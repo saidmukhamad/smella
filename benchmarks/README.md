@@ -14,6 +14,12 @@
 
 Each latency series uses 20 samples and nearest-rank percentiles. The resident synthetic workloads use one warmup. Peak RSS on the export chain comes from the child process resource counters. Wall times use a warm filesystem. Hardware, kernel, toolchain, fixture version and Git revision are recorded in each run.
 
+## First optimization cycle
+
+On the matched 513-file workload, resident p95 went from 8.06 ms at `16539b5` to 3.46 ms at `5defc13`. On the latter revision, cold p50 was 41.13 ms for Smella and 225.29 ms for Knip 6.48.0. Both produced the same 512 unused export pairs.
+
+The first 32-package run took 8.08 ms at p95 including its explanation. Many callers shared a suffix of the same reference path. Encoding each suffix once across the native boundary reduced full-query p95 to 2.00 ms, including findings, all 64 test origins, and the caller paths. The reference-machine target went from 25 ms to 6 ms. All seven published gates passed, including the package size checks. [Before entry](history/2026-11-25T15-13-06.523Z-c1b2300.json) · [After entry](history/2026-11-25T15-16-17.851Z-5defc13.json)
+
 ## Record progress
 
 From a checkout with Rust 1.88+, Node 24, npm, and Gnuplot with the pngcairo terminal, run:
