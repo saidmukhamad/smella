@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -595,4 +596,106 @@ test('a local alias named react keeps ordinary callback semantics', async t => {
   const r = await inspect(t,root,app);
   assert.ok(r.coverage.gaps.some(g=>g.code==='namespace-escape'));
   assert.deepEqual(subject(r,'Lib.ts','default').usage.value,[]);
+});
+
+test('a manifest CLI retains a registered tool callback and its internal reads', async t => {
+  const pkg = 'workspaces/mcp';
+  const bin = pkg + '/bin/serve.mjs';
+  const library = pkg + '/src/tools.mjs';
+  const testFile = pkg + '/tests/tools.test.mjs';
+  const registration = "registerTool('lookup', () => lookup());";
+  const source = [
+    "import { lookup } from '../src/tools.mjs';",
+    "const tools = new Map();",
+    "function registerTool(name, handler) { tools.set(name, handler); }",
+    registration,
+    "console.log(tools.get('lookup')?.() ?? 'unregistered');",
+  ].join('\n');
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ workspaces: ['workspaces/*'] }),
+    [pkg + '/package.json']: JSON.stringify({ name: 'mcp', bin: { mcp: 'bin/serve.mjs' } }),
+    [bin]: source,
+    [library]: [
+      "export const result = 'registered';",
+      "export function lookup() { return result; }",
+      "export function orphan() {}",
+    ].join('\n'),
+    [testFile]: "import { lookup } from '../src/tools.mjs'; lookup();",
+  });
+  // Run the synthetic CLI independently of the analyzer to check both sides of the edit.
+  const run = () => execFileSync(process.execPath, [join(root, bin)], { encoding: 'utf8' }).trim();
+  assert.equal(run(), 'registered');
+  const before = await inspect(t, root);
+  assert.equal(before.coverage.status, 'complete');
+  assert.ok(before.roots.some(r => r.file === bin && r.role === 'runtime' && r.input === pkg + '/package.json#bin'));
+  for (const name of ['lookup', 'result']) {
+    const e = subject(before, library, name);
+    assert.equal(e.kind, null);
+    assert.deepEqual(e.usage.value, ['runtime', 'test']);
+    assert.deepEqual(e.tests.map(t => t.file), [testFile]);
+    assert.equal(e.witnesses.find(w => w.role === 'runtime' && w.fact === 'value').path[0].file, bin);
+  }
+  assert.equal(subject(before, library, 'orphan').kind, 'unused-export');
+
+  await writeFile(join(root, bin), source.replace(registration, ''));
+  assert.equal(run(), 'unregistered');
+  const after = await inspect(t, root);
+  for (const name of ['lookup', 'result']) {
+    assert.equal(subject(after, library, name).kind, 'test-only-export');
+    assert.deepEqual(subject(after, library, name).usage.value, ['test']);
+  }
+  assert.equal(subject(after, library, 'orphan').kind, 'unused-export');
+});
+
+test('a missing built CLI import qualifies source findings until its source entry is supplied', async t => {
+  const file = 'src/server.ts';
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ bin: './bin/serve.mjs' }),
+    'bin/serve.mjs': "import { serve } from '../dist/server.js'; serve();",
+    'bootstrap.ts': "import { serve } from './src/server.js'; serve();",
+    [file]: "import { handle } from './handler.js'; export function serve() { return handle(); }",
+    'src/handler.ts': "export function handle() { return 42; } export const unused = 0;",
+    'server.test.ts': "import { handle } from './src/handler.js'; handle();",
+  });
+  const incomplete = await inspect(t, root);
+  const gap = incomplete.coverage.gaps.find(g => g.code === 'unresolved-import' && g.file === 'bin/serve.mjs');
+  assert.ok(gap);
+  const candidate = subject(incomplete, 'src/handler.ts', 'handle');
+  assert.equal(candidate.kind, 'test-only-export');
+  assert.equal(candidate.status, 'conditional');
+  assert.ok(candidate.gapIds.includes(gap.id));
+
+  const recovered = await inspect(t, root, { entries: { runtime: ['bootstrap.ts'] } });
+  assert.equal(subject(recovered, 'src/handler.ts', 'handle').kind, null);
+  const witness = subject(recovered, 'src/handler.ts', 'handle').witnesses.find(w => w.role === 'runtime' && w.fact === 'value');
+  assert.deepEqual([...new Set(witness.path.map(step => step.file))], ['bootstrap.ts', file, 'src/handler.ts']);
+  assert.deepEqual(subject(recovered, 'src/handler.ts', 'handle').usage.value, ['runtime', 'test']);
+  assert.equal(subject(recovered, 'src/handler.ts', 'unused').kind, 'unused-export');
+});
+
+test('a workspace manifest subpath protects its public binding through a barrel without a local caller', async t => {
+  const pkg = 'packages/sdk';
+  const barrel = pkg + '/api.mjs';
+  const file = pkg + '/impl.mjs';
+  const manifest = pkg + '/package.json';
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ workspaces: ['packages/*'] }),
+    [manifest]: JSON.stringify({ name: 'sdk', exports: { './api': './api.mjs' } }),
+    [barrel]: "export { request as getTool } from './impl.mjs';",
+    [file]: "export function request() {} export function internalOnly() {}",
+    'app.test.mjs': "import { request } from './packages/sdk/impl.mjs'; request();",
+  });
+  const before = await inspect(t, root);
+  const e = subject(before, file, 'request');
+  assert.equal(e.kind, null);
+  assert.equal(e.usage.contract, true);
+  assert.deepEqual(e.usage.value, ['test']);
+  assert.equal(e.witnesses.find(w => w.fact === 'contract').path[0].file, barrel);
+  assert.equal(subject(before, file, 'internalOnly').kind, 'unused-export');
+  assert.ok(!before.findings({ kind: 'unreferenced-module' }).some(f => f.file === barrel));
+
+  await writeFile(join(root, manifest), JSON.stringify({ name: 'sdk' }));
+  const after = await inspect(t, root);
+  assert.equal(subject(after, file, 'request').kind, 'test-only-export');
+  assert.equal(subject(after, barrel).kind, 'unreferenced-module');
 });
