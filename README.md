@@ -1,36 +1,47 @@
 # smella
 
-Smella explains which JavaScript and TypeScript exports your application, tests, tools, and public API retain. Ask about one export and get a source path through its consumers, local bindings, import aliases, and barrel files. An export can have test value usage, application type usage, and public-contract retention in the same snapshot.
+Smella is a Rust-backed library for tracing JavaScript and TypeScript usage. Given an export, it shows which application entry points, tests, and tools reach it. It also checks whether a package exposes the export as part of its public API.
 
-## Run the development package
+In the example below, searching the test files for `resetFixture` misses the caller. The test calls `prepare()`. Inside that helper, the same function is called `clear()`. Smella follows the re-exports back to the declaration and identifies the test.
 
-Use Rust 1.88 or later and Node 24 to build from this checkout. The compiled Node-API addon also runs on Bun. The first packaged target is Linux x64 with glibc.
+## Try it on a fixture
+
+Build from this checkout with Rust 1.88 or later and Node 24. The compiled addon also runs on Bun. The packaged native target is Linux x64 with glibc.
 
 ```sh
-npm test
 npm run build
-bun test test/analysis.test.mjs
 ```
 
-From the repository root, run this example with Node 24 or Bun.
+From the repository root, ask which tests use `resetFixture`.
 
-```js
+```sh
+node --input-type=module <<'JS'
 import { analyze } from 'smella';
 
 const report = await analyze({ root: 'test/fixtures/contexts' });
 try {
   const reset = report.explain({ file: 'src/service.ts', exportName: 'resetFixture' });
-  console.log(reset.kind); // test-only-export
-  console.log(reset.witnesses.find(w => w.fact === 'value').path.map(s => s.file));
-  console.log(report.findings({ kind: 'unused-export' }));
+  console.log(reset.kind);                   // test-only-export
+  console.log(reset.tests.map(t => t.file)); // [ 'tests/service.test.ts' ]
 } finally {
   report.dispose();
 }
+JS
 ```
 
-## Configure one repository
+The test reaches `resetFixture` through five files. The value witness in `reset.witnesses` gives the source location of each step along this path.
 
-Place a `smella.config.json` at the analysis root. The analyzer reads JSON, inspects source text, and writes no project files. Programs embedding the package can pass the same fields to `analyze` or use the typed `createConfig({...})` helper in their own code.
+```text
+tests/service.test.ts → tests/fixture.ts → src/index.ts → src/barrel.ts → src/service.ts
+```
+
+Use `report.findings({ kind: 'test-only-export' })` to list other exports with the same usage. Pass a finding’s `id` to `report.explain()` to inspect it. You can also ask about a private declaration with `{ file, bindingName }` or a whole module with `{ file }`. Finding IDs belong to one snapshot. Call `dispose()` to release it and `analyze` again after changing a file or an entry point. Witness locations use zero-based UTF-8 byte offsets with an exclusive end.
+
+## Configure entry points
+
+An entry point is where Smella starts tracing references. Use `runtime` for an application or CLI, `test` for test files, and `tooling` for scripts such as a build or linter. Use `publicEntries` for modules whose exports other packages can import. An exported function can have a test caller and still belong to the public API.
+
+Put a `smella.config.json` at the repository root or pass the same fields to `analyze`. The package also exports a typed `createConfig` helper.
 
 ```json
 {
@@ -45,68 +56,45 @@ Place a `smella.config.json` at the analysis root. The analyzer reads JSON, insp
 }
 ```
 
-Each API-supplied category overrides the corresponding config category. Each omitted category uses discovery. An empty array explicitly disables that category. Patterns match repository-relative paths with shell-style globs and brace alternatives. The walker skips symlinks and prunes directories named `.git`, `node_modules`, `dist`, `build`, `target`, `coverage`, `.next`, `.nx`, and `.cache`. The report lists scanned files and excluded paths.
+API options take precedence over the JSON file for each category. If neither supplies a category, Smella uses discovery. An explicit list replaces discovery for that category, and an empty list disables it. Paths and globs are relative to the analysis root.
 
-Discovery recognizes manifest `bin` targets as runtime entries, `exports` or `main` and declared type entries as public surfaces, `*.test.*`, `*.spec.*` and `__tests__` as tests, and common bundler, linter, and test configuration filenames as tooling. Discovery follows nested npm/Bun workspace declarations. A root `pnpm-workspace.yaml` selects pnpm members using its `packages` patterns, including exclusions. For a manifest that points to generated output, supply the corresponding source entries. A start script with an unspecified runtime source produces an ambiguity diagnostic. For application bootstrap code outside these conventions, supply `entries.runtime`. Inspect `report.roots` for the role, origin, and selecting pattern or manifest field.
+Discovery picks up package `bin` targets, public `exports` or `main` and declared type entries, conventional test files, and common tool configs. It follows nested npm and Bun workspaces and the package patterns in `pnpm-workspace.yaml`. Check `report.roots` to see which files were selected and why. If your manifest points at generated output such as `dist/index.js`, supply the corresponding source entry. The scanner skips directories such as `dist` and `node_modules`, as well as symlinks. If no usable entry remains, `analyze` rejects with `ANALYSIS_FAILED`.
 
-## Analyze Nx and React
+## Read a finding
 
-From the directory containing `nx.json`, Smella discovers explicit application builds and their source entries, follows TypeScript path aliases, and tracks references across Nx projects without package manifests. A JSX test can retain a single lazy panel in a production-loaded routes module. Its explanation names the test and shows the import path. The guide includes examples for Nx target defaults, Vite applications with inferred targets, React wrappers, and callers with missing entries. [Nx and React guide](docs/nx-react.md)
-
-## Interpret a report
-
-| Finding | Meaning within the effective roots and scope |
+| Finding | What Smella found |
 | --- | --- |
-| `test-only-export` | Only tests retain the binding through value or type references. |
-| `test-only-binding` | Only tests retain a private top-level declaration outside the configured test entry files. |
-| `tooling-only-export` | Only tooling retains the binding through value or type references. |
-| `unused-export` | No known value, type, or public-contract path retains the binding. Its initializer can still run. |
-| `unreferenced-module` | No known evaluation, type-retention, or contract path reaches the module. |
+| `test-only-export` | Only test entry points reach this export through a value or type reference. |
+| `test-only-binding` | Only tests reach this private top-level declaration, which lives outside the test entry files. |
+| `tooling-only-export` | Only tooling entry points reach this export through a value or type reference. |
+| `unused-export` | Smella found no value reference, type reference, or public API path to the export. Loading the module can still run the export’s initializer. |
+| `unreferenced-module` | Smella found no path that loads the module, uses its types, or exposes it through a public entry. |
 
-Each record includes independent value and type contexts, public retention, and the containing module's evaluation contexts. Findings cover named export surfaces, including barrels, so a declaration and its re-export can both appear. Select an export with `{ file, exportName }`, a private binding with `{ file, bindingName }`, or a module with `{ file }`. Passing a finding ID selects the same subject. The witness for a known fact starts at an effective root. Each step has a declaration location, and its `via` field locates the reference in the preceding file. An unused binding can have an evaluation witness alongside its absence-of-reference explanation.
+The `usage` field records these facts separately. For example, `import './setup.js'` evaluates the module. It can run top-level registration code even if every named export in that file is unused.
 
-Paths are relative with forward slashes. Locations are zero-based, half-open UTF-8 byte offsets. Finding IDs belong to a single immutable snapshot. Calling `dispose()` releases that native snapshot and can be repeated. Later queries, including metadata getters, throw `AnalysisError` with code `REPORT_DISPOSED`. Previously returned data remains available.
+Check a finding’s `status` before acting on it. A `conditional` finding has a gap that affects its conclusion. Its `gapIds` point into `report.coverage.gaps`, where you can see what Smella could not resolve. A missing import or a dynamically constructed module name can leave some callers unknown.
 
-A `partial` report contains located coverage gaps where possible. Conditional findings carry the corresponding gap IDs. A gap's `affectedFiles` lists its bounded scope, or is `null` for a project-wide uncertainty. Missing files, a computed dynamic import, or a namespace escape can weaken a negative conclusion. If every root is missing or unusable, `analyze` rejects with `ANALYSIS_FAILED`. Addon loading failures use `NATIVE_LOAD`.
+### When a workspace entry is missing
 
-## Trace tests and missing workspace entries
+In the deep-workspace fixture, a CLI in package one calls `reset` in package three through a TypeScript alias and a re-export in package two. The CLI is missing from the runtime entries. Smella can see the reference in source, but only the tests have a known path from an entry point.
 
-`explain().tests` enumerates the distinct configured test files that reach the selected subject and the facts each establishes. A test that only evaluates a module appears on the module explanation. A test that calls an exported wrapper can also appear on the explanation of its private helper.
+| Query in package three | Result | Evidence |
+| --- | --- | --- |
+| Export `reset` | `test-only-export`, conditional | `unrootedWorkspaceReads` shows the caller path from the CLI. Adding the CLI to `entries.runtime` establishes runtime usage. |
+| Private helper `makeSample` | `test-only-binding`, complete | Only `alpha.test.ts` and `beta.test.ts` reach it. The missing CLI entry has no bearing on this helper. |
 
-```js
-const report = await analyze({ root: 'test/fixtures/deep-workspace' });
-try {
-  const file = 'products/group/units/three/src/impl.ts';
-  const sample = report.explain({ file, bindingName: 'makeSample' });
-  console.log(sample.kind, sample.status, sample.tests);
-  // test-only-binding, complete, alpha.test.ts and beta.test.ts
+The same distinction matters in React. Loading a routes module can leave a lazy panel reachable only from a JSX test. In Nx workspaces, Smella reads application build targets and follows aliases across projects, including projects without a package manifest. [Workspace fixture](test/fixtures/deep-workspace) · [Nx and React examples](docs/nx-react.md)
 
-  const reset = report.explain({ file, exportName: 'reset' });
-  console.log(reset.kind, reset.status); // test-only-export, conditional
-  console.log(reset.unrootedWorkspaceReads.map(read => read.path));
-} finally {
-  report.dispose();
-}
-```
+## Analysis scope
 
-In that fixture, package one has a stale manifest entry. Its source still reads a function through a package-local TypeScript alias. Package two forwards the call to package three. Smella resolves this chain from the source files. The caller's execution role is unknown, so its reference qualifies the affected finding. Adding package one's CLI to `entries.runtime` establishes runtime usage. A neighboring private helper with only test consumers remains a complete test-only finding.
+Smella parses ES modules with Oxc and follows named imports, re-exports, literal dynamic imports, and type-only references. Resolution supports TypeScript path aliases, project references, and JS-to-TS extension mapping. Analysis reads the project without executing its code or configuration.
 
-This evidence follows resolved binding reads and module loads from files outside every effective root path when a reference crosses a declared workspace boundary. An unread static import can explain evaluation and initializer dependencies. An unavailable target or ambiguous package name yields a resolution gap. For missing build outputs, provide a source path mapping or explicit source entry. A report still requires at least one usable root.
+Once Smella reaches a function or class, it follows references in its body. A runtime value witness shows a possible read or call, including one inside a conditional branch. Computed imports and namespace objects passed to unknown code can produce coverage gaps. CommonJS inference, arbitrary loaders, and framework templates are outside the current scope. [API types, witnesses and coverage](index.d.ts)
 
-## Analysis boundary
+## Development
 
-- Oxc parses ESM JS, TS, JSX, and TSX and resolves lexical references. The Rust engine releases each syntax tree after extracting its graph edges. Breadth-first traversal records one predecessor per reached context and phase. Finding records and witness paths cross the native boundary when queried. The analysis itself runs on a libuv worker.
-- Ordinary imports and re-exports evaluate their target modules. Explicitly type-only statements retain type scope independently. Resolution uses Node/import/default package conditions, the importing file’s nearest in-scope `tsconfig.json` paths and project references, JS-to-TS extension aliases, and npm workspace package maps. Type-only requests additionally admit declaration files and the types condition. Installed third-party packages and Node builtins end traversal. Unresolved bare packages produce gaps, including missing third-party installations.
-- Named imports, local references, named re-exports, and unambiguous star chains preserve binding identity. Direct `ns.key`, literal `ns["key"]`, and `(await import("./x")).key` accesses select an export. A namespace that escapes into another value produces a bounded gap. Computed dynamic paths produce a project-wide gap when reachable.
-- Functions and classes are analyzed conservatively once retained. The engine follows references inside their bodies without proving which calls or branches execute. Top-level initializers can retain their inputs regardless of export consumption. Local type declarations in execution entries contribute type dependencies. Class members, general object-property flow, arbitrary loaders, framework templates and CommonJS inference are outside this milestone. Supply explicit roots for framework bootstraps outside the documented discovery rules.
-- Cleanup candidates describe static binding reachability. Use their evidence and coverage before editing source. The API never executes project code or suggests automatic deletion.
+Run `npm test` for the Node suite. After building the addon, run `bun test test/analysis.test.mjs` for Bun. The public corpus checks specific call paths against pinned checkouts of React, Nx, and Transformers.js. [Corpus setup](benchmarks/README.md#verify-upstream-behavior)
 
-## Measurement and packaging
+`npm run bench` measures fresh and resident Node processes on a 513-file export chain. Set `KNIP_BIN` to a Knip executable to compare both tools on the same expected findings. `npm run bench:record` records a run and updates the progress plot. [Workloads, measurements and targets](benchmarks/README.md)
 
-`npm run bench` builds in release mode and measures a deterministic 513-file graph in fresh and resident Node processes. Set `KNIP_BIN` to an installed Knip executable to include the exports-and-files comparison. The harness checks the full set of findings before accepting samples. The source fixture and runtime have different costs from a real repository with plugin discovery, unresolved imports, or many test roots.
-
-`npm run build` produces the checkout addon. On Linux x64 with glibc it also stages the native package under `npm/linux-x64-gnu`. Run `npm pack` there and in the repository root to create the two installable tarballs. Both manifests are private during development.
-
-The benchmark ledger records revisions, latency percentiles, memory, package sizes, and target checks. Use `npm run bench:record` to append a measurement and update the progress plot. [Release goals, workloads and history](benchmarks/README.md)
-
-Run `npm run verify:corpus` with the pinned upstream checkouts to validate real test, contract, lazy JSX and cross-project reference paths. [Corpus setup and assertions](benchmarks/README.md#verify-upstream-behavior)
+To package a Linux x64 glibc build, run `npm pack` in `npm/linux-x64-gnu` and again in the repository root. This produces tarballs for the native addon and its JavaScript loader.
