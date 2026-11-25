@@ -23,6 +23,10 @@ On the matched 513-file workload, resident p95 went from 8.06 ms at `16539b5` to
 
 The first 32-package run took 8.08 ms at p95 including its explanation. Many callers shared a suffix of the same reference path. Encoding each suffix once across the native boundary reduced full-query p95 to 2.00 ms, including findings, all 64 test origins, and the caller paths. The reference-machine target went from 25 ms to 6 ms. All seven published gates passed, including the package size checks. [Before entry](history/2026-11-25T15-13-06.523Z-c1b2300.json) · [After entry](history/2026-11-25T15-16-17.851Z-5defc13.json)
 
+## Nx and React measurement
+
+The first release build with Nx target discovery and React lazy-loader tracing took 1.08 ms at p95 for the four-project fixture, including all findings and two explanations. The target is 3 ms. On the matched 513-file chain, cold p95 was 46.41 ms for Smella and 241.52 ms for Knip 6.48.0. Each reported the same 512 unused exports. The Nx/React comparison records the actual Knip issue lists separately from the timed Smella run. [Measurement and comparison](history/2026-11-25T16-26-03.443Z-014d590.json)
+
 ## Record progress
 
 From a checkout with Rust 1.88+, Node 24, npm, and Gnuplot with the pngcairo terminal, run:
