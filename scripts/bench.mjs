@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { analyze } from '../index.js';
+import { stats } from './bench-stats.mjs';
 
 const count = 512;
 const samples = 20;
@@ -35,12 +36,6 @@ function run(command, args, cwd) {
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(result.stderr || result.stdout);
   return { ms, output: result.stdout.trim() };
-}
-
-function stats(numbers) {
-  const sorted = numbers.toSorted((a,b) => a-b);
-  const quantile = q => Number(sorted[Math.ceil(q * sorted.length) - 1].toFixed(2));
-  return { p50: quantile(.5), p95: quantile(.95) };
 }
 
 async function bench() {

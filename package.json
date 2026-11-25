@@ -11,6 +11,9 @@
   "scripts": {
     "build": "node scripts/build.mjs --release",
     "test": "node scripts/build.mjs && node --test test/*.test.mjs",
-    "bench": "node scripts/build.mjs --release && node scripts/bench.mjs"
+    "bench": "node scripts/build.mjs --release && node scripts/bench.mjs",
+    "bench:record": "node scripts/build.mjs --release && node scripts/track-bench.mjs --record --check",
+    "bench:check": "node scripts/build.mjs --release && node scripts/track-bench.mjs --check",
+    "bench:plot": "node scripts/plot-bench.mjs"
   }
 }
