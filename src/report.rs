@@ -21,7 +21,6 @@ pub struct Report {
     gaps: Vec<Gap>,
     reach: Reach,
     subjects: Vec<Subject>,
-    file_gaps: Vec<Vec<usize>>,
 }
 
 impl Report {
@@ -55,18 +54,6 @@ impl Report {
         graph.link();
         let reach = Reach::compute(&graph, &project.roots);
         let gaps = reach.gaps(&graph);
-        let mut file_gaps = vec![vec![]; graph.paths.len()];
-        // Store project-wide IDs once, including them at query time.
-        file_gaps.push(vec![]);
-        for (i, gap) in gaps.iter().enumerate() {
-            if let Some(files) = &gap.affected_files {
-                for file in files {
-                    file_gaps[graph.paths.binary_search(file).unwrap()].push(i);
-                }
-            } else {
-                file_gaps[graph.paths.len()].push(i);
-            }
-        }
         let mut subjects = vec![];
         for (file, module) in graph.modules.iter().enumerate() {
             let kind =
@@ -105,6 +92,13 @@ impl Report {
                 });
             }
         }
+        // Queries need the predecessor forest and source labels. Drop build-time
+        // adjacency lists and module tables before handing the snapshot to JS.
+        for node in &mut graph.nodes {
+            node.edges = Vec::new();
+        }
+        graph.modules = Vec::new();
+        graph.gaps = Vec::new();
         Ok(Self {
             graph,
             reach,
@@ -112,7 +106,6 @@ impl Report {
             excluded: project.excluded,
             gaps,
             subjects,
-            file_gaps,
         })
     }
     pub fn metadata(&self) -> Value {
@@ -137,16 +130,19 @@ impl Report {
                 .collect::<Vec<_>>()
         };
         let module_only = s.export_name.is_none();
-        let gap_ids: Vec<_> = self.file_gaps[self.graph.paths.len()]
-            .iter()
-            .chain(&self.file_gaps[s.file])
-            .map(|&i| &self.gaps[i].id)
-            .collect();
-        let loc = self.graph.nodes[s.surface].loc;
-        json!({"id":format!("s{index}"),"kind":s.kind,"file":self.graph.paths[s.file],"exportName":s.export_name,"location":loc,
-            "status":if gap_ids.is_empty() {"complete"} else {"conditional"}, "gapIds":gap_ids,
-            "usage":{"value":if module_only {vec![]} else {contexts(visits,0)}, "type":contexts(visits,1),
-            "contract":visits[6..].iter().any(Option::is_some),"evaluation":contexts(module,0)}})
+        json!({
+            "id": format!("s{index}"),
+            "kind": s.kind,
+            "file": self.graph.paths[s.file],
+            "exportName": s.export_name,
+            "location": self.graph.nodes[s.surface].loc,
+            "usage": {
+                "value": if module_only { vec![] } else { contexts(visits, 0) },
+                "type": contexts(visits, 1),
+                "contract": visits[6..].iter().any(Option::is_some),
+                "evaluation": contexts(module, 0)
+            }
+        })
     }
     pub fn findings(&self, kind: Option<&str>) -> Value {
         Value::Array(

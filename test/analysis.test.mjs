@@ -260,3 +260,15 @@ test('discovery preserves declared public types and diagnoses ambiguous applicat
   assert.equal(configured.coverage.status,'complete');
   assert.equal(subject(configured,'api.d.ts','x').usage.contract,true);
 });
+
+test('large partial reports share immutable gap lists across subjects', async t => {
+  const unresolved = Array.from({length:80},(_,i)=>`import "./missing${i}";`).join('\n');
+  const candidates = Array.from({length:80},(_,i)=>`export const x${i} = 1;`).join('\n');
+  const r = await inspect(t,await fixture(t,{'app.ts':unresolved,'a.ts':candidates,'b.ts':candidates}),app);
+  const findings = r.findings();
+  const ids = findings[0].gapIds;
+  assert.equal(ids.length,80);
+  assert.equal(findings.length,162);
+  assert.ok(findings.every(f => f.gapIds === ids && f.status === 'conditional'));
+  assert.ok(Object.isFrozen(ids));
+});

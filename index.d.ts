@@ -16,7 +16,7 @@ export interface Coverage { status: 'complete' | 'partial'; files: string[]; exc
 export interface Usage { value: Context[]; type: Context[]; contract: boolean; evaluation: Context[] }
 interface SubjectRecord {
   id: string; file: string; exportName: string | null; location: Location; usage: Usage;
-  status: 'complete' | 'conditional'; gapIds: string[];
+  status: 'complete' | 'conditional'; gapIds: readonly string[];
 }
 export interface Finding extends SubjectRecord { kind: FindingKind }
 export interface Step { file: string; kind: string; name: string; location: Location; via: { file: string; location: Location } | null }
