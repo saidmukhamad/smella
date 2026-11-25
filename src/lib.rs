@@ -1,7 +1,9 @@
 mod evidence;
 mod extract;
 mod graph;
+mod nx;
 mod project;
+mod react;
 mod report;
 
 use std::path::Path;

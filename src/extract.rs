@@ -256,10 +256,18 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
         }
     }
     let mut namespaces = HashMap::new();
+    let mut react = crate::react::ReactCalls::default();
     for import in &record.import_entries {
         let Some(from) = local(import.local_name.name.as_str()) else {
             continue;
         };
+        // An in-repository alias named "react" can implement a different API.
+        if requests
+            .get(&import.statement_span.start)
+            .is_some_and(Option::is_none)
+        {
+            react.register(import, scoping);
+        }
         let Some(to) = requests
             .get(&import.statement_span.start)
             .copied()
@@ -416,10 +424,13 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                 group
             };
             let eager = match node.kind() {
-                AstKind::VariableDeclarator(v) => !v
-                    .init
-                    .as_ref()
-                    .is_some_and(|e| e.get_inner_expression().is_function()),
+                AstKind::VariableDeclarator(v) => {
+                    let init = v.init.as_ref().map(Expression::get_inner_expression);
+                    if let Some(Expression::CallExpression(call)) = init {
+                        react.initializer(call);
+                    }
+                    !init.is_some_and(Expression::is_function)
+                }
                 AstKind::Class(_) | AstKind::TSEnumDeclaration(_) => true,
                 AstKind::TSTypeAliasDeclaration(_) | AstKind::TSInterfaceDeclaration(_) => {
                     entry_file && !exported.contains(&id)
@@ -427,9 +438,16 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                 _ => false,
             };
             owner = Owner { binding: id, eager };
-        } else if matches!(node.kind(), AstKind::ExportDefaultDeclaration(_))
+        } else if let AstKind::ExportDefaultDeclaration(export) = node.kind()
             && let Some(binding) = default_expr
         {
+            if let Some(Expression::CallExpression(call)) = export
+                .declaration
+                .as_expression()
+                .map(Expression::get_inner_expression)
+            {
+                react.initializer(call);
+            }
             owner = Owner {
                 binding,
                 eager: true,
@@ -437,10 +455,12 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
         } else if matches!(
             node.kind(),
             AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
-        ) && (matches!(
-            nodes.parent_kind(node.id()),
-            Some(AstKind::ExportDefaultDeclaration(_) | AstKind::MethodDefinition(_))
-        )) {
+        ) && (react.is_deferred(node.span().start)
+            || matches!(
+                nodes.parent_kind(node.id()),
+                Some(AstKind::ExportDefaultDeclaration(_) | AstKind::MethodDefinition(_))
+            ))
+        {
             owner.eager = false;
         }
         owners[node.id().index()] = owner;
@@ -534,6 +554,25 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                     }
                 }
             }
+            AstKind::CallExpression(call) => {
+                react.observe(call, scoping);
+                if let Expression::StaticMemberExpression(member) =
+                    call.callee.get_inner_expression()
+                    && member.property.name == "glob"
+                    && matches!(member.object.get_inner_expression(), Expression::MetaProperty(meta) if meta.meta.name == "import" && meta.property.name == "meta")
+                {
+                    for from in owner.sources(file) {
+                        out.gap(
+                            "bundler-glob",
+                            Some(loc),
+                            "import.meta.glob can load additional modules selected by the bundler."
+                                .into(),
+                            Some(from),
+                            None,
+                        );
+                    }
+                }
+            }
             AstKind::ImportExpression(expr) => {
                 for from in owner.sources(file) {
                     if let Expression::StringLiteral(s) = &expr.source {
@@ -541,6 +580,12 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                             out.target(project, s.value.as_str(), s.span, Some(from), false)
                         {
                             out.edge(from, to, false, loc);
+                            if let Some(member) = react.member(expr.span.start) {
+                                let access = out.node("import", member, loc);
+                                out.edge(from, access, false, loc);
+                                out.links.push((access, to, member.into(), false, loc));
+                                continue;
+                            }
                             let mut awaited = false;
                             let parent =
                                 nodes.ancestors(node.id()).skip(1).find(|n| match n.kind() {
@@ -551,10 +596,19 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                                     AstKind::ParenthesizedExpression(_) => false,
                                     _ => true,
                                 });
+                            // Oxc represents the value returned by a concise arrow as an
+                            // expression statement in a synthetic function body.
+                            let discarded = parent.is_some_and(|p| {
+                                matches!(p.kind(), AstKind::ExpressionStatement(_)) &&
+                                !nodes.parent_id(p.id()).and_then(|id| nodes.parent_kind(id))
+                                    .is_some_and(|k| matches!(k, AstKind::ArrowFunctionExpression(a) if a.expression))
+                            });
                             match parent.map(|p| p.kind()) {
-                                Some(AstKind::ExpressionStatement(_)) => {}
+                                _ if discarded => {}
                                 Some(AstKind::StaticMemberExpression(m)) if awaited => {
-                                    out.links.push((from, to, m.property.name.to_string(), false, loc));
+                                    let access = out.node("import", m.property.name.as_str(), loc);
+                                    out.edge(from, access, false, loc);
+                                    out.links.push((access, to, m.property.name.to_string(), false, loc));
                                 }
                                 _ => out.gap(
                                     "namespace-escape", Some(loc),

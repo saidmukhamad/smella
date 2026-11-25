@@ -1,0 +1,14 @@
+{
+  "targetDefaults": {
+    "@nx/webpack:webpack": {
+      "options": {
+        "main": "{projectRoot}/src/dev.tsx"
+      }
+    },
+    "build": {
+      "options": {
+        "main": "wrong.ts"
+      }
+    }
+  }
+}

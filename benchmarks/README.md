@@ -4,12 +4,15 @@
 2. **Explain cross-workspace references with imperfect entries.** Resolve the deep-workspace fixture through nested manifests, aliases and barrels. Show the source and location of a caller with no root path, qualify the affected binding, and recover runtime evidence when the caller's entry is supplied. Keep unrelated negative conclusions independent. Unknown dynamic targets must qualify the broader scope they can affect.
 3. **Improve measured end-to-end time.** Check latency, peak RSS and shipped package size against the versioned reference-machine targets. Record a run before and after optimizing the slowest measured stage. Each entry retains its active thresholds so later changes to the targets remain visible. [Targets](targets.json)
 
+4. **Preserve Nx and React evidence.** Discover the default application build from Nx metadata, distinguish runtime and test-only lazy components, and identify an unrooted Nx caller of a private helper. Gate a fresh snapshot, findings and both explanations at 3 ms p95 on the reference machine. [Fixture and interpretation](../docs/nx-react.md)
+
 ## Workloads
 
 | Workload | What the timer includes | Correctness check |
 | --- | --- | --- |
 | Export chain | Analysis plus JS findings for 513 TypeScript files. Fresh-process timing also includes process launch, output and exit. | Exactly the same 512 file/export pairs as the fixture oracle and, when enabled, Knip. |
 | Deep workspace | A fresh snapshot, findings, and a full private-binding explanation, in one resident process. The fixture has 32 packages, four nested workspace declarations above the package collection, 64 test roots and a missing caller entry. | All 64 value consumers and the ordered 32-package reference path must be present. |
+| Nx and React | Analysis, findings and two full explanations for a TSX storefront with four Nx projects. | Assert the two runtime entries, test-only named panel, unused archive, production catalog and conditional private helper. Optional Knip default and production runs use explicit equivalent roots. |
 | Native package | Compressed and unpacked file bytes of the actual JS and Linux x64 glibc tarballs. | The target-specific package must contain the native addon. |
 
 Each latency series uses 20 samples and nearest-rank percentiles. The resident synthetic workloads use one warmup. Peak RSS on the export chain comes from the child process resource counters. Wall times use a warm filesystem. Hardware, kernel, toolchain, fixture version and Git revision are recorded in each run.

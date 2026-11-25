@@ -1,0 +1,27 @@
+{
+  "name": "storefront",
+  "projectType": "application",
+  "targets": {
+    "build": {
+      "executor": "@nx/webpack:webpack",
+      "defaultConfiguration": "production",
+      "configurations": {
+        "production": {
+          "main": "{projectRoot}/src/client.tsx",
+          "additionalEntryPoints": [
+            {
+              "entryName": "worker",
+              "entryPath": "{projectRoot}/src/worker.ts"
+            }
+          ]
+        }
+      }
+    },
+    "serve": {
+      "executor": "@nx/webpack:dev-server",
+      "options": {
+        "buildTarget": "storefront:build:production"
+      }
+    }
+  }
+}

@@ -1186,6 +1186,7 @@ name = "smella"
 version = "0.1.0"
 dependencies = [
  "globset",
+ "json-strip-comments",
  "napi",
  "napi-build",
  "napi-derive",

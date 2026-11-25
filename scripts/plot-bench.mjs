@@ -15,13 +15,14 @@ const data = [
   ['Cold process + findings','chain.coldProcessMs'],
   ['Findings conversion','chain.findingsConversionMs'],
   ['Deep workspace + caller evidence','workspace.totalMs'],
+  ['Nx app + React route explanations','nxReact.totalMs'],
 ];
 function quote(s) { return "'"+s.replaceAll("'","''").replaceAll('\n',' ')+"'"; }
 const labels = comparable.map((e,i)=>quote(e.revision.slice(0,7))+' '+(i+1)).join(', ');
 const program = [
-  "set terminal pngcairo size 1560,880 font 'DejaVu Sans,15' noenhanced",
+  "set terminal pngcairo size 1560,1220 font 'DejaVu Sans,15' noenhanced",
   "set output 'benchmarks/progress.png'",
-  "set multiplot layout 2,2 rowsfirst title 'Smella benchmark history  ·  milliseconds per run' font ',23'",
+  "set multiplot layout 3,2 rowsfirst title 'Smella benchmark history  ·  milliseconds per run' font ',23'",
   "set border 3 lc rgb '#73838f'",
   "set grid ytics back lc rgb '#e0e6eb'",
   "set tics nomirror scale 0.4",

@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "paths": {
+      "@design/ui": [
+        "./shared/design/ui/src/index.ts"
+      ],
+      "@domain/pricing": [
+        "./shared/domain/pricing/src/pricing.ts"
+      ]
+    }
+  }
+}

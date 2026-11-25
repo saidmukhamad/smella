@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { analyze, createConfig } from 'smella';
+import { prepareNxReact } from './support/nx-react.mjs';
 
 const contexts = fileURLToPath(new URL('./fixtures/contexts', import.meta.url));
 const app = createConfig({ entries: { runtime: ['app.ts'], test: [], tooling: [] }, publicEntries: [] });
@@ -418,4 +419,153 @@ test('unbounded loads behind unrooted cross-workspace reads qualify otherwise un
   assert.equal(gap.affectedFiles,null);
   assert.ok(subject(r,'independent.ts','maybe').gapIds.includes(gap.id));
   assert.deepEqual(subject(r,'p/b/api.ts','run').usage.value,[]);
+});
+
+const store = 'products/retail/apps/storefront';
+const ui = 'shared/design/ui';
+const pricing = 'shared/domain/pricing/src/pricing.ts';
+const reactPackage = {
+  'node_modules/react/package.json': JSON.stringify({name:'react',main:'index.js'}),
+  'node_modules/react/index.js': 'throw new Error("analysis executed project code");',
+};
+
+test('Nx default build and TSX lazy routes retain production, test and unrooted callers independently', async t => {
+  const root = await fixture(t,{});
+  await prepareNxReact(root);
+  const r = await inspect(t,root);
+  assert.deepEqual(r.roots.filter(x=>x.role === 'runtime').map(x=>[x.file,x.input]), [
+    [store+'/src/client.tsx',store+'/project.json#targets.build.configurations.production.main'],
+    [store+'/src/worker.ts',store+'/project.json#targets.build.configurations.production.additionalEntryPoints[0]'],
+  ]);
+  assert.deepEqual(r.coverage.gaps.map(g=>g.code),['unrooted-workspace-reference']);
+  const catalog = subject(r,ui+'/src/Catalog.tsx','default');
+  assert.deepEqual(catalog.usage.value,['runtime']);
+  assert.equal(catalog.witnesses.find(w=>w.fact === 'value').path[0].file,store+'/src/client.tsx');
+  const preview = subject(r,ui+'/src/panels.tsx','PreviewPanel');
+  assert.equal(preview.kind,'test-only-export');
+  assert.equal(preview.status,'complete');
+  assert.deepEqual(preview.tests,[{file:ui+'/tests/preview.spec.tsx',facts:['value']}]);
+  assert.deepEqual(subject(r,ui+'/src/panels.tsx','OtherPanel').usage.value,[]);
+  assert.deepEqual(subject(r,ui+'/src/Catalog.tsx','OtherCatalog').usage.value,[]);
+  assert.equal(subject(r,ui+'/src/Archive.tsx').kind,'unreferenced-module');
+  assert.equal(subject(r,store+'/src/dev.tsx').kind,'unreferenced-module');
+  const helper = r.explain({file:pricing,bindingName:'discount'});
+  assert.equal(helper.kind,'test-only-binding');
+  assert.equal(helper.status,'conditional');
+  assert.ok(helper.unrootedWorkspaceReads.some(read=>read.file==='unshipped/apps/legacy/src/checkout.ts'));
+  const recovered = await inspect(t,root,{entries:{runtime:[store+'/src/client.tsx','unshipped/apps/legacy/src/checkout.ts']}});
+  assert.deepEqual(recovered.explain({file:pricing,bindingName:'discount'}).usage.value,['runtime','test']);
+});
+
+test('Nx merges package targets, JSONC, executor defaults and a referenced nondefault build profile', async t => {
+  const root = await fixture(t,{
+    'nx.json':'{ /* shared defaults */ "targetDefaults": { "@nx/esbuild:esbuild": { "options": { "main":"{projectRoot}/default.ts" } } }, }',
+    'package.json':JSON.stringify({workspaces:['zones/**']}),
+    'zones/app/package.json':JSON.stringify({name:'app',nx:{projectType:'application',targets:{serve:{executor:'@nx/js:node',options:{buildTarget:'engine:compile:browser'}}}}}),
+    'zones/app/project.json':JSON.stringify({targets:{serve:{options:{watch:true}}}}),
+    'engine/project.json':JSON.stringify({name:'engine',projectType:'library',targets:{compile:{executor:'@nx/esbuild:esbuild',configurations:{browser:{additionalEntryPoints:['{projectRoot}/[browser].tsx']}}}}}),
+    'engine/default.ts':'export const used = 1;', 'engine/[browser].tsx':'void 0;',
+    'zones/app/test.spec.ts':'void 0;'
+  });
+  const r = await inspect(t,root);
+  assert.deepEqual(r.roots.filter(x=>x.role==='runtime').map(x=>[x.file,x.input]), [
+    ['engine/[browser].tsx','engine/project.json#targets.compile.configurations.browser.additionalEntryPoints[0]'],
+    ['engine/default.ts','nx.json#targetDefaults.@nx/esbuild:esbuild.options.main'],
+  ]);
+  assert.equal(r.coverage.status,'complete');
+  const disabled = await inspect(t,root,{entries:{runtime:[]}});
+  assert.deepEqual(disabled.roots.map(x=>x.role),['test']);
+});
+
+test('inferred Nx targets, command entries and missing sources keep findings conditional until configured', async t => {
+  const root = await fixture(t, {
+    'nx.json':JSON.stringify({plugins:['@nx/vite/plugin']}),
+    'apps/web/project.json':JSON.stringify({name:'web',projectType:'application',targets:{
+      build:{command:'exit 1'},serve:{executor:'@nx/js:node',options:{buildTarget:'missing:build'}},
+      bundle:{executor:'@nx/webpack:webpack',options:{main:'dist/missing.js',webpackConfig:'{projectRoot}/tools/bundler.ts'}},
+    }}),
+    'apps/web/tools/bundler.ts':'throw new Error("should never run");',
+    'apps/web/src/boot.ts':'export const app = 1;',
+    'apps/web/src/app.spec.ts':'void 0;', '.nx/cache/ghost.spec.ts':'void 0;',
+  });
+  const r = await inspect(t,root);
+  assert.ok(r.coverage.gaps.some(g=>g.message.includes('nx.json uses plugins')));
+  assert.ok(r.coverage.gaps.some(g=>g.message.includes('unresolved or overridden buildTarget')));
+  assert.ok(r.coverage.gaps.some(g=>g.code==='invalid-root' && g.message.includes('dist/missing.js')));
+  assert.equal(subject(r,'apps/web/src/boot.ts','app').status,'conditional');
+  assert.ok(r.roots.some(x=>x.file==='apps/web/tools/bundler.ts' && x.role==='tooling'));
+  assert.ok(!r.coverage.files.includes('.nx/cache/ghost.spec.ts'));
+  const explicit = await inspect(t,root,{entries:{runtime:['apps/web/src/boot.ts']}});
+  assert.equal(explicit.coverage.status,'complete');
+});
+
+test('React wrappers defer callbacks by binding identity and preserve uncertainty for opaque loaders', async t => {
+  const root = await fixture(t,{
+    ...reactPackage,
+    'app.tsx': 'import { Main } from "./views"; void <Main />;',
+    'ui.test.tsx':'import { TestOnly } from "./views"; void <TestOnly />;',
+    'views.tsx':`import * as R from "react";
+import { lazy } from "react";
+import { TestChild, MainChild } from "./children";
+export const Main = R.memo(function MainView() { return <MainChild />; });
+export const TestOnly = R.memo(R.forwardRef((p,ref) => <TestChild ref={ref} />));
+export const Unused = lazy(() => import("./unread"));
+function other(lazy) { return lazy(() => import("./opaque")); }
+other(handler);
+const Adapter = R.lazy(() => import("./adapted").then(m => choose(m)));
+void <Adapter />;`,
+    'children.tsx':'export function MainChild() {} export function TestChild() {}',
+    'unread.tsx':'export default () => <div />;',
+    'opaque.ts':'export const local = 1;', 'adapted.ts':'export default 1;',
+  });
+  const r = await inspect(t,root,{entries:{runtime:['app.tsx']}});
+  assert.deepEqual(subject(r,'children.tsx','MainChild').usage.value,['runtime']);
+  assert.deepEqual(subject(r,'children.tsx','TestChild').usage.value,['test']);
+  assert.equal(subject(r,'unread.tsx').kind,'unreferenced-module');
+  assert.deepEqual(r.coverage.gaps.map(g=>[g.code,g.affectedFiles]).sort(),[
+    ['namespace-escape',['adapted.ts']],['namespace-escape',['opaque.ts']],
+  ]);
+});
+
+test('React lazy supports a destructured alias and keeps public component dependencies in the contract', async t => {
+  const root = await fixture(t,{
+    ...reactPackage,
+    'index.ts':'export { default as Dialog } from "./Dialog";',
+    'Dialog.tsx':'import { lazy } from "react"; export default lazy(() => import("./views").then(({ DialogView: View }) => ({ default: View })));',
+    'views.tsx':'export function DialogView() { return <dialog />; } export function Sibling() { return null; }',
+    'app.ts':'void 0;',
+  });
+  const r = await inspect(t,root,{...app,publicEntries:['index.ts']});
+  assert.equal(r.coverage.status,'complete');
+  const view = subject(r,'views.tsx','DialogView');
+  assert.equal(view.usage.contract,true);
+  assert.deepEqual(view.usage.value,[]);
+  assert.equal(subject(r,'views.tsx','Sibling').kind,'unused-export');
+});
+
+test('stylesheet imports resolve across CSS modules and keep missing files, loader queries and Vite glob gaps visible', async t => {
+  const root = await fixture(t,{
+    'app.ts': 'import styles from "./a.module.css"; console.log(styles.title); import.meta.glob("./routes/*.tsx"); import "./missing.css"; import text from "./template.ts?raw"; console.log(text);',
+    'a.module.css':'.title { color: red }', 'template.ts':'export default 42;',
+    'routes/landing.tsx':'export function Landing() { return <div />; }',
+  });
+  const r = await inspect(t,root,app);
+  assert.deepEqual(r.coverage.gaps.map(g=>g.code),['bundler-glob','unresolved-import','unresolved-import']);
+  assert.ok(r.coverage.gaps.some(g=>g.message.includes('loader query')));
+  const candidate = subject(r,'routes/landing.tsx','Landing');
+  assert.equal(candidate.status,'conditional');
+  assert.deepEqual(subject(r,'template.ts','default').usage.value,[]);
+});
+
+test('Nx respects a relocated root, literal paths and command overrides of inherited executors', async t => {
+  const root = await fixture(t,{
+    'nx.json':JSON.stringify({targetDefaults:{build:{executor:'@nx/esbuild:esbuild',options:{main:'wrong.ts'}}}}),
+    'metadata/web/project.json':JSON.stringify({root:'nested/site',name:'web',projectType:'application',targets:{
+      build:{command:'generate-entry'}, bundle:{executor:'@nx/esbuild:esbuild',options:{main:'{projectRoot}/src/../boot.ts'}},
+    }}),
+    'nested/site/boot.ts':'void 0;', 'wrong.ts':'void 0;',
+  });
+  const r = await inspect(t,root);
+  assert.deepEqual(r.roots.map(r=>r.file),['nested/site/boot.ts']);
+  assert.deepEqual(r.coverage.gaps.map(g=>g.code),['ambiguous-entry']);
 });

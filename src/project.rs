@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 
 use crate::graph::{Graph, Id, ROLES, Role, Root};
 
-const EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "mjs", "cts", "cjs"];
+pub(crate) const EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "mjs", "cts", "cjs"];
 const SKIP: &[&str] = &[
     ".git",
     "node_modules",
@@ -22,6 +22,7 @@ const SKIP: &[&str] = &[
     "coverage",
     ".next",
     ".cache",
+    ".nx",
 ];
 
 #[derive(Default, Deserialize)]
@@ -50,7 +51,7 @@ pub struct Config {
     pub exclude: Option<Vec<String>>,
 }
 
-fn matcher(pattern: &str) -> Result<GlobMatcher, String> {
+pub(crate) fn matcher(pattern: &str) -> Result<GlobMatcher, String> {
     GlobBuilder::new(pattern.trim_start_matches("./"))
         .literal_separator(true)
         .build()
@@ -108,6 +109,11 @@ impl Project {
         let public = input.public_entries.or(defaults.public_entries);
         let mut paths = vec![];
         let mut excluded = vec![];
+        let nx_enabled = root
+            .join("nx.json")
+            .try_exists()
+            .map_err(|e| e.to_string())?;
+        let mut nx_dirs = BTreeSet::new();
         let mut manifests = vec![];
         let mut config_dirs = BTreeMap::new();
         let mut walker = WalkDir::new(&root).sort_by_file_name().into_iter();
@@ -131,6 +137,9 @@ impl Project {
             }
             if !entry.file_type().is_file() {
                 continue;
+            }
+            if nx_enabled && name == "project.json" {
+                nx_dirs.insert(Path::new(&file).parent().unwrap().to_owned());
             }
             if name == "tsconfig.json" {
                 config_dirs.insert(
@@ -198,9 +207,24 @@ impl Project {
             base.clone_with_options(options.clone()),
             base.clone_with_options(type_options.clone()),
         ]];
+        let base_tsconfig = nx_enabled
+            && !config_dirs.contains_key(Path::new(""))
+            && root
+                .join("tsconfig.base.json")
+                .try_exists()
+                .map_err(|e| e.to_string())?;
+        if base_tsconfig {
+            config_dirs.insert(PathBuf::new(), 0);
+        }
         for (dir, index) in &mut config_dirs {
             let tsconfig = Some(TsconfigDiscovery::Manual(TsconfigOptions {
-                config_file: root.join(dir).join("tsconfig.json"),
+                config_file: root
+                    .join(dir)
+                    .join(if base_tsconfig && dir.as_os_str().is_empty() {
+                        "tsconfig.base.json"
+                    } else {
+                        "tsconfig.json"
+                    }),
                 references: TsconfigReferences::Auto,
             }));
             *index = resolvers.len();
@@ -253,7 +277,7 @@ impl Project {
                     .get(a)
                     .is_some_and(|globs| globs.matches(rel.strip_prefix(a).unwrap()))
             });
-            if member {
+            if member || nx_dirs.contains(rel) {
                 let package = json(&path)?;
                 if let Some(name) = package["name"].as_str() {
                     workspaces
@@ -271,6 +295,16 @@ impl Project {
                 packages.push((rel.to_owned(), package));
             }
         }
+        let nx = if nx_enabled {
+            let nx = crate::nx::Workspace::read(&root, &nx_dirs, &packages)?;
+            for dir in nx.directories() {
+                let id = directories.len();
+                directories.entry(dir.clone()).or_insert(id);
+            }
+            Some(nx)
+        } else {
+            None
+        };
         let workspace_for_file = closest_directories(&paths, &directories);
         let mut project = Self {
             root,
@@ -287,6 +321,12 @@ impl Project {
                 .into_iter()
                 .zip([entries.runtime, entries.test, entries.tooling, public])
         {
+            if supplied.is_none()
+                && matches!(role, Role::Runtime | Role::Tooling)
+                && let Some(nx) = &nx
+            {
+                nx.discover(&mut project, role)?;
+            }
             if let Some(patterns) = supplied {
                 for p in patterns {
                     project.select(role, &p, "explicit", &p, true)?;
@@ -411,7 +451,7 @@ impl Project {
         Ok(())
     }
 
-    /// None means a resolved external package or Node builtin.
+    /// None means a resolved external package, Node builtin or plain stylesheet.
     pub fn resolve(&self, file: Id, spec: &str, type_only: bool) -> Result<Option<Id>, String> {
         let origin = self.root.join(&self.graph.paths[file]);
         let profile = if spec.starts_with('.') || spec.starts_with('/') {
@@ -450,6 +490,14 @@ impl Project {
         match result {
             Ok(resolved) => {
                 let path = resolved.path();
+                if resolved.query().is_some() {
+                    return Err(format!(
+                        "{spec:?} includes a loader query with bundler-specific module semantics."
+                    ));
+                }
+                if spec.ends_with(".css") && path.extension().is_some_and(|ext| ext == "css") {
+                    return Ok(None);
+                }
                 if path.components().any(|p| p.as_os_str() == "node_modules") {
                     return Ok(None);
                 }

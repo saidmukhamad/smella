@@ -1,0 +1,13 @@
+{
+  "name": "nx-react-fixture",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "nx": "21.6.5",
+    "@nx/webpack": "21.6.5"
+  }
+}

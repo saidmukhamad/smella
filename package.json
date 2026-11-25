@@ -5,7 +5,7 @@
   "description": "Explain JavaScript and TypeScript export usage by context",
   "type": "module",
   "exports": { ".": { "types": "./index.d.ts", "default": "./index.js" } },
-  "files": ["index.js", "index.d.ts", "README.md"],
+  "files": ["index.js", "index.d.ts", "README.md", "docs/nx-react.md"],
   "engines": { "node": ">=24" },
   "optionalDependencies": { "smella-linux-x64-gnu": "0.1.0" },
   "scripts": {

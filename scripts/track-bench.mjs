@@ -13,6 +13,7 @@ function run(command,args,cwd=repo) {
 const targets = JSON.parse(await readFile(join(repo,'benchmarks/targets.json'),'utf8'));
 const chain = JSON.parse(run(process.execPath,['scripts/bench.mjs']));
 const workspace = JSON.parse(run(process.execPath,['scripts/bench-workspace.mjs']));
+const nxReact = JSON.parse(run(process.execPath,['scripts/bench-nx-react.mjs']));
 const output = await mkdtemp(join(tmpdir(),'smella-pack-'));
 try {
   if (process.platform !== 'linux' || process.arch !== 'x64' || !process.report.getReport().header.glibcVersionRuntime) {
@@ -28,7 +29,7 @@ try {
     schema:1, observedAt, revision,
     dirty:Boolean(run('git',['status','--porcelain','--untracked-files=normal'])),
     machine:{cpu:chain.cpu,os:chain.os,platform:process.platform,arch:process.arch,node:chain.node,rust:chain.rust},
-    chain:{fixture:'chain-v1',...chain}, workspace,
+    chain:{fixture:'chain-v1',...chain}, workspace, nxReact,
     package:{
       compressedBytes:tarballs.reduce((sum,p)=>sum+p.size,0),
       unpackedBytes:tarballs.reduce((sum,p)=>sum+p.unpackedSize,0),
