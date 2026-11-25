@@ -47,7 +47,7 @@ Place a `smella.config.json` at the analysis root. The analyzer reads JSON, insp
 
 Each API-supplied category overrides the corresponding config category. Each omitted category uses discovery. An empty array explicitly disables that category. Patterns match repository-relative paths with shell-style globs and brace alternatives. The walker skips symlinks and prunes directories named `.git`, `node_modules`, `dist`, `build`, `target`, `coverage`, `.next`, and `.cache`. The report lists scanned files and excluded paths.
 
-Discovery recognizes manifest `bin` targets as runtime entries, `exports` or `main` as public entries, `*.test.*`, `*.spec.*` and `__tests__` as tests, and common bundler, linter, and test configuration filenames as tooling. This also applies to packages selected by root npm workspace globs. For a manifest that points to generated output, supply the corresponding source entries. For application bootstrap code outside these conventions, supply `entries.runtime`. Inspect `report.roots` for the role, origin, and selecting pattern or manifest field.
+Discovery recognizes manifest `bin` targets as runtime entries, `exports` or `main` and declared type entries as public surfaces, `*.test.*`, `*.spec.*` and `__tests__` as tests, and common bundler, linter, and test configuration filenames as tooling. This also applies to packages selected by root npm workspace globs. For a manifest that points to generated output, supply the corresponding source entries. A start script with an unspecified runtime source produces an ambiguity diagnostic. For application bootstrap code outside these conventions, supply `entries.runtime`. Inspect `report.roots` for the role, origin, and selecting pattern or manifest field.
 
 ## Interpret a report
 

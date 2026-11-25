@@ -247,3 +247,16 @@ test('JSX component references and ambient declarations retain source identities
   assert.deepEqual(subject(r,'view.jsx','default').usage.value,['runtime']);
   assert.deepEqual(subject(r,'types.d.ts','Props').usage.type,['runtime']);
 });
+
+test('discovery preserves declared public types and diagnoses ambiguous application scripts', async t => {
+  const root = await fixture(t,{
+    'package.json':JSON.stringify({scripts:{start:'node run.js'},exports:{'.':{types:'./api.d.ts',import:'./api.js'}}}),
+    'api.js':'export const x = 1;', 'api.d.ts':'export declare const x: number;', 'run.js':'import { x } from "./api.js"; void x;',
+  });
+  const discovered = await inspect(t,root);
+  assert.deepEqual(discovered.roots.map(r => r.file),['api.d.ts','api.js']);
+  assert.equal(discovered.coverage.gaps[0].code,'ambiguous-entry');
+  const configured = await inspect(t,root,{entries:{runtime:['run.js']}});
+  assert.equal(configured.coverage.status,'complete');
+  assert.equal(subject(configured,'api.d.ts','x').usage.contract,true);
+});

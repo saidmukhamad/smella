@@ -244,6 +244,29 @@ impl Project {
                 project.select(role, p, "discovered", p, false)?;
             } else {
                 for (dir, pkg) in &packages {
+                    if role == Role::Runtime
+                        && pkg["bin"].is_null()
+                        && pkg.pointer("/scripts/start").is_some()
+                    {
+                        let manifest = dir.join("package.json");
+                        project.graph.gap("ambiguous-entry", None, None,
+                            format!("{}#scripts.start is a command. Supply entries.runtime to identify its source entry.", manifest.display()), None, None);
+                    }
+                    if role == Role::Public {
+                        let manifest = dir.join("package.json");
+                        for key in ["types", "typings"] {
+                            if let Some(path) = pkg[key].as_str() {
+                                let pattern = dir.join(path.trim_start_matches("./"));
+                                project.select(
+                                    role,
+                                    &pattern.to_string_lossy(),
+                                    "discovered",
+                                    &format!("{}#{key}", manifest.display()),
+                                    true,
+                                )?;
+                            }
+                        }
+                    }
                     let field = if role == Role::Runtime {
                         "bin"
                     } else if pkg.get("exports").is_some() {
@@ -253,6 +276,9 @@ impl Project {
                     };
                     let mut targets = vec![];
                     manifest_targets(&pkg[field], field == "bin", &mut targets);
+                    if field == "exports" {
+                        declared_types(&pkg[field], &mut targets);
+                    }
                     let label = format!("{}#{field}", dir.join("package.json").display());
                     let has_targets = !targets.is_empty();
                     for target in targets {
@@ -394,5 +420,24 @@ fn manifest_targets<'a>(value: &'a Value, bin_map: bool, out: &mut Vec<&'a str>)
             }
         }
         _ => {}
+    }
+}
+
+/// A public package can expose declarations alongside its executable ESM entry.
+fn declared_types<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+    if let Value::Object(map) = value {
+        if let Some(types) = map.get("types") {
+            manifest_targets(types, false, out);
+        }
+        if map.keys().any(|key| key.starts_with('.')) {
+            for child in map.values() {
+                declared_types(child, out);
+            }
+        } else if let Some((_, child)) = map
+            .iter()
+            .find(|(key, _)| matches!(key.as_str(), "node" | "import" | "default"))
+        {
+            declared_types(child, out);
+        }
     }
 }

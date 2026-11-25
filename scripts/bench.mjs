@@ -13,7 +13,7 @@ const samples = 20;
 const expected = Array.from({ length: count }, (_, i) => `m${i}.ts#dead`).sort();
 const config = { entries: { runtime: ['app.ts'], test: [], tooling: [] }, publicEntries: [] };
 
-async function once(root) {
+async function once(root, emit = false) {
   const start = performance.now();
   const report = await analyze({ root, ...config });
   try {
@@ -24,7 +24,7 @@ async function once(root) {
     assert.equal(report.coverage.files.length, count + 1);
     assert.ok(findings.every(f => f.kind === 'unused-export' && f.status === 'complete'));
     assert.deepEqual(findings.map(f => f.file + '#' + f.exportName).sort(), expected);
-    return { analysis: ready - start, conversion: converted - ready, total: converted - start, rssKiB: process.resourceUsage().maxRSS };
+    return { analysis: ready - start, conversion: converted - ready, total: converted - start, rssKiB: process.resourceUsage().maxRSS, ...(emit ? { findings } : {}) };
   } finally { report.dispose(); }
 }
 
@@ -62,7 +62,9 @@ async function bench() {
       startup.push(run(process.execPath,['--input-type=module','-e',`await import(${JSON.stringify(new URL('../index.js',import.meta.url).href)})`],root).ms);
       const { ms, output } = run(process.execPath,[script,'--once',root],root);
       cold.push(ms);
-      rss.push(JSON.parse(output).rssKiB);
+      const snapshot = JSON.parse(output);
+      rss.push(snapshot.rssKiB);
+      assert.deepEqual(snapshot.findings.map(f => f.file + '#' + f.exportName).sort(), expected);
       if (knip && i % 2 === 1) compareKnip();
     }
     function compareKnip() {
@@ -88,5 +90,5 @@ async function bench() {
   } finally { await rm(root,{recursive:true,force:true}); }
 }
 
-if (process.argv[2] === '--once') console.log(JSON.stringify(await once(process.argv[3])));
+if (process.argv[2] === '--once') console.log(JSON.stringify(await once(process.argv[3], true)));
 else await bench();
