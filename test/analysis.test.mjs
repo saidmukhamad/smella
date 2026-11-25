@@ -406,3 +406,16 @@ test('missing workspace entry keeps positive evidence and an unresolved target s
   assert.equal(subject(r,'pkgs/b/stale.ts','x').status,'conditional');
   assert.deepEqual(subject(r,'pkgs/b/stale.ts','x').usage.value,[]);
 });
+
+test('unbounded loads behind unrooted cross-workspace reads qualify otherwise unrelated findings', async t => {
+  const root = await fixture(t,{
+    'package.json':'{"workspaces":["p/*"]}', 'app.ts':'void 0;', 'independent.ts':'export const maybe = 1;',
+    'p/a/package.json':'{"name":"a"}', 'p/a/orphan.ts':'import {run} from "b"; run();',
+    'p/b/package.json':'{"name":"b","exports":"./api.ts"}', 'p/b/api.ts':'export function run() { return import(path); }',
+  });
+  const r = await inspect(t,root,app);
+  const gap = r.coverage.gaps.find(g=>g.code==='computed-import');
+  assert.equal(gap.affectedFiles,null);
+  assert.ok(subject(r,'independent.ts','maybe').gapIds.includes(gap.id));
+  assert.deepEqual(subject(r,'p/b/api.ts','run').usage.value,[]);
+});

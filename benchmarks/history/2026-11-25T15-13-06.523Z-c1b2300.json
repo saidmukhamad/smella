@@ -1,0 +1,126 @@
+{
+  "schema": 1,
+  "observedAt": "2026-11-25T15:13:06.523Z",
+  "revision": "c1b23003f048e33564feb72c7621b16cbc374939",
+  "dirty": false,
+  "machine": {
+    "cpu": "12th Gen Intel(R) Core(TM) i5-12400",
+    "os": "6.8.0-138-generic",
+    "platform": "linux",
+    "arch": "x64",
+    "node": "v24.11.0",
+    "rust": "rustc 1.88.0 (6b00bc388 2025-06-23)"
+  },
+  "chain": {
+    "fixture": "chain-v1",
+    "node": "v24.11.0",
+    "rust": "rustc 1.88.0 (6b00bc388 2025-06-23)",
+    "cpu": "12th Gen Intel(R) Core(TM) i5-12400",
+    "os": "6.8.0-138-generic",
+    "revision": "c1b2300",
+    "files": 513,
+    "findings": 512,
+    "samples": 20,
+    "startupMs": {
+      "p50": 18.19,
+      "p95": 18.43
+    },
+    "coldProcessMs": {
+      "p50": 39.77,
+      "p95": 49.7
+    },
+    "coldPeakRSSKiB": 62336,
+    "residentMs": {
+      "p50": 3.04,
+      "p95": 3.51
+    },
+    "analysisMs": {
+      "p50": 2.47,
+      "p95": 2.97
+    },
+    "findingsConversionMs": {
+      "p50": 0.52,
+      "p95": 0.61
+    },
+    "knip": "6.48.0",
+    "knipColdProcessMs": {
+      "p50": 226.73,
+      "p95": 236.71
+    }
+  },
+  "workspace": {
+    "fixture": "workspace-v1",
+    "packages": 32,
+    "testRoots": 64,
+    "files": 97,
+    "samples": 20,
+    "analysisAndFindingsMs": {
+      "p50": 1.39,
+      "p95": 1.56
+    },
+    "explanationMs": {
+      "p50": 6.19,
+      "p95": 6.44
+    },
+    "totalMs": {
+      "p50": 7.57,
+      "p95": 8.08
+    }
+  },
+  "package": {
+    "compressedBytes": 1830582,
+    "unpackedBytes": 4310521
+  },
+  "targetProfile": "Linux x64, Intel Core i5-12400, Node 24, optimized native build",
+  "checks": [
+    {
+      "metric": "chain.residentMs.p95",
+      "actual": 3.51,
+      "max": 5,
+      "unit": "ms",
+      "pass": true
+    },
+    {
+      "metric": "chain.coldProcessMs.p95",
+      "actual": 49.7,
+      "max": 65,
+      "unit": "ms",
+      "pass": true
+    },
+    {
+      "metric": "chain.findingsConversionMs.p95",
+      "actual": 0.61,
+      "max": 1,
+      "unit": "ms",
+      "pass": true
+    },
+    {
+      "metric": "chain.coldPeakRSSKiB",
+      "actual": 62336,
+      "max": 81920,
+      "unit": "KiB",
+      "pass": true
+    },
+    {
+      "metric": "workspace.totalMs.p95",
+      "actual": 8.08,
+      "max": 25,
+      "unit": "ms",
+      "pass": true
+    },
+    {
+      "metric": "package.compressedBytes",
+      "actual": 1830582,
+      "max": 2097152,
+      "unit": "B",
+      "pass": true
+    },
+    {
+      "metric": "package.unpackedBytes",
+      "actual": 4310521,
+      "max": 5242880,
+      "unit": "B",
+      "pass": true
+    }
+  ]
+}

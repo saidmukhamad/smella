@@ -5,7 +5,7 @@
     { "metric": "chain.coldProcessMs.p95", "max": 65, "unit": "ms" },
     { "metric": "chain.findingsConversionMs.p95", "max": 1, "unit": "ms" },
     { "metric": "chain.coldPeakRSSKiB", "max": 81920, "unit": "KiB" },
-    { "metric": "workspace.totalMs.p95", "max": 25, "unit": "ms" },
+    { "metric": "workspace.totalMs.p95", "max": 6, "unit": "ms" },
     { "metric": "package.compressedBytes", "max": 2097152, "unit": "B" },
     { "metric": "package.unpackedBytes", "max": 5242880, "unit": "B" }
   ]

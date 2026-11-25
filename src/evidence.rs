@@ -76,6 +76,46 @@ fn crossing_imports(graph: &Graph, workspace: &[usize]) -> Vec<bool> {
     crossing
 }
 
+/// Encode common suffixes once at the native boundary. A chain of N callers
+/// can have N distinct paths to a subject with only O(N) distinct steps.
+#[derive(Default)]
+struct WorkspacePaths(Vec<Value>);
+
+impl WorkspacePaths {
+    fn push(&mut self, graph: &Graph, id: Id, tail: Option<(usize, Loc)>) -> usize {
+        let node = &graph.nodes[id];
+        let index = self.0.len();
+        self.0.push(json!({
+            "file": graph.paths[node.file], "kind": node.kind, "name": node.name, "location": node.loc,
+            "next": tail.map(|(next, _)| next), "edge": tail.map(|(_, loc)| loc),
+        }));
+        index
+    }
+
+    fn intern(
+        &mut self,
+        graph: &Graph,
+        start: usize,
+        next: &HashMap<usize, Option<Step>>,
+        known: &mut HashMap<usize, usize>,
+    ) -> usize {
+        let mut missing = Vec::new();
+        let mut current = start;
+        while !known.contains_key(&current) {
+            missing.push(current);
+            let Some(step) = next[&current] else {
+                break;
+            };
+            current = step.state;
+        }
+        for state in missing.into_iter().rev() {
+            let tail = next[&state].map(|step| (known[&step.state], step.loc));
+            known.insert(state, self.push(graph, state / 2, tail));
+        }
+        known[&start]
+    }
+}
+
 impl Evidence {
     pub fn build(
         graph: &Graph,
@@ -197,11 +237,17 @@ impl Evidence {
         }
     }
 
-    pub fn explain(&self, graph: &Graph, binding: Id, module: bool) -> (Vec<Value>, Vec<Value>) {
+    pub fn explain(
+        &self,
+        graph: &Graph,
+        binding: Id,
+        module: bool,
+    ) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
         let mut tests = BTreeMap::<Id, Vec<&str>>::new();
         let mut sources = BTreeMap::new();
+        let mut paths = WorkspacePaths::default();
         if self.offsets.is_empty() {
-            return (vec![], vec![]);
+            return (vec![], vec![], vec![]);
         }
         for phase in 0..2 {
             let fact = if phase == 1 {
@@ -211,6 +257,7 @@ impl Evidence {
             } else {
                 "value"
             };
+            let mut known = HashMap::new();
             let start = state(binding, phase);
             let mut next = HashMap::from([(start, None)]);
             let mut queue = VecDeque::from([start]);
@@ -223,20 +270,11 @@ impl Evidence {
                         let owner = &graph.nodes[read.state / 2];
                         let key = (owner.file, read.loc.start, read.loc.end, phase);
                         sources.entry(key).or_insert_with(|| {
-                            let mut path = vec![graph.step(read.state / 2, None)];
-                            let mut current = s;
-                            let mut via = (owner.file, read.loc);
-                            loop {
-                                path.push(graph.step(current / 2, Some(via)));
-                                let Some(step): Option<Step> = next[&current] else {
-                                    break;
-                                };
-                                via = (graph.nodes[current / 2].file, step.loc);
-                                current = step.state;
-                            }
+                            let suffix = paths.intern(graph, s, &next, &mut known);
+                            let first = paths.push(graph, read.state / 2, Some((suffix, read.loc)));
                             json!({
                                 "file": graph.paths[owner.file], "location": read.loc,
-                                "fact": fact, "path": path
+                                "fact": fact, "first": first
                             })
                         });
                     }
@@ -260,6 +298,7 @@ impl Evidence {
                 .map(|(f, facts)| json!({"file":graph.paths[f],"facts":facts}))
                 .collect(),
             sources.into_values().collect(),
+            paths.0,
         )
     }
 }

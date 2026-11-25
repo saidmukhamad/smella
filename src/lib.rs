@@ -25,7 +25,9 @@ impl Snapshot {
 impl Snapshot {
     #[napi]
     pub fn metadata(&self) -> Result<String> {
-        Ok(self.live()?.metadata().to_string())
+        self.live()?
+            .metadata()
+            .map_err(|e| Error::from_reason(e.to_string()))
     }
     #[napi]
     pub fn findings(&self, kind: Option<String>) -> Result<String> {

@@ -102,3 +102,5 @@ This evidence follows resolved binding reads and module loads from files outside
 `npm run bench` builds in release mode and measures a deterministic 513-file graph in fresh and resident Node processes. Set `KNIP_BIN` to an installed Knip executable to include the exports-and-files comparison. The harness checks the full set of findings before accepting samples. The source fixture and runtime have different costs from a real repository with plugin discovery, unresolved imports, or many test roots.
 
 `npm run build` produces the checkout addon. On Linux x64 with glibc it also stages the native package under `npm/linux-x64-gnu`. Run `npm pack` there and in the repository root to create the two installable tarballs. Both manifests are private during development.
+
+The benchmark ledger records revisions, latency percentiles, memory, package sizes, and target checks. Use `npm run bench:record` to append a measurement and update the progress plot. [Release goals, workloads and history](benchmarks/README.md)

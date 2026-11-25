@@ -66,6 +66,25 @@ function indexGaps(gaps) {
   };
 }
 
+function decodeExplanation(record) {
+  const steps = record.workspaceSteps;
+  delete record.workspaceSteps;
+  for (const read of record.unrootedWorkspaceReads) {
+    const path = [];
+    let index = read.first;
+    let via = null;
+    while (index !== null) {
+      const step = steps[index];
+      path.push({file:step.file, kind:step.kind, name:step.name, location:{...step.location}, via});
+      via = step.next === null ? null : {file:step.file, location:{...step.edge}};
+      index = step.next;
+    }
+    delete read.first;
+    read.path = path;
+  }
+  return record;
+}
+
 export function createConfig(config) { return config; }
 
 export async function analyze({ root = process.cwd(), ...options } = {}) {
@@ -88,7 +107,7 @@ export async function analyze({ root = process.cwd(), ...options } = {}) {
     findings({ kind } = {}) { return JSON.parse(live().findings(kind)).map(withGaps); },
     explain(subject) {
       const current = live();
-      try { return withGaps(JSON.parse(current.explain(JSON.stringify(subject)))); }
+      try { return withGaps(decodeExplanation(JSON.parse(current.explain(JSON.stringify(subject))))); }
       catch (cause) { throw new AnalysisError('UNKNOWN_SUBJECT', cause.message, cause); }
     },
     dispose() {

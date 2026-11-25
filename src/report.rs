@@ -227,15 +227,31 @@ impl Report {
             evidence,
         })
     }
-    pub fn metadata(&self) -> Value {
-        json!({
-            "roots": self.roots,
-            "coverage": {
-                "status": if self.gaps.is_empty() { "complete" } else { "partial" },
-                "files": self.graph.paths,
-                "excluded": self.excluded,
-                "gaps": self.gaps
-            }
+    pub fn metadata(&self) -> Result<String, serde_json::Error> {
+        #[derive(Serialize)]
+        struct Coverage<'a> {
+            status: &'static str,
+            files: &'a [String],
+            excluded: &'a [String],
+            gaps: &'a [Gap],
+        }
+        #[derive(Serialize)]
+        struct Metadata<'a> {
+            roots: &'a [Root],
+            coverage: Coverage<'a>,
+        }
+        serde_json::to_string(&Metadata {
+            roots: &self.roots,
+            coverage: Coverage {
+                status: if self.gaps.is_empty() {
+                    "complete"
+                } else {
+                    "partial"
+                },
+                files: &self.graph.paths,
+                excluded: &self.excluded,
+                gaps: &self.gaps,
+            },
         })
     }
     fn record(&self, index: usize, s: &Subject) -> Record<'_> {
@@ -360,11 +376,12 @@ impl Report {
             }
         }
         result["witnesses"] = Value::Array(witnesses);
-        let (tests, reads) = self
-            .evidence
-            .explain(&self.graph, s.binding, s.form == Form::Module);
+        let (tests, reads, steps) =
+            self.evidence
+                .explain(&self.graph, s.binding, s.form == Form::Module);
         result["tests"] = Value::Array(tests);
         result["unrootedWorkspaceReads"] = Value::Array(reads);
+        result["workspaceSteps"] = Value::Array(steps);
         result["reason"] = match s.kind {
             Some("unused-export") => "No retaining binding reference from the effective roots. Module initialization is tracked separately.",
             Some("unreferenced-module") => "No evaluation, type, or public-contract path from the effective roots.",
