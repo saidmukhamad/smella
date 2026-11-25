@@ -37,6 +37,8 @@ function indexGaps(gaps) {
   const global = [];
   const local = new Map();
   for (const gap of gaps) {
+    // The native graph qualifies individual subjects for unrooted workspace reads.
+    if (gap.code === 'unrooted-workspace-reference') continue;
     if (gap.affectedFiles === null) global.push(gap.id);
     else for (const file of gap.affectedFiles) {
       if (!local.has(file)) local.set(file, []);
@@ -50,8 +52,15 @@ function indexGaps(gaps) {
     if (!byCombination.has(key)) byCombination.set(key, Object.freeze(global.concat(ids)));
     local.set(file, byCombination.get(key));
   }
+  const withWorkspace = new Map();
   return record => {
-    record.gapIds = local.get(record.file) ?? global;
+    let ids = local.get(record.file) ?? global;
+    if (record.workspaceGap) {
+      if (!withWorkspace.has(ids)) withWorkspace.set(ids, Object.freeze([...ids, record.workspaceGap]));
+      ids = withWorkspace.get(ids);
+      delete record.workspaceGap;
+    }
+    record.gapIds = ids;
     record.status = record.gapIds.length ? 'conditional' : 'complete';
     return record;
   };

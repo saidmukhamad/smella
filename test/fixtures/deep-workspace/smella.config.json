@@ -1,0 +1,12 @@
+{
+  "entries": {
+    "runtime": [
+      "app.ts"
+    ],
+    "test": [
+      "tests/*.test.ts"
+    ],
+    "tooling": []
+  },
+  "publicEntries": []
+}

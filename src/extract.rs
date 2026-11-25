@@ -10,7 +10,7 @@ use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::module_record::{ExportExportName, ExportImportName, ImportImportName};
 use oxc_syntax::node::NodeId;
 
-use crate::graph::{Edge, Export, Id, Loc};
+use crate::graph::{Edge, Export, Gap, Graph, Id, Link, Loc, Module, Node, PendingGap};
 use crate::project::Project;
 
 #[derive(Clone, Copy)]
@@ -26,43 +26,144 @@ impl Owner {
     }
 }
 
-fn target(
-    project: &mut Project,
+/// File IDs occupy the prefix shared by all workers. Binding IDs are local to
+/// a summary until it is appended in file order.
+pub struct FileSummary {
     file: Id,
-    spec: &str,
-    span: Span,
-    guard: Option<Id>,
-    type_only: bool,
-) -> Option<Id> {
-    match project.resolve(file, spec, type_only) {
-        Ok(target) => target,
-        Err(message) => {
-            project.graph.gap(
-                "unresolved-import",
-                Some(file),
-                Some(span.into()),
+    base: usize,
+    path: String,
+    nodes: Vec<Node>,
+    evaluation: Vec<Edge>,
+    module: Module,
+    links: Vec<Link>,
+    gaps: Vec<PendingGap>,
+    pub parsed: bool,
+}
+
+impl FileSummary {
+    fn node(&mut self, kind: &'static str, name: &str, loc: Loc) -> Id {
+        let id = self.base + self.nodes.len();
+        self.nodes.push(Node {
+            file: self.file,
+            kind,
+            name: name.into(),
+            loc,
+            edges: vec![],
+        });
+        id
+    }
+    fn edge(&mut self, from: Id, target: Id, type_only: bool, loc: Loc) {
+        let edges = if from == self.file {
+            &mut self.evaluation
+        } else {
+            &mut self.nodes[from - self.base].edges
+        };
+        edges.push(Edge {
+            target,
+            type_only,
+            loc,
+        });
+    }
+    fn gap(
+        &mut self,
+        code: &'static str,
+        loc: Option<Loc>,
+        message: String,
+        guard: Option<Id>,
+        target_file: Option<Id>,
+    ) {
+        self.gaps.push(PendingGap {
+            record: Gap {
+                code,
+                file: Some(self.path.clone()),
+                location: loc,
                 message,
-                guard,
-                None,
-            );
-            None
+                affected_files: None,
+                id: String::new(),
+            },
+            guard,
+            target_file,
+        });
+    }
+    fn target(
+        &mut self,
+        project: &Project,
+        spec: &str,
+        span: Span,
+        guard: Option<Id>,
+        type_only: bool,
+    ) -> Option<Id> {
+        match project.resolve(self.file, spec, type_only) {
+            Ok(target) => target,
+            Err(message) => {
+                self.gap("unresolved-import", Some(span.into()), message, guard, None);
+                None
+            }
         }
+    }
+
+    pub fn append(mut self, graph: &mut Graph) {
+        let offset = graph.nodes.len() - self.base;
+        let relocate = |id: Id| if id >= self.base { id + offset } else { id };
+        for edges in
+            std::iter::once(&mut self.evaluation).chain(self.nodes.iter_mut().map(|n| &mut n.edges))
+        {
+            for edge in edges {
+                edge.target = relocate(edge.target);
+            }
+        }
+        for export in self.module.exports.values_mut() {
+            export.binding = relocate(export.binding);
+            export.surface = relocate(export.surface);
+        }
+        for (from, ..) in &mut self.links {
+            *from = relocate(*from);
+        }
+        for gap in &mut self.gaps {
+            gap.guard = gap.guard.map(relocate);
+        }
+        graph.nodes[self.file].edges = self.evaluation;
+        graph.modules[self.file] = self.module;
+        graph.nodes.append(&mut self.nodes);
+        graph.links.append(&mut self.links);
+        graph.gaps.append(&mut self.gaps);
     }
 }
 
-pub fn extract(project: &mut Project, file: Id) -> bool {
+pub fn summarize(
+    project: &Project,
+    file: Id,
+    entry_file: bool,
+    arena: &mut Allocator,
+) -> FileSummary {
+    arena.reset();
+    let mut summary = FileSummary {
+        file,
+        path: project.graph.paths[file].clone(),
+        base: project.graph.paths.len(),
+        nodes: vec![],
+        evaluation: vec![],
+        module: Module::default(),
+        links: vec![],
+        gaps: vec![],
+        parsed: false,
+    };
+    summary.parsed = extract(project, &mut summary, arena, entry_file);
+    summary
+}
+
+fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_file: bool) -> bool {
+    let file = out.file;
     let path = project.root.join(&project.graph.paths[file]);
     let source = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) => {
-            project
-                .graph
-                .gap("read-error", Some(file), None, e.to_string(), None, None);
+            out.gap("read-error", None, e.to_string(), None, None);
             return false;
         }
     };
-    let arena = Allocator::default();
-    let mut parsed = Parser::new(&arena, &source, SourceType::from_path(&path).unwrap()).parse();
+
+    let mut parsed = Parser::new(arena, &source, SourceType::from_path(&path).unwrap()).parse();
     let declaration_file = parsed.program.source_type.is_typescript_definition();
     if declaration_file {
         // Oxc parses ambient syntax in declaration mode but skips its semantic walk.
@@ -83,14 +184,7 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
                 start: s.offset() as u32,
                 end: (s.offset() + s.len()) as u32,
             });
-        project.graph.gap(
-            "parse-error",
-            Some(file),
-            loc,
-            error.message.to_string(),
-            None,
-            None,
-        );
+        out.gap("parse-error", loc, error.message.to_string(), None, None);
     }
     if parsed.panicked {
         return false;
@@ -107,8 +201,7 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
     {
         let name = scoping.symbol_name(symbol);
         let flags = scoping.symbol_flags(symbol);
-        let id = project.graph.node(
-            file,
+        let id = out.node(
             if flags.is_import() || flags.is_type_import() {
                 "import"
             } else {
@@ -156,10 +249,10 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
         let type_only = declaration_file
             || item.is_type
             || import_phases.get(&item.statement_span.start) == Some(&true);
-        let to = target(project, file, spec, item.span, None, type_only);
+        let to = out.target(project, spec, item.span, None, type_only);
         requests.insert(item.statement_span.start, to);
         if let Some(to) = to {
-            project.graph.edge(file, to, type_only, item.span.into());
+            out.edge(file, to, type_only, item.span.into());
         }
     }
     let mut namespaces = HashMap::new();
@@ -182,7 +275,7 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
                 continue;
             }
         };
-        project.graph.links.push((
+        out.links.push((
             from,
             to,
             name.into(),
@@ -207,7 +300,7 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
         } else {
             "export"
         };
-        let surface = project.graph.node(file, kind, name, loc);
+        let surface = out.node(kind, name, loc);
         let mut binding = surface;
         if export.module_request.is_some() {
             if let Some(to) = requests
@@ -228,14 +321,11 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
                     } else {
                         n.name.as_str()
                     };
-                    project
-                        .graph
-                        .links
+                    out.links
                         .push((surface, to, key.into(), export.is_type, loc));
                 } else {
-                    project.graph.gap(
+                    out.gap(
                         "namespace-escape",
-                        Some(file),
                         Some(loc),
                         "A re-export exposes the module namespace.".into(),
                         Some(surface),
@@ -245,11 +335,10 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
             }
         } else if let Some(id) = export.local_name.name().and_then(|n| local(n.as_str())) {
             binding = id;
-            project.graph.edge(surface, id, export.is_type, loc);
+            out.edge(surface, id, export.is_type, loc);
             if let Some(&(to, _)) = namespaces.get(&id) {
-                project.graph.gap(
+                out.gap(
                     "namespace-escape",
-                    Some(file),
                     Some(loc),
                     "A re-export exposes the module namespace.".into(),
                     Some(surface),
@@ -259,16 +348,15 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
         } else if name == "default" {
             default_expr = Some(surface);
         } else {
-            project.graph.gap(
+            out.gap(
                 "missing-binding",
-                Some(file),
                 Some(loc),
                 format!("No local declaration resolved for {name}."),
                 None,
                 None,
             );
         }
-        project.graph.modules[file].exports.insert(
+        out.module.exports.insert(
             name.into(),
             Export {
                 surface,
@@ -284,18 +372,17 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
                 .copied()
                 .flatten()
             {
-                project.graph.modules[file].stars.push(Edge {
+                out.module.stars.push(Edge {
                     target: to,
                     type_only: export.is_type,
                     loc: spec.span.into(),
                 });
-            } else if !project.graph.gaps.iter().any(|g| {
+            } else if !out.gaps.iter().any(|g| {
                 g.record.code == "unresolved-import"
                     && g.record.file.as_ref() == Some(&project.graph.paths[file])
             }) {
-                project.graph.gap(
+                out.gap(
                     "external-star",
-                    Some(file),
                     Some(spec.span.into()),
                     format!(
                         "The export names of external module {:?} are outside the source scope.",
@@ -307,15 +394,8 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
             }
         }
     }
-    let exported: std::collections::HashSet<_> = project.graph.modules[file]
-        .exports
-        .values()
-        .map(|e| e.binding)
-        .collect();
-    let entry_file = project
-        .roots
-        .iter()
-        .any(|r| r.file == project.graph.paths[file] && r.role != crate::graph::Role::Public);
+    let exported: std::collections::HashSet<_> =
+        out.module.exports.values().map(|e| e.binding).collect();
     let module_owner = Owner {
         binding: file,
         eager: false,
@@ -329,11 +409,9 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
             let id = if ids.len() == 1 {
                 ids[0]
             } else {
-                let group = project
-                    .graph
-                    .node(file, "declaration", "", node.span().into());
+                let group = out.node("declaration", "", node.span().into());
                 for &id in ids {
-                    project.graph.edge(id, group, false, node.span().into());
+                    out.edge(id, group, false, node.span().into());
                 }
                 group
             };
@@ -410,16 +488,13 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
                             };
                             if let Some(property) = property {
                                 // Each access gets its own vertex so two properties of the same namespace cannot contaminate each other.
-                                let access = project.graph.node(
-                                    file,
+                                let access = out.node(
                                     "import",
                                     &format!("{}.{}", ident.name, property),
                                     loc,
                                 );
-                                project
-                                    .graph
-                                    .edge(from, access, is_type || type_import, loc);
-                                project.graph.links.push((
+                                out.edge(from, access, is_type || type_import, loc);
+                                out.links.push((
                                     access,
                                     to,
                                     property.into(),
@@ -427,9 +502,8 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
                                     loc,
                                 ));
                             } else {
-                                project.graph.gap(
+                                out.gap(
                                     "namespace-escape",
-                                    Some(file),
                                     Some(loc),
                                     format!(
                                         "The properties read from namespace {} are unknown.",
@@ -440,7 +514,7 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
                                 );
                             }
                         } else {
-                            project.graph.edge(from, binding, is_type, loc);
+                            out.edge(from, binding, is_type, loc);
                         }
                     }
                 } else if reference.symbol_id().is_none()
@@ -450,9 +524,8 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
                     )
                 {
                     for from in owner.sources(file) {
-                        project.graph.gap(
+                        out.gap(
                             "unsupported-runtime",
-                            Some(file),
                             Some(loc),
                             format!("Runtime use of {} is outside the ESM model.", ident.name),
                             Some(from),
@@ -465,9 +538,9 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
                 for from in owner.sources(file) {
                     if let Expression::StringLiteral(s) = &expr.source {
                         if let Some(to) =
-                            target(project, file, s.value.as_str(), s.span, Some(from), false)
+                            out.target(project, s.value.as_str(), s.span, Some(from), false)
                         {
-                            project.graph.edge(from, to, false, loc);
+                            out.edge(from, to, false, loc);
                             let mut awaited = false;
                             let parent =
                                 nodes.ancestors(node.id()).skip(1).find(|n| match n.kind() {
@@ -481,19 +554,18 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
                             match parent.map(|p| p.kind()) {
                                 Some(AstKind::ExpressionStatement(_)) => {}
                                 Some(AstKind::StaticMemberExpression(m)) if awaited => {
-                                    project.graph.links.push((from, to, m.property.name.to_string(), false, loc));
+                                    out.links.push((from, to, m.property.name.to_string(), false, loc));
                                 }
-                                _ => project.graph.gap(
-                                    "namespace-escape", Some(file), Some(loc),
+                                _ => out.gap(
+                                    "namespace-escape", Some(loc),
                                     "The literal import resolves, but uses of its namespace are unknown.".into(),
                                     Some(from), Some(to),
                                 ),
                             }
                         }
                     } else {
-                        project.graph.gap(
+                        out.gap(
                             "computed-import",
-                            Some(file),
                             Some(loc),
                             "Supply the possible module specifiers for this dynamic import.".into(),
                             Some(from),
@@ -505,9 +577,8 @@ pub fn extract(project: &mut Project, file: Id) -> bool {
             AstKind::TSImportType(_)
             | AstKind::TSImportEqualsDeclaration(_)
             | AstKind::TSExportAssignment(_) => {
-                project.graph.gap(
+                out.gap(
                     "unsupported-syntax",
-                    Some(file),
                     Some(loc),
                     "This TypeScript module construct requires additional resolution.".into(),
                     None,

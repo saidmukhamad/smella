@@ -68,14 +68,20 @@ fn strings(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
+enum WorkspacePackage {
+    Unique { dir: PathBuf, has_exports: bool },
+    Ambiguous,
+}
+
 pub struct Project {
     pub root: PathBuf,
     pub roots: Vec<Root>,
     pub graph: Graph,
     pub excluded: Vec<String>,
-    resolver: Resolver,
-    type_resolver: Resolver,
-    workspaces: BTreeMap<String, PathBuf>,
+    resolvers: Vec<[Resolver; 2]>,
+    file_profile: Vec<usize>,
+    workspaces: BTreeMap<String, WorkspacePackage>,
+    pub workspace_for_file: Vec<usize>,
 }
 
 impl Project {
@@ -103,6 +109,7 @@ impl Project {
         let mut paths = vec![];
         let mut excluded = vec![];
         let mut manifests = vec![];
+        let mut config_dirs = BTreeMap::new();
         let mut walker = WalkDir::new(&root).sort_by_file_name().into_iter();
         while let Some(entry) = walker.next() {
             let entry = entry.map_err(|e| format!("Cannot enumerate source scope: {e}"))?;
@@ -124,6 +131,18 @@ impl Project {
             }
             if !entry.file_type().is_file() {
                 continue;
+            }
+            if name == "tsconfig.json" {
+                config_dirs.insert(
+                    entry
+                        .path()
+                        .parent()
+                        .unwrap()
+                        .strip_prefix(&root)
+                        .unwrap()
+                        .to_owned(),
+                    0usize,
+                );
             }
             if name == "package.json" {
                 manifests.push(entry.path().to_owned());
@@ -152,7 +171,6 @@ impl Project {
         if paths.is_empty() {
             return Err("No analyzable JS or TS files in the effective scope.".into());
         }
-        let tsconfig = root.join("tsconfig.json");
         let options = ResolveOptions {
             extensions: EXTENSIONS.iter().map(|e| format!(".{e}")).collect(),
             extension_alias: vec![
@@ -161,12 +179,6 @@ impl Project {
                 (".mjs".into(), strings(&[".mjs", ".mts"])),
                 (".cjs".into(), strings(&[".cjs", ".cts"])),
             ],
-            tsconfig: tsconfig.is_file().then_some({
-                TsconfigDiscovery::Manual(TsconfigOptions {
-                    config_file: tsconfig,
-                    references: TsconfigReferences::Auto,
-                })
-            }),
             builtin_modules: true,
             condition_names: strings(&["node", "import"]),
             main_fields: strings(&["module", "main"]),
@@ -181,8 +193,29 @@ impl Project {
         type_options.extension_alias[3].1.push(".d.cts".into());
         type_options.condition_names.push("types".into());
         type_options.main_fields.insert(0, "types".into());
-        let resolver = Resolver::new(options);
-        let type_resolver = resolver.clone_with_options(type_options);
+        let base = Resolver::new(options.clone());
+        let mut resolvers = vec![[
+            base.clone_with_options(options.clone()),
+            base.clone_with_options(type_options.clone()),
+        ]];
+        for (dir, index) in &mut config_dirs {
+            let tsconfig = Some(TsconfigDiscovery::Manual(TsconfigOptions {
+                config_file: root.join(dir).join("tsconfig.json"),
+                references: TsconfigReferences::Auto,
+            }));
+            *index = resolvers.len();
+            resolvers.push([
+                base.clone_with_options(ResolveOptions {
+                    tsconfig: tsconfig.clone(),
+                    ..options.clone()
+                }),
+                base.clone_with_options(ResolveOptions {
+                    tsconfig,
+                    ..type_options.clone()
+                }),
+            ]);
+        }
+        let file_profile = closest_directories(&paths, &config_dirs);
 
         let root_manifest = root.join("package.json");
         let manifest = if manifests.contains(&root_manifest) {
@@ -190,37 +223,64 @@ impl Project {
         } else {
             Value::Null
         };
-        let patterns = manifest
-            .pointer("/workspaces/packages")
-            .or(manifest.get("workspaces"))
-            .and_then(Value::as_array);
-        let workspace_globs: Vec<_> = patterns
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(matcher)
-            .collect::<Result<_, _>>()?;
+        // A workspace member can in turn declare workspaces relative to itself.
+        // Register parents first and let the closest member own a source file.
+        let pnpm = root.join("pnpm-workspace.yaml");
+        let uses_pnpm = pnpm.try_exists().map_err(|e| e.to_string())?;
+        let root_patterns = if uses_pnpm {
+            #[derive(Deserialize)]
+            struct PnpmWorkspace {
+                #[serde(default)]
+                packages: Vec<String>,
+            }
+            let bytes = fs::read(&pnpm).map_err(|e| format!("{}: {e}", pnpm.display()))?;
+            let config: PnpmWorkspace = serde_yaml_ng::from_slice(&bytes)
+                .map_err(|e| format!("{}: {e}", pnpm.display()))?;
+            WorkspacePatterns::from_patterns(config.packages.iter().map(String::as_str))?
+        } else {
+            workspace_patterns(&manifest)?
+        };
+        let mut patterns = BTreeMap::from([(PathBuf::new(), root_patterns)]);
         let mut packages = vec![(PathBuf::new(), manifest)];
+        let mut directories = BTreeMap::from([(PathBuf::new(), 0)]);
         let mut workspaces = BTreeMap::new();
+        manifests.sort_by_key(|p| (p.components().count(), p.clone()));
         for path in manifests.into_iter().filter(|p| p != &root_manifest) {
             let dir = path.parent().unwrap();
             let rel = dir.strip_prefix(&root).unwrap();
-            if workspace_globs.iter().any(|g| g.is_match(rel)) {
+            let member = rel.ancestors().skip(1).any(|a| {
+                patterns
+                    .get(a)
+                    .is_some_and(|globs| globs.matches(rel.strip_prefix(a).unwrap()))
+            });
+            if member {
                 let package = json(&path)?;
                 if let Some(name) = package["name"].as_str() {
-                    workspaces.insert(name.into(), dir.to_owned());
+                    workspaces
+                        .entry(name.to_owned())
+                        .and_modify(|pkg| *pkg = WorkspacePackage::Ambiguous)
+                        .or_insert_with(|| WorkspacePackage::Unique {
+                            dir: dir.to_owned(),
+                            has_exports: package.get("exports").is_some(),
+                        });
                 }
+                if !uses_pnpm {
+                    patterns.insert(rel.to_owned(), workspace_patterns(&package)?);
+                }
+                directories.insert(rel.to_owned(), packages.len());
                 packages.push((rel.to_owned(), package));
             }
         }
+        let workspace_for_file = closest_directories(&paths, &directories);
         let mut project = Self {
             root,
             graph: Graph::new(paths),
             excluded,
             workspaces,
             roots: vec![],
-            resolver,
-            type_resolver,
+            resolvers,
+            file_profile,
+            workspace_for_file,
         };
         for (role, supplied) in
             ROLES
@@ -354,11 +414,12 @@ impl Project {
     /// None means a resolved external package or Node builtin.
     pub fn resolve(&self, file: Id, spec: &str, type_only: bool) -> Result<Option<Id>, String> {
         let origin = self.root.join(&self.graph.paths[file]);
-        let resolver = if type_only {
-            &self.type_resolver
+        let profile = if spec.starts_with('.') || spec.starts_with('/') {
+            0
         } else {
-            &self.resolver
+            self.file_profile[file]
         };
+        let resolver = &self.resolvers[profile][usize::from(type_only)];
         let mut result = resolver.resolve(origin.parent().unwrap(), spec);
         if result.is_err() {
             let parts: Vec<_> = spec.split('/').collect();
@@ -367,11 +428,22 @@ impl Project {
             } else {
                 1
             };
-            if let Some(pkg) = self.workspaces.get(&parts[..count].join("/")) {
+            if let Some(package) = self.workspaces.get(&parts[..count].join("/")) {
+                let WorkspacePackage::Unique {
+                    dir: pkg,
+                    has_exports,
+                } = package
+                else {
+                    return Err(format!(
+                        "Multiple workspace packages match {spec:?}. Supply an unambiguous path mapping."
+                    ));
+                };
                 // Resolve as a package self-reference to respect its exports map.
-                result = resolver.resolve(pkg, spec);
-                if matches!(result, Err(ResolveError::NotFound(_))) {
-                    result = resolver.resolve(pkg, &format!("./{}", parts[count..].join("/")));
+                let package_resolver = &self.resolvers[0][usize::from(type_only)];
+                result = package_resolver.resolve(pkg, spec);
+                if !has_exports && matches!(result, Err(ResolveError::NotFound(_))) {
+                    result =
+                        package_resolver.resolve(pkg, &format!("./{}", parts[count..].join("/")));
                 }
             }
         }
@@ -396,6 +468,54 @@ impl Project {
             Err(e) => Err(format!("Cannot resolve {spec:?}: {e}")),
         }
     }
+}
+
+#[derive(Default)]
+struct WorkspacePatterns {
+    include: Vec<GlobMatcher>,
+    exclude: Vec<GlobMatcher>,
+}
+impl WorkspacePatterns {
+    fn from_patterns<'a>(patterns: impl Iterator<Item = &'a str>) -> Result<Self, String> {
+        let mut result = Self::default();
+        for pattern in patterns {
+            if let Some(negative) = pattern.strip_prefix('!') {
+                result.exclude.push(matcher(negative)?);
+            } else {
+                result.include.push(matcher(pattern)?);
+            }
+        }
+        Ok(result)
+    }
+    fn matches(&self, path: &Path) -> bool {
+        self.include.iter().any(|p| p.is_match(path))
+            && !self.exclude.iter().any(|p| p.is_match(path))
+    }
+}
+
+fn workspace_patterns(manifest: &Value) -> Result<WorkspacePatterns, String> {
+    WorkspacePatterns::from_patterns(
+        manifest
+            .pointer("/workspaces/packages")
+            .or(manifest.get("workspaces"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    )
+}
+
+fn closest_directories(paths: &[String], directories: &BTreeMap<PathBuf, usize>) -> Vec<usize> {
+    paths
+        .iter()
+        .map(|p| {
+            Path::new(p)
+                .ancestors()
+                .skip(1)
+                .find_map(|a| directories.get(a).copied())
+                .unwrap_or(0)
+        })
+        .collect()
 }
 
 fn manifest_targets<'a>(value: &'a Value, bin_map: bool, out: &mut Vec<&'a str>) {

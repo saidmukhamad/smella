@@ -1,6 +1,6 @@
 export type Context = 'runtime' | 'test' | 'tooling';
 export type Role = Context | 'public';
-export type FindingKind = 'unused-export' | 'test-only-export' | 'tooling-only-export' | 'unreferenced-module';
+export type FindingKind = 'unused-export' | 'test-only-export' | 'test-only-binding' | 'tooling-only-export' | 'unreferenced-module';
 export interface Config {
   include?: readonly string[];
   exclude?: readonly string[];
@@ -15,18 +15,29 @@ export interface Gap { id: string; code: string; file: string | null; location: 
 export interface Coverage { status: 'complete' | 'partial'; files: string[]; excluded: string[]; gaps: Gap[] }
 export interface Usage { value: Context[]; type: Context[]; contract: boolean; evaluation: Context[] }
 interface SubjectRecord {
-  id: string; file: string; exportName: string | null; location: Location; usage: Usage;
+  id: string; file: string; exportName: string | null; bindingName?: string; location: Location; usage: Usage;
   status: 'complete' | 'conditional'; gapIds: readonly string[];
 }
 export interface Finding extends SubjectRecord { kind: FindingKind }
 export interface Step { file: string; kind: string; name: string; location: Location; via: { file: string; location: Location } | null }
 export interface Witness { role: Role; fact: 'value' | 'type' | 'evaluation' | 'contract'; path: Step[] }
-export interface Explanation extends SubjectRecord { kind: FindingKind | null; reason: string; witnesses: Witness[] }
+export type TestFact = 'value' | 'type' | 'evaluation';
+export interface TestConsumer { file: string; facts: TestFact[] }
+export interface WorkspaceRead { file: string; location: Location; fact: TestFact; path: Step[] }
+export interface Explanation extends SubjectRecord {
+  kind: FindingKind | null;
+  reason: string;
+  witnesses: Witness[];
+  tests: TestConsumer[];
+  unrootedWorkspaceReads: WorkspaceRead[];
+}
+export type Subject = string | { file: string; exportName?: string; bindingName?: never }
+  | { file: string; bindingName: string; exportName?: never };
 export interface Report {
   readonly roots: readonly Root[];
   readonly coverage: Coverage;
   findings(filter?: { kind?: FindingKind }): Finding[];
-  explain(subject: string | { file: string; exportName?: string }): Explanation;
+  explain(subject: Subject): Explanation;
   dispose(): void;
 }
 export class AnalysisError extends Error {

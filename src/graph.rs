@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::Serialize;
 
 pub type Id = usize;
+pub type Link = (Id, Id, String, bool, Loc);
 
 #[derive(Clone, Copy, Default, Serialize)]
 pub struct Loc {
@@ -87,7 +88,7 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     pub modules: Vec<Module>,
     pub gaps: Vec<PendingGap>,
-    pub links: Vec<(Id, Id, String, bool, Loc)>,
+    pub links: Vec<Link>,
 }
 
 impl Graph {
@@ -145,6 +146,13 @@ impl Graph {
             guard,
             target_file,
         });
+    }
+    pub fn step(&self, id: Id, via: Option<(Id, Loc)>) -> serde_json::Value {
+        let node = &self.nodes[id];
+        serde_json::json!({
+            "file": self.paths[node.file], "kind": node.kind, "name": node.name, "location": node.loc,
+            "via": via.map(|(file,loc)| serde_json::json!({"file": self.paths[file], "location": loc}))
+        })
     }
     pub fn link(&mut self) {
         // Propagate names backwards across star edges, once per (file, name).
@@ -308,9 +316,10 @@ impl Reach {
         Self { visited }
     }
 
-    pub fn gaps(&self, graph: &Graph) -> Vec<Gap> {
-        let active =
-            |guard: Option<Id>| guard.is_none_or(|n| self.visited[n].iter().any(Option::is_some));
+    pub fn gaps(&self, graph: &Graph, uncertain: impl Fn(Id) -> bool) -> Vec<Gap> {
+        let active = |guard: Option<Id>| {
+            guard.is_none_or(|n| self.visited[n].iter().any(Option::is_some) || uncertain(n))
+        };
         let mut records = vec![];
         // Escaped namespace values can retain implementations beyond the target file.
         // Follow their possible dependencies without recording any positive usage.
@@ -320,6 +329,13 @@ impl Reach {
                 continue;
             }
             let mut record = pending.record.clone();
+            if pending
+                .guard
+                .is_some_and(|n| self.visited[n].iter().all(Option::is_none))
+            {
+                record.message =
+                    format!("If the unrooted workspace caller runs: {}", record.message);
+            }
             if let Some(target) = pending.target_file {
                 record.affected_files = closures
                     .entry(target)

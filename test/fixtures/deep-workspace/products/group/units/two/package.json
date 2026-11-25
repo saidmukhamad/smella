@@ -1,0 +1,4 @@
+{
+  "name": "@example/two",
+  "exports": "./src/barrel.ts"
+}

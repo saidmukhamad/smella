@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "~relay": [
+        "../two/src/barrel.ts"
+      ]
+    }
+  }
+}

@@ -1,17 +1,82 @@
-use std::path::Path;
+use oxc_allocator::Allocator;
+use rayon::prelude::*;
+use std::{path::Path, sync::OnceLock};
 
+use crate::evidence::Evidence;
+use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
-use crate::extract::extract;
+use crate::extract::summarize;
 use crate::graph::{Gap, Graph, Id, ROLES, Reach, Role, Root, Visit};
 use crate::project::{Config, Project};
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Form {
+    Module,
+    Export,
+    Binding,
+}
 
 struct Subject {
     file: Id,
     surface: Id,
     binding: Id,
-    export_name: Option<String>,
+    form: Form,
     kind: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Record<'a> {
+    id: String,
+    kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_gap: Option<&'a str>,
+    file: &'a str,
+    export_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binding_name: Option<&'a str>,
+    location: crate::graph::Loc,
+    usage: Usage,
+}
+
+#[derive(Serialize)]
+struct Usage {
+    value: Contexts,
+    #[serde(rename = "type")]
+    types: Contexts,
+    contract: bool,
+    evaluation: Contexts,
+}
+
+struct Contexts(u8);
+impl Serialize for Contexts {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(
+            ROLES[..3]
+                .iter()
+                .filter(|&&role| self.0 & (1 << role as usize) != 0),
+        )
+    }
+}
+
+fn classification(lanes: &[Option<Visit>; 8]) -> Option<&'static str> {
+    let used = |role: Role| {
+        lanes[role as usize * 2..role as usize * 2 + 2]
+            .iter()
+            .any(Option::is_some)
+    };
+    match (
+        used(Role::Runtime),
+        used(Role::Test),
+        used(Role::Tooling),
+        used(Role::Public),
+    ) {
+        (false, false, false, false) => Some("unused-export"),
+        (false, true, false, false) => Some("test-only-export"),
+        (false, false, true, false) => Some("tooling-only-export"),
+        _ => None,
+    }
 }
 
 pub struct Report {
@@ -21,19 +86,58 @@ pub struct Report {
     gaps: Vec<Gap>,
     reach: Reach,
     subjects: Vec<Subject>,
+    evidence: Evidence,
 }
 
 impl Report {
     pub fn build(root: &Path, config: Config) -> Result<Self, String> {
         let mut project = Project::open(root, config)?;
-        let parsed: Vec<_> = (0..project.graph.paths.len())
-            .map(|f| extract(&mut project, f))
-            .collect();
-        if !project
-            .roots
+        let file_count = project.graph.paths.len();
+        let mut roles = vec![0u8; file_count];
+        for root in &project.roots {
+            let file = project.graph.paths.binary_search(&root.file).unwrap();
+            roles[file] |= 1 << root.role as usize;
+        }
+        // Reuse workers across concurrent snapshots, and arenas across files.
+        static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+        let read = |arena: &mut Allocator, file| {
+            summarize(
+                &project,
+                file,
+                roles[file] & !(1 << Role::Public as usize) != 0,
+                arena,
+            )
+        };
+        let pool = (file_count >= 32)
+            .then(|| {
+                POOL.get_or_init(|| {
+                    let threads = std::thread::available_parallelism().ok()?.get().min(4);
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .ok()
+                })
+            })
+            .and_then(Option::as_ref);
+        let summaries: Vec<_> = if let Some(pool) = pool {
+            pool.install(|| {
+                (0..file_count)
+                    .into_par_iter()
+                    .map_init(Allocator::default, read)
+                    .collect()
+            })
+        } else {
+            let mut arena = Allocator::default();
+            (0..file_count).map(|file| read(&mut arena, file)).collect()
+        };
+        let usable = summaries
             .iter()
-            .any(|r| parsed[project.graph.paths.binary_search(&r.file).unwrap()])
-        {
+            .enumerate()
+            .any(|(file, summary)| roles[file] != 0 && summary.parsed);
+        for summary in summaries {
+            summary.append(&mut project.graph);
+        }
+        if !usable {
             let first = project.graph.gaps.iter().find(|g| {
                 g.record
                     .file
@@ -53,7 +157,26 @@ impl Report {
         let mut graph = project.graph;
         graph.link();
         let reach = Reach::compute(&graph, &project.roots);
-        let gaps = reach.gaps(&graph);
+        let mut workspace_gaps = Vec::new();
+        let evidence = Evidence::build(
+            &graph,
+            &reach,
+            &roles,
+            &project.workspace_for_file,
+            &mut workspace_gaps,
+        );
+        let mut gaps = reach.gaps(&graph, |id| evidence.gap_for(id).is_some());
+        gaps.append(&mut workspace_gaps);
+        let mut exported = vec![false; graph.nodes.len()];
+        for e in graph.modules.iter().flat_map(|m| m.exports.values()) {
+            exported[e.binding] = true;
+        }
+        let mut private = vec![vec![]; file_count];
+        for (id, n) in graph.nodes.iter().enumerate() {
+            if n.kind == "binding" && !exported[id] {
+                private[n.file].push(id);
+            }
+        }
         let mut subjects = vec![];
         for (file, module) in graph.modules.iter().enumerate() {
             let kind =
@@ -62,33 +185,28 @@ impl Report {
                 file,
                 surface: file,
                 binding: file,
-                export_name: None,
+                form: Form::Module,
                 kind,
             });
-            for (name, e) in &module.exports {
-                let lanes = &reach.visited[e.binding];
-                let used = |role: Role| {
-                    lanes[(role as usize) * 2..(role as usize) * 2 + 2]
-                        .iter()
-                        .any(Option::is_some)
-                };
-                let kind = match (
-                    used(Role::Runtime),
-                    used(Role::Test),
-                    used(Role::Tooling),
-                    used(Role::Public),
-                ) {
-                    (false, false, false, false) => Some("unused-export"),
-                    (false, true, false, false) => Some("test-only-export"),
-                    (false, false, true, false) => Some("tooling-only-export"),
-                    _ => None,
-                };
+            for e in module.exports.values() {
                 subjects.push(Subject {
                     file,
                     surface: e.surface,
                     binding: e.binding,
-                    export_name: Some(name.clone()),
-                    kind,
+                    form: Form::Export,
+                    kind: classification(&reach.visited[e.binding]),
+                });
+            }
+            private[file].sort_by(|&a, &b| graph.nodes[a].name.cmp(&graph.nodes[b].name));
+            for &binding in &private[file] {
+                let test_only = roles[file] & (1 << Role::Test as usize) == 0
+                    && classification(&reach.visited[binding]) == Some("test-only-export");
+                subjects.push(Subject {
+                    file,
+                    surface: binding,
+                    binding,
+                    form: Form::Binding,
+                    kind: test_only.then_some("test-only-binding"),
                 });
             }
         }
@@ -106,6 +224,7 @@ impl Report {
             excluded: project.excluded,
             gaps,
             subjects,
+            evidence,
         })
     }
     pub fn metadata(&self) -> Value {
@@ -119,53 +238,57 @@ impl Report {
             }
         })
     }
-    fn record(&self, index: usize, s: &Subject) -> Value {
+    fn record(&self, index: usize, s: &Subject) -> Record<'_> {
         let visits = &self.reach.visited[s.binding];
-        let module = &self.reach.visited[s.file];
-        let contexts = |visits: &[Option<Visit>; 8], phase: usize| {
-            ROLES[..3]
-                .iter()
-                .copied()
-                .filter(|r| visits[(*r as usize) * 2 + phase].is_some())
-                .collect::<Vec<_>>()
+        let contexts = |lanes: &[Option<Visit>; 8], phase: usize| {
+            Contexts((0usize..3).fold(0, |mask, role| {
+                mask | (u8::from(lanes[2 * role + phase].is_some()) << role)
+            }))
         };
-        let module_only = s.export_name.is_none();
-        json!({
-            "id": format!("s{index}"),
-            "kind": s.kind,
-            "file": self.graph.paths[s.file],
-            "exportName": s.export_name,
-            "location": self.graph.nodes[s.surface].loc,
-            "usage": {
-                "value": if module_only { vec![] } else { contexts(visits, 0) },
-                "type": contexts(visits, 1),
-                "contract": visits[6..].iter().any(Option::is_some),
-                "evaluation": contexts(module, 0)
-            }
-        })
+        let node = &self.graph.nodes[s.surface];
+        Record {
+            id: format!("s{index}"),
+            workspace_gap: self.evidence.gap_for(s.binding),
+            kind: s.kind,
+            file: &self.graph.paths[s.file],
+            location: node.loc,
+            export_name: (s.form == Form::Export).then_some(node.name.as_str()),
+            binding_name: (s.form == Form::Binding).then_some(node.name.as_str()),
+            usage: Usage {
+                value: if s.form == Form::Module {
+                    Contexts(0)
+                } else {
+                    contexts(visits, 0)
+                },
+                types: contexts(visits, 1),
+                contract: visits[6..].iter().any(Option::is_some),
+                evaluation: contexts(&self.reach.visited[s.file], 0),
+            },
+        }
     }
-    pub fn findings(&self, kind: Option<&str>) -> Value {
-        Value::Array(
-            self.subjects
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.kind.is_some() && (kind.is_none() || s.kind == kind))
-                .map(|(i, s)| self.record(i, s))
-                .collect(),
-        )
+
+    pub fn findings(&self, kind: Option<&str>) -> Result<String, serde_json::Error> {
+        let records = self
+            .subjects
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind.is_some() && (kind.is_none() || s.kind == kind))
+            .map(|(i, s)| self.record(i, s));
+        let mut output = Vec::new();
+        serde_json::Serializer::new(&mut output).collect_seq(records)?;
+        Ok(String::from_utf8(output).expect("JSON is UTF-8"))
     }
     fn witness(&self, mut id: Id, mut lane: usize) -> Value {
         let mut path = vec![];
         loop {
-            let node = &self.graph.nodes[id];
             let visit = self.reach.visited[id][lane].unwrap();
             let via = match visit {
-                Visit::Root => Value::Null,
+                Visit::Root => None,
                 Visit::From {
                     node: from, loc, ..
-                } => json!({"file":self.graph.paths[self.graph.nodes[from].file],"location":loc}),
+                } => Some((self.graph.nodes[from].file, loc)),
             };
-            path.push(json!({"file":self.graph.paths[node.file],"kind":node.kind,"name":node.name,"location":node.loc,"via":via}));
+            path.push(self.graph.step(id, via));
             match visit {
                 Visit::Root => break,
                 Visit::From {
@@ -193,18 +316,24 @@ impl Report {
                 .paths
                 .binary_search_by(|path| path.as_str().cmp(file))
                 .ok();
-            file.and_then(|file| {
+            let (form, name) = match (selector.get("exportName"), selector.get("bindingName")) {
+                (Some(Value::String(s)), None) => (Form::Export, s.as_str()),
+                (None, Some(Value::String(s))) => (Form::Binding, s.as_str()),
+                (None, None) => (Form::Module, ""),
+                _ => return Err("Expected one exportName or bindingName.".into()),
+            };
+            file.and_then(|f| {
                 self.subjects
                     .binary_search_by(|s| {
-                        (s.file, s.export_name.as_deref())
-                            .cmp(&(file, selector["exportName"].as_str()))
+                        (s.file, s.form, self.graph.nodes[s.surface].name.as_str())
+                            .cmp(&(f, form, name))
                     })
                     .ok()
             })
         }
         .ok_or("Unknown analysis subject.")?;
         let s = &self.subjects[index];
-        let mut result = self.record(index, s);
+        let mut result = serde_json::to_value(self.record(index, s)).map_err(|e| e.to_string())?;
         let mut witnesses = vec![];
         for role in ROLES {
             for phase in 0..2 {
@@ -214,7 +343,7 @@ impl Report {
                         "contract"
                     } else if phase == 1 {
                         "type"
-                    } else if s.export_name.is_none() {
+                    } else if s.form == Form::Module {
                         "evaluation"
                     } else {
                         "value"
@@ -224,18 +353,24 @@ impl Report {
                 }
             }
             let lane = (role as usize) * 2;
-            if s.export_name.is_some() && self.reach.visited[s.file][lane].is_some() {
+            if s.form != Form::Module && self.reach.visited[s.file][lane].is_some() {
                 witnesses.push(
                     json!({"role":role,"fact":"evaluation","path":self.witness(s.file,lane)}),
                 );
             }
         }
         result["witnesses"] = Value::Array(witnesses);
+        let (tests, reads) = self
+            .evidence
+            .explain(&self.graph, s.binding, s.form == Form::Module);
+        result["tests"] = Value::Array(tests);
+        result["unrootedWorkspaceReads"] = Value::Array(reads);
         result["reason"] = match s.kind {
             Some("unused-export") => "No retaining binding reference from the effective roots. Module initialization is tracked separately.",
             Some("unreferenced-module") => "No evaluation, type, or public-contract path from the effective roots.",
-            Some("test-only-export") => "Only test roots have known retaining references.",
+            Some("test-only-export" | "test-only-binding") => "Only test roots have known retaining references.",
             Some("tooling-only-export") => "Only tooling roots have known retaining references.",
+            None if self.reach.visited[s.binding].iter().all(Option::is_none) => "No effective root reaches this binding.",
             _ => "The effective roots retain this subject."
         }.into();
         Ok(result)

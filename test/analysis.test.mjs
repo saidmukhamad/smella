@@ -272,3 +272,137 @@ test('large partial reports share immutable gap lists across subjects', async t 
   assert.ok(findings.every(f => f.gapIds === ids && f.status === 'conditional'));
   assert.ok(Object.isFrozen(ids));
 });
+
+const deep = fileURLToPath(new URL('./fixtures/deep-workspace', import.meta.url));
+const units = 'products/group/units/';
+const impl = units + 'three/src/impl.ts';
+const cli = units + 'one/src/cli.ts';
+
+test('unrooted workspace reads survive nested membership, local aliases and two package boundaries', async t => {
+  const r = await inspect(t,deep);
+  const reset = subject(r,impl,'reset');
+  assert.equal(reset.kind,'test-only-export');
+  assert.deepEqual(reset.usage.value,['test']);
+  assert.equal(reset.status,'conditional');
+  assert.deepEqual(r.coverage.gaps.map(g => g.code),['unrooted-workspace-reference']);
+  assert.deepEqual(reset.gapIds,r.coverage.gaps.map(g => g.id));
+  const read = reset.unrootedWorkspaceReads.find(r => r.file === cli);
+  assert.equal(read.fact,'value');
+  assert.deepEqual([...new Set(read.path.map(step => step.file))],[
+    cli, units+'two/src/barrel.ts', units+'two/src/relay.ts', units+'three/src/index.ts',impl
+  ]);
+  assert.equal(read.path[0].name,'boot');
+  assert.ok(read.path.some(s => s.name === 'forward'));
+  assert.equal(subject(r,impl,'never').status,'complete');
+  assert.deepEqual(reset.tests,[
+    {file:'tests/alpha.test.ts',facts:['value']},
+    {file:'tests/beta.test.ts',facts:['value']},
+    {file:'tests/types.test.ts',facts:['type']}
+  ]);
+});
+
+test('private test-only implementation is distinguished from public, runtime and unrooted consumers', async t => {
+  const base = await inspect(t,deep);
+  const finding = base.findings({kind:'test-only-binding'}).find(f => f.bindingName === 'makeSample');
+  assert.equal(finding.file,impl);
+  assert.equal(finding.exportName,null);
+  assert.equal(finding.status,'complete');
+  const local = base.explain(finding.id);
+  assert.deepEqual(local,base.explain({file:impl,bindingName:'makeSample'}));
+  assert.deepEqual(local.unrootedWorkspaceReads,[]);
+  assert.deepEqual(local.tests.map(t => t.file),['tests/alpha.test.ts','tests/beta.test.ts']);
+  assert.equal(base.explain({file:impl,bindingName:'normalize'}).status,'conditional');
+  const rooted = await inspect(t,deep,{entries:{runtime:['app.ts',cli]}});
+  assert.deepEqual(rooted.coverage.gaps,[]);
+  const normalized = rooted.explain({file:impl,bindingName:'normalize'});
+  assert.equal(normalized.kind,null);
+  assert.deepEqual(normalized.usage.value,['runtime','test']);
+  assert.deepEqual(normalized.unrootedWorkspaceReads,[]);
+  const published = await inspect(t,deep,{publicEntries:[units+'three/src/index.ts']});
+  assert.equal(published.explain({file:impl,bindingName:'makeSample'}).usage.contract,true);
+  assert.deepEqual(published.findings({kind:'test-only-binding'}).filter(f=>f.file===impl),[]);
+});
+
+test('test attribution respects unused imports, type edges, cycles and per-file roles', async t => {
+  const root = await fixture(t,{
+    'a.test.ts':'import { work } from "./b"; work();',
+    'b.test.ts':'import "./a.test"; import type { work } from "./b"; type W = typeof work;',
+    'c.test.ts':'import {work} from "./b";',
+    'b.ts':'export {work} from "./lib";',
+    'lib.ts':'export function work() { return 1; }',
+  });
+  const r = await inspect(t,root,{entries:{test:['*.test.ts','a.test.ts']},publicEntries:[]});
+  assert.deepEqual(subject(r,'lib.ts','work').tests,[
+    {file:'a.test.ts',facts:['value']},{file:'b.test.ts',facts:['value','type']}
+  ]);
+  assert.deepEqual(subject(r,'lib.ts').tests.find(x=>x.file==='c.test.ts').facts,['evaluation']);
+});
+
+test('unrooted side-effect imports qualify module evaluation and initialization dependencies only', async t => {
+  const root = await fixture(t,{
+    'package.json':'{"workspaces":["pkgs/*"]}','app.ts':'void 0;',
+    'pkgs/a/package.json':'{"name":"a"}','pkgs/a/start.ts':'import "b";',
+    'pkgs/b/package.json':'{"name":"b","exports":"./init.ts"}',
+    'pkgs/b/init.ts':'function register() {} register(); export const spare = 1;',
+  });
+  const r = await inspect(t,root,app);
+  assert.equal(subject(r,'pkgs/b/init.ts').unrootedWorkspaceReads[0].fact,'evaluation');
+  assert.equal(subject(r,'pkgs/b/init.ts').status,'conditional');
+  const helper = r.explain({file:'pkgs/b/init.ts',bindingName:'register'});
+  assert.deepEqual(helper.usage.value,[]);
+  assert.equal(helper.unrootedWorkspaceReads[0].file,'pkgs/a/start.ts');
+  assert.equal(subject(r,'pkgs/b/init.ts','spare').status,'complete');
+});
+
+test('parallel analysis resolves identical aliases in neighboring workspaces independently', async t => {
+  const files = {'package.json':'{"workspaces":["units/*"]}', 'app.ts':'import {left} from "left"; left();'};
+  for (const [name, role] of [['left','runtime'],['right','test']]) {
+    const dir = 'units/'+name+'/';
+    files[dir+'tsconfig.json']='{"compilerOptions":{"paths":{"~local":["./local.ts"]}}}';
+    files[dir+'package.json']=JSON.stringify({name,exports:'./api.ts'});
+    files[dir+'api.ts']=`import {local} from "~local"; export const ${name} = () => local();`;
+    files[dir+'local.ts']=`export function local() {return "${role}";}`;
+  }
+  files['a.test.ts']='import {right} from "right"; right();';
+  for(let i=0;i<32;i++) files['extras/'+i+'.ts']='export const filler = 0;';
+  const root = await fixture(t,files);
+  const reports = await Promise.all(Array.from({length:4},()=>inspect(t,root,{entries:{runtime:['app.ts']},publicEntries:[]})));
+  for (const r of reports) {
+    assert.deepEqual(r.coverage.gaps,[]);
+    assert.deepEqual(subject(r,'units/left/local.ts','local').usage.value,['runtime']);
+    assert.deepEqual(subject(r,'units/right/local.ts','local').usage.value,['test']);
+    assert.deepEqual(r.findings(),reports[0].findings());
+  }
+});
+
+test('pnpm workspace packages include deep members and honor excluded package globs', async t => {
+  const root = await fixture(t,{
+    'pnpm-workspace.yaml':"packages:\n  - 'tree/**'\n  - '!tree/ignored/**'\ncatalog:\n  tsx: '^4'\n",
+    'app.ts':'import {x} from "lib"; x();',
+    'tree/a/b/lib/package.json':'{"name":"lib","exports":"./src.ts"}',
+    'tree/a/b/lib/src.ts':'export const x = () => 1;',
+    'tree/ignored/duplicate/package.json':'{"name":"lib","exports":"./src.ts"}',
+    'tree/ignored/duplicate/src.ts':'export const x = () => 2;',
+  });
+  const r = await inspect(t,root,app);
+  assert.equal(r.coverage.status,'complete');
+  assert.deepEqual(subject(r,'tree/a/b/lib/src.ts','x').usage.value,['runtime']);
+  assert.equal(subject(r,'tree/ignored/duplicate/src.ts','x').kind,'unused-export');
+});
+
+test('missing workspace entry keeps positive evidence and an unresolved target stays conditional', async t => {
+  const root = await fixture(t,{
+    'package.json':'{"workspaces":["pkgs/*"]}', 'app.ts':'import {ok} from "./lib"; ok();',
+    'lib.ts':'export const ok = () => 1;',
+    'pkgs/a/package.json':'{"name":"a","main":"./missing.js"}',
+    'pkgs/a/use.ts':'import {x} from "b/stale"; x();',
+    'pkgs/b/package.json':'{"name":"b","exports":{"./stale":"./dist/missing.js"}}',
+    'pkgs/b/stale.ts':'export const x = 1;',
+  });
+  const r = await inspect(t,root,{entries:{runtime:['app.ts']}});
+  assert.ok(r.coverage.gaps.some(g=>g.code==='invalid-root'));
+  assert.ok(r.coverage.gaps.some(g=>g.code==='unresolved-import' && g.file==='pkgs/a/use.ts'));
+  assert.deepEqual(subject(r,'lib.ts','ok').usage.value,['runtime']);
+  assert.equal(subject(r,'pkgs/b/stale.ts','x').status,'conditional');
+  assert.deepEqual(subject(r,'pkgs/b/stale.ts','x').usage.value,[]);
+});

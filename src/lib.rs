@@ -1,3 +1,4 @@
+mod evidence;
 mod extract;
 mod graph;
 mod project;
@@ -28,7 +29,9 @@ impl Snapshot {
     }
     #[napi]
     pub fn findings(&self, kind: Option<String>) -> Result<String> {
-        Ok(self.live()?.findings(kind.as_deref()).to_string())
+        self.live()?
+            .findings(kind.as_deref())
+            .map_err(|e| Error::from_reason(e.to_string()))
     }
     #[napi]
     pub fn explain(&self, selector: String) -> Result<String> {

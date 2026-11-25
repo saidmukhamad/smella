@@ -1,0 +1,4 @@
+{
+  "name": "@example/three",
+  "exports": "./src/index.ts"
+}
