@@ -1,0 +1,32 @@
+[package]
+name = "smella"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+globset = "0.4"
+napi = { version = "2.16", default-features = false, features = ["napi6"] }
+napi-derive = "2.16"
+oxc_allocator = "=0.75.0"
+oxc_ast = "=0.75.0"
+oxc_index = "3.1"
+oxc_parser = "=0.75.0"
+oxc_resolver = "=11.13.1"
+oxc_semantic = "=0.75.0"
+oxc_span = "=0.75.0"
+oxc_syntax = "=0.75.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+walkdir = "2"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

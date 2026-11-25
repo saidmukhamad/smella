@@ -1,0 +1,10 @@
+{
+  "name": "smella-linux-x64-gnu",
+  "version": "0.1.0",
+  "private": true,
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"],
+  "main": "smella.node",
+  "files": ["smella.node"]
+}

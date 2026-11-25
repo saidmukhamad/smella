@@ -1,0 +1,4 @@
+{
+  "entries": { "runtime": ["src/app.ts"], "test": ["tests/*.test.ts"], "tooling": ["scripts/check.ts"] },
+  "publicEntries": ["sdk/index.ts"]
+}
