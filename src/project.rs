@@ -83,6 +83,7 @@ pub struct Project {
     file_profile: Vec<usize>,
     workspaces: BTreeMap<String, WorkspacePackage>,
     pub workspace_for_file: Vec<usize>,
+    pub react_entry: Option<Id>,
 }
 
 impl Project {
@@ -305,6 +306,21 @@ impl Project {
         } else {
             None
         };
+        let react_entry = match workspaces.get("react") {
+            Some(WorkspacePackage::Unique { dir, has_exports }) => {
+                let spec = if *has_exports { "react" } else { "./" };
+                resolvers[0][0].resolve(dir, spec).ok().and_then(|entry| {
+                    let file = entry
+                        .path()
+                        .strip_prefix(&root)
+                        .ok()?
+                        .to_str()?
+                        .replace('\\', "/");
+                    paths.binary_search(&file).ok()
+                })
+            }
+            _ => None,
+        };
         let workspace_for_file = closest_directories(&paths, &directories);
         let mut project = Self {
             root,
@@ -315,6 +331,7 @@ impl Project {
             resolvers,
             file_profile,
             workspace_for_file,
+            react_entry,
         };
         for (role, supplied) in
             ROLES

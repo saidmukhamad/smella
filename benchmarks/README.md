@@ -27,6 +27,31 @@ The first 32-package run took 8.08 ms at p95 including its explanation. Many cal
 
 The first release build with Nx target discovery and React lazy-loader tracing took 1.08 ms at p95 for the four-project fixture, including all findings and two explanations. The target is 3 ms. On the matched 513-file chain, cold p95 was 46.41 ms for Smella and 241.52 ms for Knip 6.48.0. Each reported the same 512 unused exports. The Nx/React comparison records the actual Knip issue lists separately from the timed Smella run. [Measurement and comparison](history/2026-11-25T16-26-03.443Z-014d590.json)
 
+## Verify upstream behavior
+
+The corpus runner checks predictions against named upstream declarations, call sites and entry files. It reads three pinned public projects. Run this setup once in a new directory and keep the checkouts clean.
+
+```sh
+mkdir -p /tmp/smella-corpus
+fetch_case() {
+  git init -q "/tmp/smella-corpus/$1" &&
+    git -C "/tmp/smella-corpus/$1" fetch -q --depth 1 "https://github.com/$2.git" "$3" &&
+    git -C "/tmp/smella-corpus/$1" checkout -q --detach FETCH_HEAD
+}
+fetch_case transformers huggingface/transformers.js 890e398f3fe99e52e855ffc4f2c81fccbe762dd5
+fetch_case nx nrwl/nx 3272c313f283c9cf4e2af868a2b3617fad280f40
+fetch_case react facebook/react 92bb0678c52133a47b3095f6e54da883ea0d6cff
+SMELLA_CORPUS_DIR=/tmp/smella-corpus npm run verify:corpus
+```
+
+| Repository | Assertions |
+| --- | --- |
+| Transformers.js | A real test reaches `pipeline` through the public barrel. Toggling the test and public entries changes the corresponding facts independently. A directory-driven suite carries a computed-import gap. |
+| Nx | A devkit test reaches the private `toClassName` helper. Adding the public API produces a contract witness through both barrels. |
+| React | The streaming-render fixture reaches the lazy `Comments` component in ordinary `.js` files. Removing its render site in a temporary copy drops both value and evaluation usage while `Sidebar` stays reachable. |
+
+An assertion or revision mismatch fails the run. These checks establish the selected facts even when missing dependencies, Flow syntax or dynamic loaders keep the broader report partial. The React control edits only a temporary copy. [Verification runner](../scripts/verify-corpus.mjs)
+
 ## Record progress
 
 From a checkout with Rust 1.88+, Node 24, npm, and Gnuplot with the pngcairo terminal, run:

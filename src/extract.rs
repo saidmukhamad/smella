@@ -163,7 +163,11 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
         }
     };
 
-    let mut parsed = Parser::new(arena, &source, SourceType::from_path(&path).unwrap()).parse();
+    let mut source_type = SourceType::from_path(&path).unwrap();
+    if path.extension().is_some_and(|ext| ext == "js") {
+        source_type = source_type.with_jsx(true);
+    }
+    let mut parsed = Parser::new(arena, &source, source_type).parse();
     let declaration_file = parsed.program.source_type.is_typescript_definition();
     if declaration_file {
         // Oxc parses ambient syntax in declaration mode but skips its semantic walk.
@@ -261,10 +265,11 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
         let Some(from) = local(import.local_name.name.as_str()) else {
             continue;
         };
-        // An in-repository alias named "react" can implement a different API.
-        if requests
-            .get(&import.statement_span.start)
-            .is_some_and(Option::is_none)
+        // Recognize the package's own source entry in workspaces such as React.
+        // A tsconfig alias to an unrelated local implementation has different semantics.
+        if import.module_request.name == "react"
+            && let Some(target) = requests.get(&import.statement_span.start)
+            && (target.is_none() || *target == project.react_entry)
         {
             react.register(import, scoping);
         }

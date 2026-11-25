@@ -108,3 +108,5 @@ This evidence follows resolved binding reads and module loads from files outside
 `npm run build` produces the checkout addon. On Linux x64 with glibc it also stages the native package under `npm/linux-x64-gnu`. Run `npm pack` there and in the repository root to create the two installable tarballs. Both manifests are private during development.
 
 The benchmark ledger records revisions, latency percentiles, memory, package sizes, and target checks. Use `npm run bench:record` to append a measurement and update the progress plot. [Release goals, workloads and history](benchmarks/README.md)
+
+Run `npm run verify:corpus` with the pinned upstream checkouts to validate real test, contract, lazy JSX and cross-project reference paths. [Corpus setup and assertions](benchmarks/README.md#verify-upstream-behavior)

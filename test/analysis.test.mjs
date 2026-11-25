@@ -569,3 +569,30 @@ test('Nx respects a relocated root, literal paths and command overrides of inher
   assert.deepEqual(r.roots.map(r=>r.file),['nested/site/boot.ts']);
   assert.deepEqual(r.coverage.gaps.map(g=>g.code),['ambiguous-entry']);
 });
+
+test('a .js JSX entry retains a lazy component from the React workspace package through a JSX render', async t => {
+  const root = await fixture(t,{
+    'package.json':JSON.stringify({workspaces:['packages/*']}),
+    'packages/react/package.json':JSON.stringify({name:'react',exports:{'.':'./index.js'}}),
+    'packages/react/index.js':'export function lazy(load) { return load; }',
+    'site/index.js':'import App from "./App"; mount(<App />);',
+    'site/App.js':'import { lazy } from "react"; const Feed = lazy(() => import("./Feed")); export default function App() { return <><Feed /></>; }',
+    'site/Feed.js':'export default function Feed() { return <section />; } export function Sibling() { return null; }',
+  });
+  const r = await inspect(t,root,{entries:{runtime:['site/index.js']},publicEntries:[]});
+  assert.equal(r.coverage.status,'complete');
+  assert.deepEqual(subject(r,'site/Feed.js','default').usage.value,['runtime']);
+  assert.equal(subject(r,'site/Feed.js','Sibling').kind,'unused-export');
+});
+
+test('a local alias named react keeps ordinary callback semantics', async t => {
+  const root = await fixture(t,{
+    'tsconfig.json':JSON.stringify({compilerOptions:{paths:{react:['./other.ts']}}}),
+    'other.ts':'export function lazy(cb) { return cb(); }',
+    'app.ts':'import {lazy} from "react"; const unused = lazy(() => import("./Lib"));',
+    'Lib.ts':'export default 1;',
+  });
+  const r = await inspect(t,root,app);
+  assert.ok(r.coverage.gaps.some(g=>g.code==='namespace-escape'));
+  assert.deepEqual(subject(r,'Lib.ts','default').usage.value,[]);
+});
