@@ -81,14 +81,26 @@ impl FileSummary {
         guard: Option<Id>,
         target_file: Option<Id>,
     ) {
+        self.gap_scoped(code, loc, message, guard, target_file, None);
+    }
+    fn gap_scoped(
+        &mut self,
+        code: &'static str,
+        loc: Option<Loc>,
+        message: String,
+        guard: Option<Id>,
+        target_file: Option<Id>,
+        affected_files: Option<Vec<String>>,
+    ) {
         self.gaps.push(PendingGap {
             record: Gap {
                 code,
                 file: Some(self.path.clone()),
                 location: loc,
                 message,
-                affected_files: None,
+                affected_files,
                 id: String::new(),
+                test_only: false,
             },
             guard,
             target_file,
@@ -106,7 +118,15 @@ impl FileSummary {
         match project.resolve_with_mode(self.file, spec, type_only, cjs) {
             Ok(target) => target,
             Err(message) => {
-                self.gap("unresolved-import", Some(span.into()), message, guard, None);
+                let scope = project.scope_unresolved_import(self.file, spec);
+                self.gap_scoped(
+                    "unresolved-import",
+                    Some(span.into()),
+                    message,
+                    guard,
+                    None,
+                    scope,
+                );
                 None
             }
         }
@@ -476,6 +496,58 @@ fn match_template_prefix_glob(
         .map(|(id, _)| id)
         .collect();
     (!matched.is_empty()).then_some(matched)
+}
+
+fn is_json_dynamic_spec(expr: &Expression<'_>) -> bool {
+    match expr.get_inner_expression() {
+        Expression::TemplateLiteral(t) => t
+            .quasis
+            .last()
+            .and_then(|q| q.value.cooked.as_ref())
+            .is_some_and(|s| s.ends_with(".json")),
+        Expression::CallExpression(call) => {
+            let is_join = match call.callee.get_inner_expression() {
+                Expression::Identifier(id) => matches!(id.name.as_str(), "join" | "resolve"),
+                Expression::StaticMemberExpression(m) => {
+                    matches!(m.property.name.as_str(), "join" | "resolve")
+                }
+                _ => false,
+            };
+            is_join
+                && call
+                    .arguments
+                    .last()
+                    .and_then(|a| a.as_expression())
+                    .and_then(static_string_expr)
+                    .is_some_and(|(s, _)| s.ends_with(".json"))
+        }
+        _ => false,
+    }
+}
+
+fn relative_template_scope(
+    project: &Project,
+    file: Id,
+    expr: &Expression<'_>,
+) -> Option<Vec<String>> {
+    let Expression::TemplateLiteral(t) = expr.get_inner_expression() else {
+        return None;
+    };
+    let first = t.quasis.first()?.value.cooked.as_ref()?.as_str();
+    if !(first.starts_with("./") || first.starts_with("../")) {
+        return None;
+    }
+    let dir_part = first.rsplit_once('/').map_or(".", |(d, _)| d);
+    let file_dir = Path::new(&project.graph.paths[file])
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let norm = crate::source_map::normalize_rel(&file_dir.join(dir_part))?;
+    let mut files = project.files_in_dir(&norm);
+    if !files.contains(&project.graph.paths[file]) {
+        files.push(project.graph.paths[file].clone());
+        files.sort();
+    }
+    Some(files)
 }
 
 fn cjs_exports_target(scoping: &Scoping, expr: &Expression<'_>) -> Option<Span> {
@@ -1046,7 +1118,15 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
             start: s.offset() as u32,
             end: (s.offset() + s.len()) as u32,
         });
-        out.gap("parse-error", loc, error.message.to_string(), None, None);
+        let scope = project.is_multi_workspace().then(|| vec![out.path.clone()]);
+        out.gap_scoped(
+            "parse-error",
+            loc,
+            error.message.to_string(),
+            None,
+            None,
+            scope,
+        );
     }
     if parsed.panicked {
         return false;
@@ -1653,13 +1733,24 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                         "require" | "exports" | "module" | "eval"
                     )
                 {
+                    let scope = if ident.name == "require" && !project.is_multi_workspace() {
+                        None
+                    } else if ident.name == "require" {
+                        let dir = Path::new(&out.path)
+                            .parent()
+                            .unwrap_or_else(|| Path::new(""));
+                        Some(project.files_in_dir(dir))
+                    } else {
+                        Some(vec![out.path.clone()])
+                    };
                     for from in owner.sources(file) {
-                        out.gap(
+                        out.gap_scoped(
                             "unsupported-runtime",
                             Some(loc),
                             format!("Runtime use of {} is outside the ESM model.", ident.name),
                             Some(from),
                             None,
+                            scope.clone(),
                         );
                     }
                 }
@@ -1744,15 +1835,20 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                             }
                         }
                         if specs.is_empty() && glob_targets.is_empty() {
-                            for from in owner.sources(file) {
-                                out.gap(
-                                    "computed-import",
-                                    Some(loc),
-                                    "Supply the possible module specifiers for this dynamic require."
-                                        .into(),
-                                    Some(from),
-                                    None,
-                                );
+                            if !req_arg.is_some_and(is_json_dynamic_spec) {
+                                let scope =
+                                    req_arg.and_then(|a| relative_template_scope(project, file, a));
+                                for from in owner.sources(file) {
+                                    out.gap_scoped(
+                                        "computed-import",
+                                        Some(loc),
+                                        "Supply the possible module specifiers for this dynamic require."
+                                            .into(),
+                                        Some(from),
+                                        None,
+                                        scope.clone(),
+                                    );
+                                }
                             }
                         } else {
                             let is_glob = !glob_targets.is_empty();
@@ -1765,21 +1861,23 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                                     Ok(Some(_)) => {}
                                     Ok(None) => any_external = true,
                                     Err(msg) => {
-                                        first_err.get_or_insert((*spec_span, msg));
+                                        first_err.get_or_insert((spec.clone(), *spec_span, msg));
                                     }
                                 }
                             }
                             if targets.is_empty()
                                 && !any_external
-                                && let Some((err_span, msg)) = first_err
+                                && let Some((err_spec, err_span, msg)) = first_err
                             {
+                                let scope = project.scope_unresolved_import(file, &err_spec);
                                 for from in owner.sources(file) {
-                                    out.gap(
+                                    out.gap_scoped(
                                         "unresolved-import",
                                         Some(err_span.into()),
                                         msg.clone(),
                                         Some(from),
                                         None,
+                                        scope.clone(),
                                     );
                                 }
                             }
@@ -2086,13 +2184,18 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                             }
                         }
                     } else {
-                        out.gap(
-                            "computed-import",
-                            Some(loc),
-                            "Supply the possible module specifiers for this dynamic import.".into(),
-                            Some(from),
-                            None,
-                        );
+                        if !is_json_dynamic_spec(&expr.source) {
+                            let scope = relative_template_scope(project, file, &expr.source);
+                            out.gap_scoped(
+                                "computed-import",
+                                Some(loc),
+                                "Supply the possible module specifiers for this dynamic import."
+                                    .into(),
+                                Some(from),
+                                None,
+                                scope,
+                            );
+                        }
                         continue;
                     }
                     for to in targets {

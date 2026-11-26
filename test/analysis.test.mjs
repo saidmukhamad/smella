@@ -416,16 +416,21 @@ test('missing workspace entry keeps positive evidence and an unresolved target s
   assert.deepEqual(subject(r,'pkgs/b/stale.ts','x').usage.value,[]);
 });
 
-test('unbounded loads behind unrooted cross-workspace reads qualify otherwise unrelated findings', async t => {
+test('unbounded loads behind unrooted cross-workspace reads qualify the affected workspace without tainting unrelated packages', async t => {
   const root = await fixture(t,{
     'package.json':'{"workspaces":["p/*"]}', 'app.ts':'void 0;', 'independent.ts':'export const maybe = 1;',
     'p/a/package.json':'{"name":"a"}', 'p/a/orphan.ts':'import {run} from "b"; run();',
     'p/b/package.json':'{"name":"b","exports":"./api.ts"}', 'p/b/api.ts':'export function run() { return import(path); }',
+    'p/b/sibling.ts':'export const near = 1;',
   });
   const r = await inspect(t,root,app);
   const gap = r.coverage.gaps.find(g=>g.code==='computed-import');
-  assert.equal(gap.affectedFiles,null);
-  assert.ok(subject(r,'independent.ts','maybe').gapIds.includes(gap.id));
+  assert.ok(gap);
+  assert.ok(gap.affectedFiles.includes('p/b/api.ts'));
+  assert.ok(gap.affectedFiles.includes('p/b/sibling.ts'));
+  assert.ok(subject(r,'p/b/sibling.ts','near').gapIds.includes(gap.id));
+  assert.equal(subject(r,'p/b/sibling.ts','near').status,'conditional');
+  assert.equal(subject(r,'independent.ts','maybe').status,'complete');
   assert.deepEqual(subject(r,'p/b/api.ts','run').usage.value,[]);
 });
 
@@ -1113,4 +1118,29 @@ test('extensionless shebang bins, nodemon and framework start scripts, and spawn
   assert.equal(subject(r, 'src/job.ts', 'deadJob').kind, 'unused-export');
   assert.deepEqual(subject(r, 'packages/dev-srv/src/serve.ts', 'serve').usage.value, ['runtime']);
   assert.deepEqual(subject(r, 'packages/docs/app/page.tsx').usage.evaluation, ['runtime']);
+});
+
+test('gaps in one monorepo workspace leave fully resolved findings in unrelated workspaces complete', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ workspaces: ['packages/*'], bin: { app: './app.ts' } }),
+    'app.ts': 'import { ok } from "@org/clean"; import { messy } from "@org/noisy"; ok(); messy();',
+    'packages/clean/package.json': JSON.stringify({ name: '@org/clean', exports: { '.': './src/index.ts' } }),
+    'packages/clean/src/index.ts': 'export function ok() {} export function cleanUnused() {}',
+    'packages/noisy/package.json': JSON.stringify({ name: '@org/noisy', exports: { '.': './src/index.ts' } }),
+    'packages/noisy/src/index.ts': [
+      'import "uninstalled-external-pkg";',
+      'import { missing } from "./broken";',
+      'export function messy() { eval("1"); return missing; }',
+      'export function noisyUnused() {}',
+    ].join('\n'),
+    'packages/noisy/src/broken.ts': 'export const present = 1;',
+    'packages/noisy/src/index.test.ts': 'export async function loadDyn(x: string) { return import(x); } loadDyn("a");',
+  });
+
+  const r = await inspect(t, root, { publicEntries: [] });
+  assert.equal(r.coverage.status, 'partial');
+  assert.equal(subject(r, 'packages/clean/src/index.ts', 'cleanUnused').status, 'complete');
+  assert.deepEqual(subject(r, 'packages/clean/src/index.ts', 'cleanUnused').gapIds, []);
+  assert.equal(subject(r, 'packages/noisy/src/index.ts', 'noisyUnused').status, 'conditional');
+  assert.equal(subject(r, 'packages/noisy/src/broken.ts', 'present').status, 'conditional');
 });

@@ -628,6 +628,48 @@ impl SourceMapper {
         None
     }
 
+    pub fn matches_tsconfig_path(&self, file_rel: &Path, spec: &str) -> Vec<PathBuf> {
+        let Some(rules) = file_rel
+            .ancestors()
+            .skip(1)
+            .find_map(|anc| self.tsconfig_paths.get(anc))
+        else {
+            return vec![];
+        };
+        for rule in rules {
+            let matched = if rule.wildcard {
+                if spec.starts_with(&rule.prefix)
+                    && spec.ends_with(&rule.suffix)
+                    && spec.len() >= rule.prefix.len() + rule.suffix.len()
+                {
+                    Some(&spec[rule.prefix.len()..spec.len() - rule.suffix.len()])
+                } else {
+                    None
+                }
+            } else if spec == rule.prefix {
+                Some("")
+            } else {
+                None
+            };
+            if let Some(star) = matched {
+                return rule
+                    .targets
+                    .iter()
+                    .filter_map(|tpl| {
+                        let raw = to_slash(tpl);
+                        let expanded = if rule.wildcard {
+                            raw.replace('*', star)
+                        } else {
+                            raw
+                        };
+                        normalize_rel(Path::new(&expanded))
+                    })
+                    .collect();
+            }
+        }
+        vec![]
+    }
+
     pub fn map_pattern(&self, repo_root: &Path, paths: &[String], pattern: &str) -> Option<String> {
         let clean = pattern.trim().trim_start_matches("./");
         if clean.is_empty() {

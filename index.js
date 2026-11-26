@@ -180,8 +180,37 @@ function indexGaps(gaps) {
     }
   }
 
+  // Separate test-only gaps (which can never establish runtime usage, so they cannot
+  // make test-only-export / test-only-binding / tooling-only-export findings conditional).
+  const localNonTest = new Map();
+  const globalNonTest = [];
+  for (const gap of gaps) {
+    if (gap.code === 'unrooted-workspace-reference' || gap.testOnly) continue;
+    if (gap.affectedFiles === null) {
+      globalNonTest.push(gap.id);
+    } else {
+      for (const file of gap.affectedFiles) {
+        if (!localNonTest.has(file)) localNonTest.set(file, []);
+        localNonTest.get(file).push(gap.id);
+      }
+    }
+  }
+  Object.freeze(globalNonTest);
+  const byNonTestCombo = new Map();
+  for (const [file, ids] of localNonTest) {
+    const key = ids.join(',');
+    if (!byNonTestCombo.has(key)) byNonTestCombo.set(key, Object.freeze(globalNonTest.concat(ids)));
+    localNonTest.set(file, byNonTestCombo.get(key));
+  }
+
   return record => {
-    let ids = local.get(record.file) ?? global;
+    const isTestOrToolingFinding =
+      record.kind === 'test-only-export' ||
+      record.kind === 'test-only-binding' ||
+      record.kind === 'tooling-only-export';
+    let ids = isTestOrToolingFinding
+      ? (localNonTest.get(record.file) ?? globalNonTest)
+      : (local.get(record.file) ?? global);
     const workspaceGap = record.workspaceGap ?? null;
     if (workspaceGap) {
       if (!withWorkspace.has(ids)) withWorkspace.set(ids, Object.freeze([...ids, workspaceGap]));
@@ -190,7 +219,13 @@ function indexGaps(gaps) {
     }
     record.gapIds = ids;
     record.status = record.gapIds.length ? 'conditional' : 'complete';
-    record.primaryGaps = record.gapIds.length ? primaryFor(record.file, localOnly.get(record.file), workspaceGap) : emptyPrimary;
+    record.primaryGaps = record.gapIds.length
+      ? primaryFor(
+          record.file,
+          isTestOrToolingFinding ? localNonTest.get(record.file) : localOnly.get(record.file),
+          workspaceGap,
+        )
+      : emptyPrimary;
     return record;
   };
 }

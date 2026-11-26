@@ -453,12 +453,6 @@ impl Project {
                 .into_iter()
                 .zip([entries.runtime, entries.test, entries.tooling, public])
         {
-            if supplied.is_none()
-                && matches!(role, Role::Runtime | Role::Tooling)
-                && let Some(nx) = &nx
-            {
-                nx.discover(&mut project, role)?;
-            }
             if let Some(patterns) = supplied {
                 for p in patterns {
                     project.select(role, &p, "explicit", &p, true)?;
@@ -471,6 +465,9 @@ impl Project {
                     project.select(role, p, "discovered", p, false)?;
                 }
             } else if role == Role::Tooling {
+                if let Some(nx) = &nx {
+                    nx.discover(&mut project, role)?;
+                }
                 let p =
                     "**/{vite,vitest,jest,webpack,rollup,eslint}.config.{ts,js,mjs,cjs,mts,cts}";
                 project.select(role, p, "discovered", p, false)?;
@@ -531,7 +528,8 @@ impl Project {
                             }
                             crate::discover::ScriptOutcome::DelegatedOrNoop => {}
                             crate::discover::ScriptOutcome::Ambiguous => {
-                                project.graph.gap(
+                                let scope = project.scope_for_discovered_dir(dir);
+                                project.graph.gap_scoped(
                                     "ambiguous-entry",
                                     None,
                                     None,
@@ -540,6 +538,7 @@ impl Project {
                                     ),
                                     None,
                                     None,
+                                    scope,
                                 );
                             }
                         }
@@ -626,15 +625,22 @@ impl Project {
                         && !pkg[field].is_null()
                         && !has_targets
                     {
-                        project.graph.gap(
+                        let scope = project.scope_for_discovered_dir(dir);
+                        project.graph.gap_scoped(
                             "ambiguous-entry",
                             None,
                             None,
                             format!("{label} has no supported ESM target. Supply publicEntries."),
                             None,
                             None,
+                            scope,
                         );
                     }
+                }
+                if role == Role::Runtime
+                    && let Some(nx) = &nx
+                {
+                    nx.discover(&mut project, role)?;
                 }
             }
         }
@@ -737,8 +743,18 @@ impl Project {
             let message = format!(
                 "{role:?} root {pattern:?} selected by {input:?} matched no included file. Supply a source entry."
             );
+            let scope = if origin == "discovered" {
+                let manifest_dir = input
+                    .split('#')
+                    .next()
+                    .and_then(|p| Path::new(p).parent())
+                    .unwrap_or_else(|| Path::new(""));
+                self.scope_for_discovered_dir(manifest_dir)
+            } else {
+                None
+            };
             self.graph
-                .gap("invalid-root", None, None, message, None, None);
+                .gap_scoped("invalid-root", None, None, message, None, None, scope);
         }
         Ok(())
     }
@@ -875,6 +891,114 @@ impl Project {
             .get(ws_id)
             .map(PathBuf::as_path)
             .unwrap_or_else(|| Path::new(""))
+    }
+
+    pub fn is_multi_workspace(&self) -> bool {
+        self.workspace_dirs.len() > 1
+    }
+
+    pub fn files_in_dir(&self, dir: &Path) -> Vec<String> {
+        let prefix = to_slash(dir);
+        if prefix.is_empty() {
+            return self.graph.paths.clone();
+        }
+        let slash = format!("{prefix}/");
+        let start = self
+            .graph
+            .paths
+            .partition_point(|p| p.as_str() < slash.as_str());
+        self.graph.paths[start..]
+            .iter()
+            .take_while(|p| p.starts_with(&slash))
+            .cloned()
+            .collect()
+    }
+
+    pub fn scope_for_discovered_dir(&self, dir: &Path) -> Option<Vec<String>> {
+        if dir.as_os_str().is_empty() || !self.is_multi_workspace() {
+            None
+        } else {
+            Some(self.files_in_dir(dir))
+        }
+    }
+
+    pub fn scope_unresolved_import(&self, file: Id, spec: &str) -> Option<Vec<String>> {
+        let importer = self.graph.paths[file].clone();
+        let clean_spec = spec.split('?').next().unwrap_or(spec);
+        if is_non_code_export(clean_spec) {
+            return Some(vec![importer]);
+        }
+        if spec.contains('?')
+            && let Ok(resolved) = self.resolve_with_mode(file, clean_spec, false, false)
+        {
+            let mut affected = vec![importer];
+            if let Some(id) = resolved
+                && self.graph.paths[id] != affected[0]
+            {
+                affected.push(self.graph.paths[id].clone());
+                affected.sort();
+            }
+            return Some(affected);
+        }
+        if !self.is_multi_workspace() {
+            if !clean_spec.starts_with('.')
+                && !clean_spec.starts_with('/')
+                && Self::split_package_spec(clean_spec)
+                    .is_none_or(|(pkg, _)| !self.workspaces.contains_key(&pkg))
+                && self
+                    .source_mapper
+                    .matches_tsconfig_path(Path::new(&importer), clean_spec)
+                    .is_empty()
+            {
+                return Some(vec![importer]);
+            }
+            return None;
+        }
+        let mut affected = BTreeSet::from([importer.clone()]);
+        if clean_spec.starts_with('.') || clean_spec.starts_with('/') {
+            let file_dir = Path::new(&importer)
+                .parent()
+                .unwrap_or_else(|| Path::new(""));
+            if let Some(rel) = normalize_rel(&file_dir.join(clean_spec)) {
+                let target_ws_dir = self
+                    .workspace_dirs
+                    .iter()
+                    .filter(|d| !d.as_os_str().is_empty() && rel.starts_with(d))
+                    .max_by_key(|d| d.components().count());
+                if self.source_mapper.is_in_out_dir(&rel)
+                    || target_ws_dir.is_some_and(|d| d != self.workspace_dir_for(file))
+                {
+                    if let Some(ws_dir) = target_ws_dir {
+                        affected.extend(self.files_in_dir(ws_dir));
+                    }
+                } else if let Some(parent) = rel.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    affected.extend(self.files_in_dir(parent));
+                }
+            }
+            return Some(affected.into_iter().collect());
+        }
+        if let Some((pkg_name, _)) = Self::split_package_spec(clean_spec)
+            && let Some(WorkspacePackage::Unique(pkg)) = self.workspaces.get(&pkg_name)
+        {
+            affected.extend(self.files_in_dir(&pkg.rel_dir));
+            return Some(affected.into_iter().collect());
+        }
+        let ts_targets = self
+            .source_mapper
+            .matches_tsconfig_path(Path::new(&importer), clean_spec);
+        if !ts_targets.is_empty() {
+            for t in &ts_targets {
+                if let Some(parent) = t.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    affected.extend(self.files_in_dir(parent));
+                }
+            }
+            return Some(affected.into_iter().collect());
+        }
+        Some(affected.into_iter().collect())
     }
 
     /// None means a resolved external package, Node builtin or plain stylesheet.
