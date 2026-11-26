@@ -1517,3 +1517,26 @@ test('path strings, tool configs, build script entries, Vite/Jest config paths, 
   assert.deepEqual(subject(r, 'public/mockServiceWorker.js').usage.evaluation, ['runtime']);
   assert.deepEqual(r.findings(), []);
 });
+
+test('test support files do not report test-only exports or bindings while still reporting dead exports', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ name: 'test-support-demo', type: 'module', bin: { app: './src/app.ts' } }),
+    'src/app.ts': 'export function prod() { return 1; } prod();',
+    'src/service.ts': 'export function prodResetForTests() { return 0; }',
+    'browser-tests/support/paths.ts': 'function internalBase() { return "/"; } export const APP_ROOT = internalBase(); export const deadSupport = 1;',
+    '__tests__/support/helper.ts': 'export function makeEnv() { return {}; }',
+    '__tests__/app.test.ts': 'import { prodResetForTests } from "../src/service"; import { APP_ROOT } from "../browser-tests/support/paths"; import { makeEnv } from "./support/helper"; console.log(prodResetForTests(), APP_ROOT, makeEnv());',
+  });
+  const r = await inspect(t, root);
+  assert.equal(subject(r, 'src/service.ts', 'prodResetForTests').kind, 'test-only-export');
+  assert.equal(subject(r, 'browser-tests/support/paths.ts', 'APP_ROOT').kind, null);
+  assert.equal(subject(r, 'browser-tests/support/paths.ts', 'deadSupport').kind, 'unused-export');
+  assert.equal(subject(r, '__tests__/support/helper.ts', 'makeEnv').kind, null);
+  assert.deepEqual(
+    r.findings().map(f => [f.kind, f.file, f.exportName]),
+    [
+      ['unused-export', 'browser-tests/support/paths.ts', 'deadSupport'],
+      ['test-only-export', 'src/service.ts', 'prodResetForTests'],
+    ],
+  );
+});

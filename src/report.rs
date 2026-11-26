@@ -74,6 +74,67 @@ impl Serialize for Contexts {
     }
 }
 
+fn is_test_support_file(path: &str, is_test_root: bool) -> bool {
+    if is_test_root {
+        return true;
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    for dir in &parts[..parts.len().saturating_sub(1)] {
+        if matches!(
+            *dir,
+            "__tests__"
+                | "__mocks__"
+                | "__fixtures__"
+                | "__helpers__"
+                | "__support__"
+                | "test"
+                | "tests"
+                | "testing"
+                | "test-utils"
+                | "test-helpers"
+                | "test-support"
+                | "testUtils"
+                | "testHelpers"
+                | "testSupport"
+                | "browser-tests"
+                | "e2e"
+                | "e2e-tests"
+                | "integration-tests"
+                | "unit-tests"
+                | "playwright"
+                | "cypress"
+        ) {
+            return true;
+        }
+    }
+    if let Some(name) = parts.last() {
+        let lower = name.to_ascii_lowercase();
+        let markers = [
+            ".test.",
+            ".spec.",
+            ".mock.",
+            ".mocks.",
+            ".fixture.",
+            ".fixtures.",
+            ".stub.",
+            ".stubs.",
+            ".setup.",
+            ".test-util.",
+            ".test-utils.",
+            ".test-helper.",
+            ".test-helpers.",
+        ];
+        if markers.iter().any(|m| lower.contains(m))
+            || lower.starts_with("test-setup.")
+            || lower.starts_with("setup-tests.")
+            || lower.starts_with("setuptests.")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn classification(lanes: &[Option<Visit>; 8]) -> Option<&'static str> {
     let used = |role: Role| {
         lanes[role as usize * 2..role as usize * 2 + 2]
@@ -234,6 +295,10 @@ impl Report {
         }
         let mut subjects = vec![];
         for (file, module) in graph.modules.iter().enumerate() {
+            let test_support = is_test_support_file(
+                &graph.paths[file],
+                roles[file] & (1 << Role::Test as usize) != 0,
+            );
             let kind =
                 (!reach.visited[file].iter().any(Option::is_some)).then_some("unreferenced-module");
             subjects.push(Subject {
@@ -247,7 +312,10 @@ impl Report {
                 let kind = if entry_exports_used[file] {
                     None
                 } else {
-                    classification(&reach.visited[e.binding])
+                    match classification(&reach.visited[e.binding]) {
+                        Some("test-only-export") if test_support => None,
+                        other => other,
+                    }
                 };
                 subjects.push(Subject {
                     file,
@@ -259,7 +327,7 @@ impl Report {
             }
             private[file].sort_by(|&a, &b| graph.nodes[a].name.cmp(&graph.nodes[b].name));
             for &binding in &private[file] {
-                let test_only = roles[file] & (1 << Role::Test as usize) == 0
+                let test_only = !test_support
                     && classification(&reach.visited[binding]) == Some("test-only-export");
                 subjects.push(Subject {
                     file,
