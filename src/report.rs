@@ -158,6 +158,7 @@ impl Report {
                 ))
             ));
         }
+        let multi_workspace = project.is_multi_workspace();
         let mut graph = project.graph;
         graph.link();
         let reach = Reach::compute(&graph, &project.roots);
@@ -169,7 +170,12 @@ impl Report {
             &project.workspace_for_file,
             &mut workspace_gaps,
         );
-        let mut gaps = reach.gaps(&graph, |id| evidence.gap_for(id).is_some());
+        let mut gaps = reach.gaps(
+            &graph,
+            |id| evidence.gap_for(id).is_some(),
+            &roles,
+            multi_workspace,
+        );
         gaps.append(&mut workspace_gaps);
         let mut exported = vec![false; graph.nodes.len()];
         for e in graph.modules.iter().flat_map(|m| m.exports.values()) {

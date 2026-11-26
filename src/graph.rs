@@ -57,6 +57,8 @@ pub struct Gap {
     pub message: String,
     pub affected_files: Option<Vec<String>>,
     pub id: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub test_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -144,13 +146,28 @@ impl Graph {
         guard: Option<Id>,
         target_file: Option<Id>,
     ) {
+        self.gap_scoped(code, file, loc, message, guard, target_file, None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gap_scoped(
+        &mut self,
+        code: &'static str,
+        file: Option<Id>,
+        loc: Option<Loc>,
+        message: String,
+        guard: Option<Id>,
+        target_file: Option<Id>,
+        affected_files: Option<Vec<String>>,
+    ) {
         let record = Gap {
             code,
             file: file.map(|f| self.paths[f].clone()),
             location: loc,
             message,
-            affected_files: None,
+            affected_files,
             id: String::new(),
+            test_only: false,
         };
         self.gaps.push(PendingGap {
             record,
@@ -280,13 +297,20 @@ impl Graph {
                 if forwarded.contains(&from) {
                     self.nodes[from].edges.clear();
                 }
-                self.gap(
+                let from_file = self.nodes[from].file;
+                let mut affected = vec![self.paths[file].clone()];
+                if from_file != file {
+                    affected.push(self.paths[from_file].clone());
+                    affected.sort();
+                }
+                self.gap_scoped(
                     "missing-export",
-                    Some(self.nodes[from].file),
+                    Some(from_file),
                     Some(loc),
                     format!("{} has no unambiguous export {name}.", self.paths[file]),
                     None,
                     None,
+                    Some(affected),
                 );
             }
         }
@@ -370,9 +394,27 @@ impl Reach {
         Self { visited }
     }
 
-    pub fn gaps(&self, graph: &Graph, uncertain: impl Fn(Id) -> bool) -> Vec<Gap> {
+    pub fn gaps(
+        &self,
+        graph: &Graph,
+        uncertain: impl Fn(Id) -> bool,
+        roles: &[u8],
+        multi_workspace: bool,
+    ) -> Vec<Gap> {
         let active = |guard: Option<Id>| {
             guard.is_none_or(|n| self.visited[n].iter().any(Option::is_some) || uncertain(n))
+        };
+        let node_test_only = |n: Id| {
+            !uncertain(n)
+                && self.visited[n][0..2].iter().all(Option::is_none)
+                && self.visited[n][4..8].iter().all(Option::is_none)
+                && self.visited[n][2..4].iter().any(Option::is_some)
+        };
+        let node_test_or_tooling_only = |n: Id| {
+            !uncertain(n)
+                && self.visited[n][0..2].iter().all(Option::is_none)
+                && self.visited[n][6..8].iter().all(Option::is_none)
+                && self.visited[n][2..6].iter().any(Option::is_some)
         };
         let mut records = vec![];
         // Escaped namespace values can retain implementations beyond the target file.
@@ -390,24 +432,98 @@ impl Reach {
                 record.message =
                     format!("If the unrooted workspace caller runs: {}", record.message);
             }
+            let origin_file_id = record
+                .file
+                .as_deref()
+                .and_then(|p| graph.paths.binary_search_by(|x| x.as_str().cmp(p)).ok());
+            record.test_only = pending.guard.is_some_and(&node_test_only)
+                || (pending.guard.is_none()
+                    && origin_file_id.is_some_and(|f| {
+                        roles[f] == (1 << Role::Test as usize) && node_test_only(f)
+                    }));
+            if record.affected_files.is_none()
+                && pending.target_file.is_none()
+                && multi_workspace
+                && matches!(record.code, "computed-import" | "bundler-glob")
+                && let Some(file_path) = &record.file
+            {
+                if pending.guard.is_some_and(&node_test_or_tooling_only) {
+                    record.affected_files = Some(vec![file_path.clone()]);
+                } else {
+                    let prefix = file_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+                    let scoped: Vec<String> = if prefix.is_empty() {
+                        vec![file_path.clone()]
+                    } else {
+                        let slash = format!("{prefix}/");
+                        graph
+                            .paths
+                            .iter()
+                            .filter(|p| {
+                                p.strip_prefix(&slash)
+                                    .is_some_and(|rest| !rest.contains('/'))
+                            })
+                            .cloned()
+                            .collect()
+                    };
+                    record.affected_files = Some(if scoped.is_empty() {
+                        vec![file_path.clone()]
+                    } else {
+                        scoped
+                    });
+                }
+            }
             if let Some(target) = pending.target_file {
+                let guard_runtime = pending.guard.is_none_or(|n| {
+                    uncertain(n)
+                        || self.visited[n][0..2].iter().any(Option::is_some)
+                        || self.visited[n][6..8].iter().any(Option::is_some)
+                });
+                let guard_tooling = pending
+                    .guard
+                    .is_some_and(|n| self.visited[n][4..6].iter().any(Option::is_some));
+                let already_covered = |n: Id| {
+                    let v = &self.visited[n];
+                    let has_runtime = v[0].is_some() || v[6].is_some();
+                    if guard_runtime {
+                        has_runtime
+                    } else if guard_tooling {
+                        has_runtime || v[4].is_some()
+                    } else {
+                        // Test-only caller: already covered if reached by runtime, public, or test.
+                        has_runtime || v[2].is_some()
+                    }
+                };
                 record.affected_files = closures
-                    .entry(target)
+                    .entry((target, guard_runtime, guard_tooling))
                     .or_insert_with(|| {
-                        let mut stack = vec![target];
-                        stack.extend(graph.modules[target].exports.values().map(|e| e.surface));
+                        let mut stack = Vec::new();
+                        if !already_covered(target) {
+                            stack.push(target);
+                        }
+                        for e in graph.modules[target].exports.values() {
+                            if !already_covered(e.surface) && !already_covered(e.binding) {
+                                stack.push(e.surface);
+                            }
+                        }
                         let mut seen = BTreeSet::new();
                         let mut files = BTreeSet::new();
                         while let Some(n) = stack.pop() {
                             if seen.insert(n) {
                                 files.insert(graph.paths[graph.nodes[n].file].clone());
-                                stack.extend(graph.nodes[n].edges.iter().map(|e| e.target));
+                                for edge in &graph.nodes[n].edges {
+                                    if !already_covered(edge.target) {
+                                        stack.push(edge.target);
+                                    }
+                                }
                             }
                         }
-                        if graph
-                            .gaps
-                            .iter()
-                            .any(|gap| gap.guard.is_some_and(|n| seen.contains(&n)))
+                        if !multi_workspace
+                            && graph.gaps.iter().any(|gap| {
+                                gap.record.affected_files.is_none()
+                                    && gap.target_file.is_none()
+                                    && matches!(gap.record.code, "computed-import" | "bundler-glob")
+                                    && gap.guard.is_some_and(|n| seen.contains(&n))
+                            })
                         {
                             None
                         } else {

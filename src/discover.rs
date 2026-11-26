@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use oxc_allocator::Allocator;
 use oxc_ast::{
     AstKind,
-    ast::{Expression, ObjectPropertyKind, PropertyKey},
+    ast::{
+        Expression, ObjectPropertyKind, PropertyKey, Statement, TSModuleDeclarationKind,
+        TSModuleDeclarationName,
+    },
 };
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
@@ -105,7 +108,7 @@ fn extract_runner_entry(cmd: &[String]) -> Option<String> {
     let runner = Path::new(cmd.get(i)?.as_str())
         .file_name()
         .and_then(|s| s.to_str())?;
-    if !matches!(runner, "node" | "bun" | "ts-node" | "tsx") {
+    if !matches!(runner, "node" | "bun" | "ts-node" | "tsx" | "nodemon") {
         return None;
     }
     i += 1;
@@ -116,8 +119,20 @@ fn extract_runner_entry(cmd: &[String]) -> Option<String> {
         if arg == "--" {
             return cmd.get(i + 1).filter(|a| !a.starts_with('$')).cloned();
         }
-        if matches!(arg, "-e" | "--eval" | "-p" | "--print" | "-c" | "--check") {
+        if matches!(arg, "-e" | "--eval" | "-p" | "--print" | "-c" | "--check")
+            && runner != "nodemon"
+        {
             return None;
+        }
+        if runner == "nodemon" && matches!(arg, "-x" | "--exec") {
+            if let Some(exec_str) = cmd.get(i + 1) {
+                let inner_words = split_shell_words(exec_str);
+                if let Some(found) = extract_runner_entry(&inner_words) {
+                    return Some(found);
+                }
+            }
+            i += 2;
+            continue;
         }
         if matches!(
             arg,
@@ -133,6 +148,16 @@ fn extract_runner_entry(cmd: &[String]) -> Option<String> {
                 | "--tsconfig"
                 | "--env-file"
                 | "--preload"
+                | "-w"
+                | "--watch"
+                | "-e"
+                | "--ext"
+                | "-i"
+                | "--ignore"
+                | "-d"
+                | "--delay"
+                | "--config"
+                | "--signal"
         ) {
             i += 2;
         } else if arg.starts_with('-') {
@@ -142,6 +167,92 @@ fn extract_runner_entry(cmd: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+fn discover_framework_start_entries(
+    project: &Project,
+    pkg_dir: &Path,
+    cmd: &[String],
+) -> Option<Vec<String>> {
+    let mut i = 0;
+    while i < cmd.len()
+        && (is_env_assign(&cmd[i]) || matches!(cmd[i].as_str(), "exec" | "then" | "else" | "do"))
+    {
+        i += 1;
+    }
+    let bin = Path::new(cmd.get(i)?.as_str())
+        .file_name()
+        .and_then(|s| s.to_str())?;
+    fn strip_pkg_prefix<'a>(prefix: &str, p: &'a str) -> Option<&'a str> {
+        if prefix.is_empty() {
+            Some(p)
+        } else {
+            p.strip_prefix(prefix).and_then(|r| r.strip_prefix('/'))
+        }
+    }
+    let prefix = to_slash(pkg_dir);
+    match bin {
+        "next" => {
+            let mut found = Vec::new();
+            for p in &project.graph.paths {
+                let Some(rel) = strip_pkg_prefix(&prefix, p) else {
+                    continue;
+                };
+                let stripped = rel.strip_prefix("src/").unwrap_or(rel);
+                let is_next_entry = stripped.starts_with("pages/")
+                    || (stripped.starts_with("app/")
+                        && Path::new(stripped)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|s| {
+                                matches!(
+                                    s,
+                                    "page"
+                                        | "layout"
+                                        | "route"
+                                        | "loading"
+                                        | "error"
+                                        | "global-error"
+                                        | "not-found"
+                                        | "template"
+                                        | "default"
+                                        | "opengraph-image"
+                                        | "twitter-image"
+                                        | "icon"
+                                        | "apple-icon"
+                                        | "sitemap"
+                                        | "robots"
+                                        | "manifest"
+                                )
+                            }))
+                    || matches!(
+                        stripped,
+                        "middleware.ts"
+                            | "middleware.js"
+                            | "instrumentation.ts"
+                            | "instrumentation.js"
+                    );
+                if is_next_entry {
+                    found.push(p.clone());
+                }
+            }
+            Some(found)
+        }
+        "vite" => {
+            let html = pkg_dir.join("index.html");
+            let found = html_script_sources(&project.root, &html, &project.graph.paths);
+            if !found.is_empty()
+                || project.roots.iter().any(|r| {
+                    r.role == Role::Runtime && strip_pkg_prefix(&prefix, &r.file).is_some()
+                })
+            {
+                Some(found)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 fn extract_delegation(cmd: &[String]) -> Option<(String, String)> {
@@ -234,6 +345,15 @@ pub fn parse_start_script(
                     parse_start_script(project, &norm_dir, target_script, packages, depth + 1)
             {
                 entries.extend(sub);
+            }
+            continue;
+        }
+        if let Some(fw_entries) = discover_framework_start_entries(project, pkg_dir, cmd) {
+            saw_delegation = true;
+            for path in fw_entries {
+                if !entries.contains(&path) {
+                    entries.push(path);
+                }
             }
             continue;
         }
@@ -451,6 +571,60 @@ pub fn discover_bundler_entries(project: &mut Project) {
         }
     }
     project.roots.extend(new_roots);
+}
+
+/// Discover ambient declaration files (`.d.ts`/`.d.mts`/`.d.cts` containing `declare global`
+/// or `declare module` augmentations) that TypeScript automatically includes in compilation.
+pub fn discover_ambient_declarations(project: &mut Project) {
+    let candidates: Vec<String> = project
+        .graph
+        .paths
+        .iter()
+        .filter(|p| p.ends_with(".d.ts") || p.ends_with(".d.mts") || p.ends_with(".d.cts"))
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let mut arena = Allocator::default();
+    let mut ambient = Vec::new();
+    for file in candidates {
+        let abs = project.root.join(&file);
+        let Ok(source) = fs::read_to_string(&abs) else {
+            continue;
+        };
+        if !source.contains("declare ") {
+            continue;
+        }
+        arena.reset();
+        let parsed = Parser::new(
+            &arena,
+            &source,
+            SourceType::from_path(&abs).unwrap_or_default(),
+        )
+        .parse();
+        if parsed.panicked {
+            continue;
+        }
+        let is_ambient = parsed.program.body.iter().any(|stmt| {
+            matches!(
+                stmt,
+                Statement::TSModuleDeclaration(m)
+                    if m.kind == TSModuleDeclarationKind::Global
+                        || matches!(m.id, TSModuleDeclarationName::StringLiteral(_))
+            )
+        });
+        if is_ambient {
+            ambient.push(Root {
+                file,
+                role: Role::Runtime,
+                origin: "discovered",
+                input: "ambient-declaration".into(),
+                mode: RootEntryMode::ModuleOnly,
+            });
+        }
+    }
+    project.roots.extend(ambient);
 }
 
 pub fn discover_extra_tooling_configs(project: &mut Project) {

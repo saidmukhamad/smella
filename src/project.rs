@@ -52,6 +52,7 @@ pub struct Config {
     pub public_entries: Option<Vec<String>>,
     pub include: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
+    pub dynamic_imports: Option<BTreeMap<String, Vec<String>>>,
 }
 
 pub(crate) fn matcher(pattern: &str) -> Result<GlobMatcher, String> {
@@ -100,6 +101,7 @@ pub struct Project {
     workspace_dirs: Vec<PathBuf>,
     pub react_entry: Option<Id>,
     pub source_mapper: SourceMapper,
+    pub dynamic_imports: BTreeMap<String, Vec<String>>,
 }
 
 impl Project {
@@ -124,6 +126,10 @@ impl Project {
         let exclude = matchers(&input.exclude.or(defaults.exclude).unwrap_or_default())?;
         let entries = input.entries.merge(defaults.entries);
         let public = input.public_entries.or(defaults.public_entries);
+        let dynamic_imports = input
+            .dynamic_imports
+            .or(defaults.dynamic_imports)
+            .unwrap_or_default();
         let mut paths = vec![];
         let mut excluded = vec![];
         let nx_enabled = root
@@ -134,6 +140,7 @@ impl Project {
         let mut manifests = vec![];
         let mut config_dirs = BTreeMap::new();
         let mut tsconfig_files = vec![];
+        let mut bundler_configs = vec![];
         let mut walker = WalkDir::new(&root).sort_by_file_name().into_iter();
         while let Some(entry) = walker.next() {
             let entry = entry.map_err(|e| format!("Cannot enumerate source scope: {e}"))?;
@@ -161,6 +168,15 @@ impl Project {
             }
             if name.starts_with("tsconfig") && name.ends_with(".json") {
                 tsconfig_files.push(PathBuf::from(&file));
+            }
+            if name.starts_with("tsdown.config.")
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| EXTENSIONS.contains(&e))
+            {
+                bundler_configs.push(PathBuf::from(&file));
             }
             if name == "tsconfig.json" {
                 config_dirs.insert(
@@ -196,7 +212,58 @@ impl Project {
                 excluded.push(file);
             }
         }
+        let mut non_js_bins = BTreeSet::new();
+        for manifest_path in &manifests {
+            let Ok(pkg) = json(manifest_path) else {
+                continue;
+            };
+            let Some(dir) = manifest_path
+                .parent()
+                .and_then(|d| d.strip_prefix(&root).ok())
+            else {
+                continue;
+            };
+            let mut bin_targets = Vec::new();
+            manifest_targets(&pkg["bin"], true, &mut bin_targets);
+            for raw in bin_targets {
+                let trimmed = raw.trim().trim_start_matches("./");
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Some(norm) = normalize_rel(&dir.join(trimmed)) else {
+                    continue;
+                };
+                if norm
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| EXTENSIONS.contains(&e))
+                {
+                    continue;
+                }
+                let abs = root.join(&norm);
+                if !abs.is_file() {
+                    continue;
+                }
+                let file = to_slash(&norm);
+                match classify_bin_shebang(&abs) {
+                    Some(true) => {
+                        if include
+                            .as_ref()
+                            .is_none_or(|v| v.iter().any(|p| p.is_match(&file)))
+                            && !exclude.iter().any(|p| p.is_match(&file))
+                        {
+                            paths.push(file);
+                        }
+                    }
+                    Some(false) => {
+                        non_js_bins.insert(file);
+                    }
+                    None => {}
+                }
+            }
+        }
         paths.sort();
+        paths.dedup();
         excluded.sort();
         if paths.is_empty() {
             return Err("No analyzable JS or TS files in the effective scope.".into());
@@ -210,7 +277,7 @@ impl Project {
                 (".cjs".into(), strings(&[".cjs", ".cts"])),
             ],
             builtin_modules: true,
-            condition_names: strings(&["node", "import"]),
+            condition_names: strings(&["node", "import", "default"]),
             main_fields: strings(&["module", "main"]),
             ..Default::default()
         };
@@ -331,7 +398,7 @@ impl Project {
                 packages.push((rel.to_owned(), package));
             }
         }
-        let source_mapper = SourceMapper::build(&root, &tsconfig_files);
+        let source_mapper = SourceMapper::build(&root, &tsconfig_files, &bundler_configs);
         let nx = if nx_enabled {
             let nx = crate::nx::Workspace::read(&root, &nx_dirs, &packages)?;
             for dir in nx.directories() {
@@ -379,18 +446,13 @@ impl Project {
             workspace_dirs,
             react_entry,
             source_mapper,
+            dynamic_imports,
         };
         for (role, supplied) in
             ROLES
                 .into_iter()
                 .zip([entries.runtime, entries.test, entries.tooling, public])
         {
-            if supplied.is_none()
-                && matches!(role, Role::Runtime | Role::Tooling)
-                && let Some(nx) = &nx
-            {
-                nx.discover(&mut project, role)?;
-            }
             if let Some(patterns) = supplied {
                 for p in patterns {
                     project.select(role, &p, "explicit", &p, true)?;
@@ -403,6 +465,9 @@ impl Project {
                     project.select(role, p, "discovered", p, false)?;
                 }
             } else if role == Role::Tooling {
+                if let Some(nx) = &nx {
+                    nx.discover(&mut project, role)?;
+                }
                 let p =
                     "**/{vite,vitest,jest,webpack,rollup,eslint}.config.{ts,js,mjs,cjs,mts,cts}";
                 project.select(role, p, "discovered", p, false)?;
@@ -411,6 +476,7 @@ impl Project {
             } else {
                 if role == Role::Runtime {
                     crate::discover::discover_bundler_entries(&mut project);
+                    crate::discover::discover_ambient_declarations(&mut project);
                 }
                 for (dir, pkg) in &packages {
                     if role == Role::Runtime {
@@ -462,7 +528,8 @@ impl Project {
                             }
                             crate::discover::ScriptOutcome::DelegatedOrNoop => {}
                             crate::discover::ScriptOutcome::Ambiguous => {
-                                project.graph.gap(
+                                let scope = project.scope_for_discovered_dir(dir);
+                                project.graph.gap_scoped(
                                     "ambiguous-entry",
                                     None,
                                     None,
@@ -471,6 +538,7 @@ impl Project {
                                     ),
                                     None,
                                     None,
+                                    scope,
                                 );
                             }
                         }
@@ -528,6 +596,9 @@ impl Project {
                             continue;
                         }
                         let file = to_slash(&dir.join(trimmed.trim_start_matches("./")));
+                        if role == Role::Runtime && field == "bin" && non_js_bins.contains(&file) {
+                            continue;
+                        }
                         if role == Role::Public && trimmed.contains('*') {
                             // Non-code asset wildcard directories (e.g. `./skills/*`) have no JS/TS files.
                             let prefix = file.split('*').next().unwrap_or("");
@@ -554,15 +625,22 @@ impl Project {
                         && !pkg[field].is_null()
                         && !has_targets
                     {
-                        project.graph.gap(
+                        let scope = project.scope_for_discovered_dir(dir);
+                        project.graph.gap_scoped(
                             "ambiguous-entry",
                             None,
                             None,
                             format!("{label} has no supported ESM target. Supply publicEntries."),
                             None,
                             None,
+                            scope,
                         );
                     }
+                }
+                if role == Role::Runtime
+                    && let Some(nx) = &nx
+                {
+                    nx.discover(&mut project, role)?;
                 }
             }
         }
@@ -665,8 +743,18 @@ impl Project {
             let message = format!(
                 "{role:?} root {pattern:?} selected by {input:?} matched no included file. Supply a source entry."
             );
+            let scope = if origin == "discovered" {
+                let manifest_dir = input
+                    .split('#')
+                    .next()
+                    .and_then(|p| Path::new(p).parent())
+                    .unwrap_or_else(|| Path::new(""));
+                self.scope_for_discovered_dir(manifest_dir)
+            } else {
+                None
+            };
             self.graph
-                .gap("invalid-root", None, None, message, None, None);
+                .gap_scoped("invalid-root", None, None, message, None, None, scope);
         }
         Ok(())
     }
@@ -722,10 +810,12 @@ impl Project {
                     return Some(Ok(None));
                 }
                 let rel = rel_dir.join(target.trim_start_matches("./"));
-                if let Some(id) =
-                    self.source_mapper
-                        .map_to_source(&self.root, &self.graph.paths, &rel)
-                {
+                if let Some(id) = self.source_mapper.map_to_source_mode(
+                    &self.root,
+                    &self.graph.paths,
+                    &rel,
+                    type_only,
+                ) {
                     return Some(Ok(Some(id)));
                 }
             }
@@ -738,9 +828,12 @@ impl Project {
                 }
                 let rel = rel_dir.join(s);
                 if self.source_mapper.is_in_out_dir(&rel)
-                    && let Some(id) =
-                        self.source_mapper
-                            .map_to_source(&self.root, &self.graph.paths, &rel)
+                    && let Some(id) = self.source_mapper.map_to_source_mode(
+                        &self.root,
+                        &self.graph.paths,
+                        &rel,
+                        type_only,
+                    )
                 {
                     return Some(Ok(Some(id)));
                 }
@@ -769,10 +862,12 @@ impl Project {
                 candidates.push("./index");
                 for target in candidates {
                     let rel = rel_dir.join(target.trim_start_matches("./"));
-                    if let Some(id) =
-                        self.source_mapper
-                            .map_to_source(&self.root, &self.graph.paths, &rel)
-                    {
+                    if let Some(id) = self.source_mapper.map_to_source_mode(
+                        &self.root,
+                        &self.graph.paths,
+                        &rel,
+                        type_only,
+                    ) {
                         return Some(Ok(Some(id)));
                     }
                 }
@@ -784,7 +879,7 @@ impl Project {
                 }
                 let rel = rel_dir.join(s);
                 self.source_mapper
-                    .map_to_source(&self.root, &self.graph.paths, &rel)
+                    .map_to_source_mode(&self.root, &self.graph.paths, &rel, type_only)
                     .map(|id| Ok(Some(id)))
             }
         }
@@ -796,6 +891,114 @@ impl Project {
             .get(ws_id)
             .map(PathBuf::as_path)
             .unwrap_or_else(|| Path::new(""))
+    }
+
+    pub fn is_multi_workspace(&self) -> bool {
+        self.workspace_dirs.len() > 1
+    }
+
+    pub fn files_in_dir(&self, dir: &Path) -> Vec<String> {
+        let prefix = to_slash(dir);
+        if prefix.is_empty() {
+            return self.graph.paths.clone();
+        }
+        let slash = format!("{prefix}/");
+        let start = self
+            .graph
+            .paths
+            .partition_point(|p| p.as_str() < slash.as_str());
+        self.graph.paths[start..]
+            .iter()
+            .take_while(|p| p.starts_with(&slash))
+            .cloned()
+            .collect()
+    }
+
+    pub fn scope_for_discovered_dir(&self, dir: &Path) -> Option<Vec<String>> {
+        if dir.as_os_str().is_empty() || !self.is_multi_workspace() {
+            None
+        } else {
+            Some(self.files_in_dir(dir))
+        }
+    }
+
+    pub fn scope_unresolved_import(&self, file: Id, spec: &str) -> Option<Vec<String>> {
+        let importer = self.graph.paths[file].clone();
+        let clean_spec = spec.split('?').next().unwrap_or(spec);
+        if is_non_code_export(clean_spec) {
+            return Some(vec![importer]);
+        }
+        if spec.contains('?')
+            && let Ok(resolved) = self.resolve_with_mode(file, clean_spec, false, false)
+        {
+            let mut affected = vec![importer];
+            if let Some(id) = resolved
+                && self.graph.paths[id] != affected[0]
+            {
+                affected.push(self.graph.paths[id].clone());
+                affected.sort();
+            }
+            return Some(affected);
+        }
+        if !self.is_multi_workspace() {
+            if !clean_spec.starts_with('.')
+                && !clean_spec.starts_with('/')
+                && Self::split_package_spec(clean_spec)
+                    .is_none_or(|(pkg, _)| !self.workspaces.contains_key(&pkg))
+                && self
+                    .source_mapper
+                    .matches_tsconfig_path(Path::new(&importer), clean_spec)
+                    .is_empty()
+            {
+                return Some(vec![importer]);
+            }
+            return None;
+        }
+        let mut affected = BTreeSet::from([importer.clone()]);
+        if clean_spec.starts_with('.') || clean_spec.starts_with('/') {
+            let file_dir = Path::new(&importer)
+                .parent()
+                .unwrap_or_else(|| Path::new(""));
+            if let Some(rel) = normalize_rel(&file_dir.join(clean_spec)) {
+                let target_ws_dir = self
+                    .workspace_dirs
+                    .iter()
+                    .filter(|d| !d.as_os_str().is_empty() && rel.starts_with(d))
+                    .max_by_key(|d| d.components().count());
+                if self.source_mapper.is_in_out_dir(&rel)
+                    || target_ws_dir.is_some_and(|d| d != self.workspace_dir_for(file))
+                {
+                    if let Some(ws_dir) = target_ws_dir {
+                        affected.extend(self.files_in_dir(ws_dir));
+                    }
+                } else if let Some(parent) = rel.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    affected.extend(self.files_in_dir(parent));
+                }
+            }
+            return Some(affected.into_iter().collect());
+        }
+        if let Some((pkg_name, _)) = Self::split_package_spec(clean_spec)
+            && let Some(WorkspacePackage::Unique(pkg)) = self.workspaces.get(&pkg_name)
+        {
+            affected.extend(self.files_in_dir(&pkg.rel_dir));
+            return Some(affected.into_iter().collect());
+        }
+        let ts_targets = self
+            .source_mapper
+            .matches_tsconfig_path(Path::new(&importer), clean_spec);
+        if !ts_targets.is_empty() {
+            for t in &ts_targets {
+                if let Some(parent) = t.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    affected.extend(self.files_in_dir(parent));
+                }
+            }
+            return Some(affected.into_iter().collect());
+        }
+        Some(affected.into_iter().collect())
     }
 
     /// None means a resolved external package, Node builtin or plain stylesheet.
@@ -810,24 +1013,55 @@ impl Project {
             return Ok(None);
         }
         let origin = self.root.join(&self.graph.paths[file]);
+        let origin_dir = origin.parent().unwrap();
         let profile = if spec.starts_with('.') || spec.starts_with('/') {
             0
         } else {
             self.file_profile[file]
         };
         let resolver = &self.resolvers[profile][usize::from(type_only)];
-        let mut result = resolver.resolve(origin.parent().unwrap(), spec);
+        let mut result = resolver.resolve(origin_dir, spec);
+        // Avoid tsconfig `baseUrl` shadowing an installed package with a same-named local file (e.g. `knip.ts` importing `"knip"`).
+        if profile != 0
+            && !spec.starts_with('.')
+            && !spec.starts_with('/')
+            && let Ok(ref resolved) = result
+            && resolved.path() == origin
+            && let Ok(pkg_res) = self.resolvers[0][usize::from(type_only)].resolve(origin_dir, spec)
+            && pkg_res
+                .path()
+                .components()
+                .any(|c| c.as_os_str() == "node_modules")
+        {
+            return Ok(None);
+        }
         if result.is_err() {
             if let Some(ws) = self.resolve_workspace_source(spec, type_only, cjs) {
                 return ws;
+            }
+            if !spec.starts_with('.')
+                && !spec.starts_with('/')
+                && let Some(id) = self.source_mapper.resolve_tsconfig_path(
+                    Path::new(&self.graph.paths[file]),
+                    spec,
+                    &self.root,
+                    &self.graph.paths,
+                    type_only,
+                )
+            {
+                return Ok(Some(id));
             }
             if spec.starts_with('.') {
                 let rel_origin = Path::new(&self.graph.paths[file]);
                 if let Some(rel) = normalize_rel(&rel_origin.parent().unwrap().join(spec))
                     && self.source_mapper.is_in_out_dir(&rel)
-                    && let Some(id) =
-                        self.source_mapper
-                            .map_to_source(&self.root, &self.graph.paths, &rel)
+                    && let Some(id) = self.source_mapper.map_to_source_mode(
+                        &self.root,
+                        &self.graph.paths,
+                        &rel,
+                        type_only,
+                    )
+                    && id != file
                 {
                     return Ok(Some(id));
                 }
@@ -851,15 +1085,32 @@ impl Project {
                     result = package_resolver
                         .resolve(&pkg_info.dir, &format!("./{}", parts[count..].join("/")));
                 }
+            } else if let Some(types_spec) = mangle_types_spec(spec)
+                && let Ok(typed) = self.resolvers[0][1].resolve(origin_dir, &types_spec)
+                && typed
+                    .path()
+                    .components()
+                    .any(|c| c.as_os_str() == "node_modules")
+            {
+                return Ok(None);
             }
         }
         match result {
             Ok(resolved) => {
                 let path = resolved.path();
-                if resolved.query().is_some() {
-                    return Err(format!(
-                        "{spec:?} includes a loader query with bundler-specific module semantics."
-                    ));
+                if let Some(query) = resolved.query() {
+                    let q = query.trim_start_matches('?');
+                    if matches!(q, "url" | "raw" | "inline") {
+                        return Ok(None);
+                    }
+                    if !matches!(
+                        q,
+                        "worker" | "sharedworker" | "worker&inline" | "inline&worker"
+                    ) {
+                        return Err(format!(
+                            "{spec:?} includes a loader query with bundler-specific module semantics."
+                        ));
+                    }
                 }
                 if spec.ends_with(".css") && path.extension().is_some_and(|ext| ext == "css") {
                     return Ok(None);
@@ -886,10 +1137,21 @@ impl Project {
                     }
                 };
                 if self.source_mapper.is_in_out_dir(Path::new(&rel))
-                    && let Some(id) = self.source_mapper.map_to_source(
+                    && let Some(id) = self.source_mapper.map_to_source_mode(
                         &self.root,
                         &self.graph.paths,
                         Path::new(&rel),
+                        type_only,
+                    )
+                    && id != file
+                {
+                    return Ok(Some(id));
+                }
+                if type_only
+                    && let Some(id) = crate::source_map::SourceMapper::lookup_direct_mode(
+                        &self.graph.paths,
+                        Path::new(&rel),
+                        true,
                     )
                 {
                     return Ok(Some(id));
@@ -897,10 +1159,12 @@ impl Project {
                 if let Ok(id) = self.graph.paths.binary_search(&rel) {
                     return Ok(Some(id));
                 }
-                if let Some(id) =
-                    self.source_mapper
-                        .map_to_source(&self.root, &self.graph.paths, Path::new(&rel))
-                {
+                if let Some(id) = self.source_mapper.map_to_source_mode(
+                    &self.root,
+                    &self.graph.paths,
+                    Path::new(&rel),
+                    type_only,
+                ) {
                     return Ok(Some(id));
                 }
                 if is_non_code_export(&rel) {
@@ -913,6 +1177,49 @@ impl Project {
             Err(ResolveError::Builtin { .. }) => Ok(None),
             Err(e) => Err(format!("Cannot resolve {spec:?}: {e}")),
         }
+    }
+}
+
+fn classify_bin_shebang(path: &Path) -> Option<bool> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut buf = [0u8; 160];
+    let n = file.read(&mut buf).ok()?;
+    let header = std::str::from_utf8(&buf[..n]).ok()?;
+    let line = header.lines().next()?.trim();
+    let rest = line.strip_prefix("#!")?.trim();
+    let mut tokens = rest.split_whitespace();
+    let first = Path::new(tokens.next()?)
+        .file_name()
+        .and_then(|s| s.to_str())?;
+    let interp = if first == "env" {
+        tokens
+            .find(|t| !t.starts_with('-') && !t.contains('='))
+            .and_then(|t| Path::new(t).file_name().and_then(|s| s.to_str()))
+            .unwrap_or("")
+    } else {
+        first
+    };
+    Some(matches!(
+        interp,
+        "node" | "nodejs" | "bun" | "deno" | "tsx" | "ts-node"
+    ))
+}
+
+fn mangle_types_spec(spec: &str) -> Option<String> {
+    if spec.starts_with('.') || spec.starts_with('/') || spec.starts_with("@types/") {
+        return None;
+    }
+    if let Some(rest) = spec.strip_prefix('@') {
+        let mut it = rest.splitn(3, '/');
+        let scope = it.next()?;
+        let name = it.next()?;
+        match it.next() {
+            Some(sub) if !sub.is_empty() => Some(format!("@types/{scope}__{name}/{sub}")),
+            _ => Some(format!("@types/{scope}__{name}")),
+        }
+    } else {
+        Some(format!("@types/{spec}"))
     }
 }
 

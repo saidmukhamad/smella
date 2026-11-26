@@ -416,16 +416,21 @@ test('missing workspace entry keeps positive evidence and an unresolved target s
   assert.deepEqual(subject(r,'pkgs/b/stale.ts','x').usage.value,[]);
 });
 
-test('unbounded loads behind unrooted cross-workspace reads qualify otherwise unrelated findings', async t => {
+test('unbounded loads behind unrooted cross-workspace reads qualify the affected workspace without tainting unrelated packages', async t => {
   const root = await fixture(t,{
     'package.json':'{"workspaces":["p/*"]}', 'app.ts':'void 0;', 'independent.ts':'export const maybe = 1;',
     'p/a/package.json':'{"name":"a"}', 'p/a/orphan.ts':'import {run} from "b"; run();',
     'p/b/package.json':'{"name":"b","exports":"./api.ts"}', 'p/b/api.ts':'export function run() { return import(path); }',
+    'p/b/sibling.ts':'export const near = 1;',
   });
   const r = await inspect(t,root,app);
   const gap = r.coverage.gaps.find(g=>g.code==='computed-import');
-  assert.equal(gap.affectedFiles,null);
-  assert.ok(subject(r,'independent.ts','maybe').gapIds.includes(gap.id));
+  assert.ok(gap);
+  assert.ok(gap.affectedFiles.includes('p/b/api.ts'));
+  assert.ok(gap.affectedFiles.includes('p/b/sibling.ts'));
+  assert.ok(subject(r,'p/b/sibling.ts','near').gapIds.includes(gap.id));
+  assert.equal(subject(r,'p/b/sibling.ts','near').status,'conditional');
+  assert.equal(subject(r,'independent.ts','maybe').status,'complete');
   assert.deepEqual(subject(r,'p/b/api.ts','run').usage.value,[]);
 });
 
@@ -551,10 +556,12 @@ test('React lazy supports a destructured alias and keeps public component depend
   assert.equal(subject(r,'views.tsx','Sibling').kind,'unused-export');
 });
 
-test('stylesheet imports resolve across CSS modules, literal import.meta.glob resolves statically, and dynamic glob/loader queries stay visible', async t => {
+test('stylesheet imports resolve across CSS modules, literal import.meta.glob and standard asset/worker queries resolve cleanly, while dynamic glob and unknown queries stay visible', async t => {
   const root = await fixture(t,{
-    'app.ts': 'import styles from "./a.module.css"; console.log(styles.title); import.meta.glob("./routes/*.tsx"); import.meta.glob(dynPattern); import "./missing.css"; import text from "./template.ts?raw"; console.log(text);',
-    'a.module.css':'.title { color: red }', 'template.ts':'export default 42;',
+    'app.ts': 'import styles from "./a.module.css"; console.log(styles.title); import.meta.glob("./routes/*.tsx"); import.meta.glob(dynPattern); import "./missing.css"; import text from "./template.ts?raw"; import url from "./template.ts?url"; import InlineCss from "./a.module.css?inline"; import MyWorker from "./bg.ts?worker"; import custom from "./template.ts?custom"; const addon = require("./native.node"); console.log(text, url, InlineCss, MyWorker, custom, addon);',
+    'a.module.css':'.title { color: red }', 'template.ts':'export default 42;', 'native.node':'',
+    'bg.ts':'import { work } from "./bg-lib"; work();',
+    'bg-lib.ts':'export function work() {} export function unused() {}',
     'routes/landing.tsx':'export function Landing() { return <div />; }',
   });
   const r = await inspect(t,root,app);
@@ -564,6 +571,8 @@ test('stylesheet imports resolve across CSS modules, literal import.meta.glob re
   assert.deepEqual(candidate.usage.value,['runtime']);
   assert.equal(candidate.kind,null);
   assert.deepEqual(subject(r,'template.ts','default').usage.value,[]);
+  assert.deepEqual(subject(r,'bg-lib.ts','work').usage.value,['runtime']);
+  assert.equal(subject(r,'bg-lib.ts','unused').kind,'unused-export');
 });
 
 test('Nx respects a relocated root, literal paths and command overrides of inherited executors', async t => {
@@ -946,4 +955,192 @@ test('static import.meta.glob, inline primaryGaps and NDJSON CLI stream compact 
     assert.equal(item.primaryGaps.length, 1);
     assert.equal(item.primaryGaps[0].code, 'computed-import');
   }
+});
+
+test('type-only @types fallback, tsdown outDir, tsconfig compiled-type paths, default exports and companion declarations resolve cleanly', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ workspaces: ['packages/*'] }),
+    'node_modules/@types/bare-lib/package.json': JSON.stringify({ name: '@types/bare-lib', types: 'index.d.ts' }),
+    'node_modules/@types/bare-lib/index.d.ts': 'export interface BareReq { id: string }',
+    'node_modules/ext-tool/package.json': JSON.stringify({ name: 'ext-tool', types: 'index.d.ts' }),
+    'node_modules/ext-tool/index.d.ts': 'export interface ToolCfg { enabled: boolean }',
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: {
+        baseUrl: '.',
+        paths: {
+          'host/@/*': ['packages/host/dist/@mf-types/compiled-types/ui/*'],
+        },
+      },
+    }),
+    'ext-tool.ts': 'import type { ToolCfg } from "ext-tool"; export const cfg: ToolCfg = { enabled: true };',
+    'app.ts': [
+      'import type { BareReq } from "bare-lib";',
+      'import { Button } from "host/@/button";',
+      'import { cfg } from "./ext-tool";',
+      'import type { HelperOpts } from "./packages/helper/mod.mjs";',
+      'import { runHelper } from "@org/default-only";',
+      'const backend = require("./packages/bundled/dist/index.cjs");',
+      'const req: BareReq = { id: "1" };',
+      'const opts: HelperOpts = { retries: 1 };',
+      'backend.start(); Button(); runHelper(); console.log(req, opts, cfg);',
+    ].join('\n'),
+    'packages/host/tsconfig.mf.json': JSON.stringify({ compilerOptions: { outDir: './@mf-types', rootDir: './src' } }),
+    'packages/host/src/ui/button.ts': 'export function Button() {} export function unusedButton() {}',
+    'packages/bundled/tsdown.config.ts': 'export default defineConfig({ entry: ["src/index.ts"], outDir: "dist", format: "cjs" });',
+    'packages/bundled/src/index.ts': 'export function start() {} export function unusedStart() {}',
+    'packages/helper/mod.mjs': 'export function helperVal() { return 1; }',
+    'packages/helper/mod.d.ts': 'export interface HelperOpts { retries: number } export interface UnusedOpts { x: number }',
+    'packages/default-only/package.json': JSON.stringify({
+      name: '@org/default-only',
+      exports: { '.': { default: './src/index.ts' } },
+    }),
+    'packages/default-only/src/index.ts': 'export function runHelper() {}',
+  });
+
+  const r = await inspect(t, root, app);
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.deepEqual(subject(r, 'packages/host/src/ui/button.ts', 'Button').usage.value, ['runtime']);
+  assert.equal(subject(r, 'packages/host/src/ui/button.ts', 'unusedButton').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'packages/bundled/src/index.ts', 'start').usage.value, ['runtime']);
+  assert.equal(subject(r, 'packages/bundled/src/index.ts', 'unusedStart').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'packages/helper/mod.d.ts', 'HelperOpts').usage.type, ['runtime']);
+  assert.equal(subject(r, 'packages/helper/mod.d.ts', 'UnusedOpts').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'packages/default-only/src/index.ts', 'runHelper').usage.value, ['runtime']);
+});
+
+test('export type star from .d.ts, mixed value/type companion .d.ts, declaration merging and ambient declarations resolve cleanly', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ workspaces: ['packages/*'], bin: { app: './app.ts' } }),
+    'app.ts': [
+      'import type { SharedApi } from "./lib/shared";',
+      'import { runTool, type ToolReceipt } from "./tool.mjs";',
+      'import { Merged } from "./merged";',
+      'const x: SharedApi = { id: "1" };',
+      'const y: ToolReceipt = { ok: true };',
+      'console.log(runTool(), x, y, Merged);',
+    ].join('\n'),
+    'reexport.ts': 'export type * from "./types/shared";',
+    'types/shared.d.ts': 'export type { SharedApi, UnusedShared } from "@org/types";',
+    'tsconfig.types.json': JSON.stringify({ compilerOptions: { outDir: './types', rootDir: './lib' } }),
+    'lib/shared.ts': 'export type * from "../types/shared";',
+    'packages/types/package.json': JSON.stringify({ name: '@org/types', exports: { '.': './index.ts' } }),
+    'packages/types/index.ts': 'export interface SharedApi { id: string } export interface GlobalUser { name: string } export interface UnusedShared { x: number }',
+    'tool.mjs': 'export function runTool() { return 1; }',
+    'tool.d.ts': 'export interface ToolReceipt { ok: boolean } export interface UnusedReceipt { no: boolean }',
+    'merged.ts': 'export interface Merged { value: number } export const Merged = { value: 1 };',
+    'ambient.d.ts': 'import type { GlobalUser } from "@org/types"; declare global { namespace Req { interface Context { user?: GlobalUser; } } } export {};',
+  });
+
+  const r = await inspect(t, root, { publicEntries: [] });
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.deepEqual(subject(r, 'packages/types/index.ts', 'SharedApi').usage.type, ['runtime']);
+  assert.deepEqual(subject(r, 'packages/types/index.ts', 'GlobalUser').usage.type, ['runtime']);
+  assert.deepEqual(subject(r, 'packages/types/index.ts', 'GlobalUser').usage.evaluation, []);
+  assert.equal(subject(r, 'packages/types/index.ts', 'UnusedShared').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'tool.mjs', 'runTool').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'tool.d.ts', 'ToolReceipt').usage.type, ['runtime']);
+  assert.equal(subject(r, 'tool.d.ts', 'UnusedReceipt').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'merged.ts', 'Merged').usage.value, ['runtime']);
+});
+
+test('typeof import, Promise.all dynamic imports, Object.defineProperty exports, template-prefix globs and dynamicImports config resolve cleanly', async t => {
+  const root = await fixture(t, {
+    'app.ts': [
+      'type WholeApi = typeof import("./api");',
+      'type ReqRet = ReturnType<typeof require>;',
+      'const cjs = require("./defined.cjs");',
+      'export async function run(name: string, dyn: string) {',
+      '  const [{ alpha }, modB] = await Promise.all([import("./modA"), import("./modB")]);',
+      '  const { cmd } = await import(new URL("./cmd.mjs", import.meta.url).href);',
+      '  const plugin = require(`./plugins/${name}`);',
+      '  const { cfgTarget } = await import(dyn);',
+      '  return [alpha(), modB.beta(), cmd(), cjs.definedFn(), plugin, cfgTarget(), null as unknown as WholeApi, null as unknown as ReqRet];',
+      '}',
+      'run("x", "y");',
+    ].join('\n'),
+    'api.ts': 'export interface ApiShape { ok: boolean }',
+    'modA.ts': 'export function alpha() {} export function unusedA() {}',
+    'modB.ts': 'export function beta() {} export function unusedB() {}',
+    'cmd.mjs': 'export function cmd() {} export function unusedCmd() {}',
+    'defined.cjs': 'function definedFn() { return 1; } function deadCjs() {} Object.defineProperty(exports, "definedFn", { enumerable: true, get: () => definedFn }); Object.defineProperty(exports, "deadCjs", { value: deadCjs });',
+    'plugins/one.ts': 'export function initOne() {}',
+    'plugins/two.ts': 'export function initTwo() {}',
+    'configured.ts': 'export function cfgTarget() {}',
+  });
+
+  const r = await inspect(t, root, { ...app, dynamicImports: { 'app.ts': ['./configured'] } });
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.deepEqual(subject(r, 'api.ts', 'ApiShape').usage.type, ['runtime']);
+  assert.deepEqual(subject(r, 'api.ts').usage.evaluation, []);
+  assert.deepEqual(subject(r, 'modA.ts', 'alpha').usage.value, ['runtime']);
+  assert.equal(subject(r, 'modA.ts', 'unusedA').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'modB.ts', 'beta').usage.value, ['runtime']);
+  assert.equal(subject(r, 'modB.ts', 'unusedB').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'cmd.mjs', 'cmd').usage.value, ['runtime']);
+  assert.equal(subject(r, 'cmd.mjs', 'unusedCmd').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'defined.cjs', 'definedFn').usage.value, ['runtime']);
+  assert.equal(subject(r, 'defined.cjs', 'deadCjs').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'plugins/one.ts').usage.evaluation, ['runtime']);
+  assert.deepEqual(subject(r, 'plugins/two.ts').usage.evaluation, ['runtime']);
+  assert.deepEqual(subject(r, 'configured.ts').usage.evaluation, ['runtime']);
+});
+
+test('extensionless shebang bins, nodemon and framework start scripts, and spawn execPath children are discovered cleanly', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({
+      workspaces: ['packages/*'],
+      bin: {
+        'js-tool': './bin/js-tool',
+        'sh-tool': './bin/sh-tool',
+        'py-tool': './bin/py-tool',
+      },
+    }),
+    'bin/js-tool': '#!/usr/bin/env node\nconst { spawn } = require("node:child_process");\nconst path = require("node:path");\nconst { cliWork } = require("../src/cli-lib.cjs");\ncliWork();\nspawn(process.execPath, ["-r", "ts-node/register", path.join(__dirname, "../src/worker.ts")]);\n',
+    'bin/sh-tool': '#!/bin/sh\necho ok\n',
+    'bin/py-tool': '#!/usr/bin/env python3\nprint("ok")\n',
+    'src/cli-lib.cjs': 'exports.cliWork = () => 1; exports.unusedCli = () => 2;',
+    'src/worker.ts': 'import { runJob } from "./job"; runJob();',
+    'src/job.ts': 'export function runJob() {} export function deadJob() {}',
+    'packages/dev-srv/package.json': JSON.stringify({ name: '@org/dev-srv', scripts: { start: 'nodemon -w src --exec "tsx src/server.ts"' } }),
+    'packages/dev-srv/src/server.ts': 'import { serve } from "./serve"; serve();',
+    'packages/dev-srv/src/serve.ts': 'export function serve() {}',
+    'packages/docs/package.json': JSON.stringify({ name: '@org/docs', scripts: { start: 'next start' } }),
+    'packages/docs/app/page.tsx': 'import { DocHero } from "./hero"; export default function Page() { return DocHero(); }',
+    'packages/docs/app/hero.ts': 'export function DocHero() {}',
+  });
+
+  const r = await inspect(t, root, { publicEntries: [] });
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.ok(r.roots.some(x => x.file === 'bin/js-tool' && x.role === 'runtime'));
+  assert.deepEqual(subject(r, 'src/cli-lib.cjs', 'cliWork').usage.value, ['runtime']);
+  assert.equal(subject(r, 'src/cli-lib.cjs', 'unusedCli').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'src/job.ts', 'runJob').usage.value, ['runtime']);
+  assert.equal(subject(r, 'src/job.ts', 'deadJob').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'packages/dev-srv/src/serve.ts', 'serve').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'packages/docs/app/page.tsx').usage.evaluation, ['runtime']);
+});
+
+test('gaps in one monorepo workspace leave fully resolved findings in unrelated workspaces complete', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ workspaces: ['packages/*'], bin: { app: './app.ts' } }),
+    'app.ts': 'import { ok } from "@org/clean"; import { messy } from "@org/noisy"; ok(); messy();',
+    'packages/clean/package.json': JSON.stringify({ name: '@org/clean', exports: { '.': './src/index.ts' } }),
+    'packages/clean/src/index.ts': 'export function ok() {} export function cleanUnused() {}',
+    'packages/noisy/package.json': JSON.stringify({ name: '@org/noisy', exports: { '.': './src/index.ts' } }),
+    'packages/noisy/src/index.ts': [
+      'import "uninstalled-external-pkg";',
+      'import { missing } from "./broken";',
+      'export function messy() { eval("1"); return missing; }',
+      'export function noisyUnused() {}',
+    ].join('\n'),
+    'packages/noisy/src/broken.ts': 'export const present = 1;',
+    'packages/noisy/src/index.test.ts': 'export async function loadDyn(x: string) { return import(x); } loadDyn("a");',
+  });
+
+  const r = await inspect(t, root, { publicEntries: [] });
+  assert.equal(r.coverage.status, 'partial');
+  assert.equal(subject(r, 'packages/clean/src/index.ts', 'cleanUnused').status, 'complete');
+  assert.deepEqual(subject(r, 'packages/clean/src/index.ts', 'cleanUnused').gapIds, []);
+  assert.equal(subject(r, 'packages/noisy/src/index.ts', 'noisyUnused').status, 'conditional');
+  assert.equal(subject(r, 'packages/noisy/src/broken.ts', 'present').status, 'conditional');
 });

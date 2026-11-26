@@ -244,13 +244,83 @@ impl Workspace {
 
     pub fn discover(&self, project: &mut Project, role: Role) -> Result<(), String> {
         let runtime = role == Role::Runtime;
+        if !runtime && let Some(plugins) = self.config["plugins"].as_array() {
+            for item in plugins {
+                let raw = item
+                    .as_str()
+                    .or_else(|| item.get("plugin").and_then(Value::as_str));
+                if let Some(spec) = raw.filter(|s| s.starts_with('.'))
+                    && let Some(norm) = workspace_path(spec)
+                    && let Some(file) = norm.to_str()
+                    && project
+                        .graph
+                        .paths
+                        .binary_search_by(|p| p.as_str().cmp(file))
+                        .is_ok()
+                {
+                    project.roots.push(Root {
+                        file: file.to_owned(),
+                        role: Role::Tooling,
+                        origin: "discovered",
+                        input: "nx.json#plugins".into(),
+                        mode: RootEntryMode::AllExports,
+                    });
+                }
+            }
+        }
         if runtime
             && (self.config["plugins"]
                 .as_array()
                 .is_some_and(|p| !p.is_empty())
                 || !self.config["extends"].is_null())
         {
-            gap(project, "nx.json uses plugins or extended configuration that can supply additional application targets. Supply entries.runtime for the deployment profile.".into());
+            let scope = if project.is_multi_workspace() && !self.projects.is_empty() {
+                let mut affected = BTreeSet::new();
+                for def in &self.projects {
+                    if def.field("projectType") != Some("application") {
+                        continue;
+                    }
+                    let prefix = def.dir.to_string_lossy().replace('\\', "/");
+                    let has_runtime = project.roots.iter().any(|r| {
+                        r.role == Role::Runtime
+                            && (prefix.is_empty() || r.file.starts_with(&format!("{prefix}/")))
+                    });
+                    if !has_runtime && !def.dir.as_os_str().is_empty() {
+                        affected.extend(project.files_in_dir(&def.dir));
+                    }
+                }
+                if affected.is_empty()
+                    && let Some(plugins) = self.config["plugins"].as_array()
+                {
+                    for item in plugins {
+                        let raw = item
+                            .as_str()
+                            .or_else(|| item.get("plugin").and_then(Value::as_str));
+                        if let Some(spec) = raw.filter(|s| s.starts_with('.'))
+                            && let Some(norm) = workspace_path(spec)
+                            && let Some(file) = norm.to_str()
+                        {
+                            affected.insert(file.to_owned());
+                        }
+                    }
+                }
+                if affected.is_empty() {
+                    None
+                } else {
+                    Some(affected.into_iter().collect())
+                }
+            } else {
+                None
+            };
+            project.graph.gap_scoped(
+                "ambiguous-entry",
+                None,
+                None,
+                "nx.json uses plugins or extended configuration that can supply additional application targets. Supply entries.runtime for the deployment profile.".into(),
+                None,
+                None,
+                scope,
+            );
         }
         for def in &self.projects {
             let kind = def.field("projectType");
@@ -525,6 +595,7 @@ fn select_file(project: &mut Project, def: &Definition, role: Role, source: &str
             mode: RootEntryMode::ModuleOnly,
         });
     } else {
-        project.graph.gap("invalid-root",None,None,format!("{source} in project {:?} selects {value}, which has no included source file. Supply an explicit source entry.",def.dir),None,None);
+        let scope = project.scope_for_discovered_dir(&def.dir);
+        project.graph.gap_scoped("invalid-root",None,None,format!("{source} in project {:?} selects {value}, which has no included source file. Supply an explicit source entry.",def.dir),None,None,scope);
     }
 }

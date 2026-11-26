@@ -197,6 +197,7 @@ impl Evidence {
                     "Supply the callers' entry roles. Explanations identify the source locations."
                 )
                 .into(),
+                test_only: false,
             });
         }
         result.test_files = roles
