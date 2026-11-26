@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { analyze } from '../index.js';
+import { analyze } from '../dist/index.mjs';
 
 if (!process.env.KNIP_BIN) throw new Error('Set KNIP_BIN to the Knip executable');
 const knip = resolve(process.env.KNIP_BIN);

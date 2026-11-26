@@ -41,7 +41,7 @@ fetch_case() {
 fetch_case transformers huggingface/transformers.js 890e398f3fe99e52e855ffc4f2c81fccbe762dd5
 fetch_case nx nrwl/nx 3272c313f283c9cf4e2af868a2b3617fad280f40
 fetch_case react facebook/react 92bb0678c52133a47b3095f6e54da883ea0d6cff
-SMELLA_CORPUS_DIR=/tmp/smella-corpus npm run verify:corpus
+SMELLA_CORPUS_DIR=/tmp/smella-corpus bun run verify:corpus
 ```
 
 | Repository | Assertions |
@@ -54,17 +54,17 @@ An assertion or revision mismatch fails the run. These checks establish the sele
 
 ## Record progress
 
-With Rust 1.88+, Node 24, npm and Gnuplot (pngcairo), run the following command to record a measurement.
+With Rust 1.88+, Bun 1.2+ and Gnuplot (pngcairo), run the following command to record a measurement.
 
 ```sh
-npm run bench:record
+bun run bench:record
 ```
 
 Each run saves a timestamped JSON file and updates `benchmarks/history/progress.png`. Git ignores that directory. The recorder keeps measurements that miss a budget and exits with a failure. Each file includes the Git revision, working tree status and active thresholds.
 
-Use `npm run bench:check` to check the budgets without recording a run. Use `npm run bench:plot` to redraw the local chart. To update the chart in this README, copy a reviewed local plot to `benchmarks/progress.png`.
+Use `bun run bench:check` to check the budgets without recording a run. Use `bun run bench:plot` to redraw the local chart. To update the chart in this README, copy a reviewed local plot to `benchmarks/progress.png`.
 
-Set `KNIP_BIN` to the executable from a separate installation of Knip 6.48.0 with TypeScript 6.0.3 to run the matched comparison. The independent behavioral comparison uses `KNIP_BIN=/path/to/knip node scripts/compare-test-usage.mjs`.
+Set `KNIP_BIN` to the executable from a separate installation of Knip 6.48.0 with TypeScript 6.0.3 to run the matched comparison. The independent behavioral comparison uses `KNIP_BIN=/path/to/knip bun scripts/compare-test-usage.mjs`.
 
 The plot groups runs matching the most recent machine and toolchain. Points correspond to stored runs. Dashed lines show today's targets, and missing measurements stay blank.
 

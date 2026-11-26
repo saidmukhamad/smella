@@ -625,6 +625,7 @@ impl Project {
                     "**/{vite,vitest,jest,webpack,rollup,eslint}.config.{ts,js,mjs,cjs,mts,cts}";
                 project.select(role, p, "discovered", p, false)?;
                 crate::discover::discover_extra_tooling_configs(&mut project);
+                crate::discover::discover_tooling_scripts(&mut project, &packages);
                 crate::discover::discover_storybook_stories(&mut project)?;
             } else {
                 if role == Role::Runtime {
@@ -1173,7 +1174,7 @@ impl Project {
         type_only: bool,
         cjs: bool,
     ) -> Result<Option<Id>, String> {
-        if spec.starts_with("bun:") {
+        if spec.starts_with("bun:") || spec.ends_with(".node") {
             return Ok(None);
         }
         let origin = self.root.join(&self.graph.paths[file]);

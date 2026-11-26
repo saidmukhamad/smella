@@ -82,8 +82,8 @@ JSX tags and namespace members preserve their referenced bindings. Inline render
 From the Smella checkout, build the release addon and run the following command. The harness creates a temporary copy of the fixture, supplies inert installed-package boundaries for React and React DOM, verifies Smella's witnesses and runs both Knip modes with the same application and test entries and TS aliases. It prints the file and export lists for each mode.
 
 ```sh
-npm run build
-KNIP_BIN=/path/to/knip node scripts/bench-nx-react.mjs
+bun run build
+KNIP_BIN=/path/to/knip bun scripts/bench-nx-react.mjs
 ```
 
 On Knip 6.48.0 the default run omitted the `Preview` wrapper from unused exports. The production run listed it in both the barrel and the routes module. Both runs listed the unrooted legacy checkout as an unused file. Smella's single snapshot additionally identified the precise test reaching `PreviewPanel`, the unreferenced archive module, and the checkout's reference chain to the private pricing helper. This comparison covers a specific fixture and Knip's files/exports report. Knip also documents Nx support and integrated-workspace configuration. [Knip Nx plugin](https://knip.dev/reference/plugins/nx) · [Knip integrated monorepos](https://knip.dev/features/integrated-monorepos)

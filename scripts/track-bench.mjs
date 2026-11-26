@@ -1,8 +1,27 @@
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gunzipSync } from 'node:zlib';
+
+function readTar(tgzBytes) {
+  const raw = gunzipSync(tgzBytes);
+  const files = [];
+  let unpackedSize = 0;
+  for (let off = 0; off + 512 <= raw.length; ) {
+    const header = raw.subarray(off, off + 512);
+    if (header.every(b => b === 0)) break;
+    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/, '');
+    const prefix = header.subarray(345, 500).toString('utf8').replace(/\0.*$/, '');
+    const full = (prefix ? `${prefix}/${name}` : name).replace(/^package\//, '');
+    const size = parseInt(header.subarray(124, 136).toString('utf8').replace(/\0.*$/, '').trim() || '0', 8);
+    files.push(full);
+    unpackedSize += size;
+    off += 512 + Math.ceil(size / 512) * 512;
+  }
+  return { files, unpackedSize };
+}
 
 const repo = fileURLToPath(new URL('..',import.meta.url));
 const record = process.argv.includes('--record');
@@ -19,10 +38,14 @@ try {
   if (process.platform !== 'linux' || process.arch !== 'x64' || !process.report.getReport().header.glibcVersionRuntime) {
     throw new Error('The package footprint workload requires the supported Linux x64 glibc release build.');
   }
-  const tarballs = ['.', 'npm/linux-x64-gnu'].map(dir =>
-    JSON.parse(run('npm',['pack','--json','--ignore-scripts','--pack-destination',output],join(repo,dir)))[0]
-  );
-  if (!tarballs[1].files.some(f=>f.path==='smella.node')) throw new Error('Build the release addon before measuring its package.');
+  const tarballs = await Promise.all(['.', 'npm/linux-x64-gnu'].map(async dir => {
+    const filename = run('bun', ['pm', 'pack', '--ignore-scripts', '--destination', output, '--quiet'], join(repo, dir));
+    const tgzPath = join(output, filename);
+    const [{ size }, bytes] = await Promise.all([stat(tgzPath), readFile(tgzPath)]);
+    const { files, unpackedSize } = readTar(bytes);
+    return { size, unpackedSize, files };
+  }));
+  if (!tarballs[1].files.some(f => f === 'smella.node')) throw new Error('Build the release addon before measuring its package.');
   const revision = run('git',['rev-parse','HEAD']);
   const observedAt = new Date().toISOString();
   const entry = {
