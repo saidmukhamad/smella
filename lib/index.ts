@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { collectGitDiff, extractGitArchive, linkNodeModules } from './git.ts';
 import type {
@@ -93,7 +93,11 @@ interface DiffContext {
   summary: DiffSummary;
 }
 
-const require = createRequire(import.meta.url);
+const metaUrl =
+  typeof import.meta?.url === 'string' && import.meta.url.startsWith('file:')
+    ? import.meta.url
+    : undefined;
+const nativeRequire = createRequire(metaUrl ?? process.execPath);
 let native: NativeBinding | undefined;
 
 export class AnalysisError extends Error {
@@ -108,12 +112,19 @@ export class AnalysisError extends Error {
 
 function load(): NativeBinding {
   try {
-    const parentAddon = fileURLToPath(new URL('../smella.node', import.meta.url));
-    if (existsSync(parentAddon)) return require(parentAddon) as NativeBinding;
-    const siblingAddon = fileURLToPath(new URL('./smella.node', import.meta.url));
-    if (existsSync(siblingAddon)) return require(siblingAddon) as NativeBinding;
+    if (metaUrl && !metaUrl.includes('/$bunfs/')) {
+      const parentAddon = fileURLToPath(new URL('../smella.node', metaUrl));
+      if (existsSync(parentAddon)) return nativeRequire(parentAddon) as NativeBinding;
+      const siblingAddon = fileURLToPath(new URL('./smella.node', metaUrl));
+      if (existsSync(siblingAddon)) return nativeRequire(siblingAddon) as NativeBinding;
+    }
+    const dir = dirname(process.execPath);
+    const execSibling = join(dir, 'smella.node');
+    if (existsSync(execSibling)) return nativeRequire(execSibling) as NativeBinding;
+    const execParent = join(dir, '../smella.node');
+    if (existsSync(execParent)) return nativeRequire(execParent) as NativeBinding;
     if (process.platform === 'linux' && process.arch === 'x64') {
-      return require('smella-linux-x64-gnu') as NativeBinding;
+      return nativeRequire('smella-linux-x64-gnu') as NativeBinding;
     }
     throw new Error(`No packaged native build for ${process.platform}-${process.arch}`);
   } catch (cause) {
