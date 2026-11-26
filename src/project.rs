@@ -134,6 +134,7 @@ impl Project {
         let mut manifests = vec![];
         let mut config_dirs = BTreeMap::new();
         let mut tsconfig_files = vec![];
+        let mut bundler_configs = vec![];
         let mut walker = WalkDir::new(&root).sort_by_file_name().into_iter();
         while let Some(entry) = walker.next() {
             let entry = entry.map_err(|e| format!("Cannot enumerate source scope: {e}"))?;
@@ -161,6 +162,15 @@ impl Project {
             }
             if name.starts_with("tsconfig") && name.ends_with(".json") {
                 tsconfig_files.push(PathBuf::from(&file));
+            }
+            if name.starts_with("tsdown.config.")
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| EXTENSIONS.contains(&e))
+            {
+                bundler_configs.push(PathBuf::from(&file));
             }
             if name == "tsconfig.json" {
                 config_dirs.insert(
@@ -210,7 +220,7 @@ impl Project {
                 (".cjs".into(), strings(&[".cjs", ".cts"])),
             ],
             builtin_modules: true,
-            condition_names: strings(&["node", "import"]),
+            condition_names: strings(&["node", "import", "default"]),
             main_fields: strings(&["module", "main"]),
             ..Default::default()
         };
@@ -331,7 +341,7 @@ impl Project {
                 packages.push((rel.to_owned(), package));
             }
         }
-        let source_mapper = SourceMapper::build(&root, &tsconfig_files);
+        let source_mapper = SourceMapper::build(&root, &tsconfig_files, &bundler_configs);
         let nx = if nx_enabled {
             let nx = crate::nx::Workspace::read(&root, &nx_dirs, &packages)?;
             for dir in nx.directories() {
@@ -722,10 +732,12 @@ impl Project {
                     return Some(Ok(None));
                 }
                 let rel = rel_dir.join(target.trim_start_matches("./"));
-                if let Some(id) =
-                    self.source_mapper
-                        .map_to_source(&self.root, &self.graph.paths, &rel)
-                {
+                if let Some(id) = self.source_mapper.map_to_source_mode(
+                    &self.root,
+                    &self.graph.paths,
+                    &rel,
+                    type_only,
+                ) {
                     return Some(Ok(Some(id)));
                 }
             }
@@ -738,9 +750,12 @@ impl Project {
                 }
                 let rel = rel_dir.join(s);
                 if self.source_mapper.is_in_out_dir(&rel)
-                    && let Some(id) =
-                        self.source_mapper
-                            .map_to_source(&self.root, &self.graph.paths, &rel)
+                    && let Some(id) = self.source_mapper.map_to_source_mode(
+                        &self.root,
+                        &self.graph.paths,
+                        &rel,
+                        type_only,
+                    )
                 {
                     return Some(Ok(Some(id)));
                 }
@@ -769,10 +784,12 @@ impl Project {
                 candidates.push("./index");
                 for target in candidates {
                     let rel = rel_dir.join(target.trim_start_matches("./"));
-                    if let Some(id) =
-                        self.source_mapper
-                            .map_to_source(&self.root, &self.graph.paths, &rel)
-                    {
+                    if let Some(id) = self.source_mapper.map_to_source_mode(
+                        &self.root,
+                        &self.graph.paths,
+                        &rel,
+                        type_only,
+                    ) {
                         return Some(Ok(Some(id)));
                     }
                 }
@@ -784,7 +801,7 @@ impl Project {
                 }
                 let rel = rel_dir.join(s);
                 self.source_mapper
-                    .map_to_source(&self.root, &self.graph.paths, &rel)
+                    .map_to_source_mode(&self.root, &self.graph.paths, &rel, type_only)
                     .map(|id| Ok(Some(id)))
             }
         }
@@ -810,24 +827,54 @@ impl Project {
             return Ok(None);
         }
         let origin = self.root.join(&self.graph.paths[file]);
+        let origin_dir = origin.parent().unwrap();
         let profile = if spec.starts_with('.') || spec.starts_with('/') {
             0
         } else {
             self.file_profile[file]
         };
         let resolver = &self.resolvers[profile][usize::from(type_only)];
-        let mut result = resolver.resolve(origin.parent().unwrap(), spec);
+        let mut result = resolver.resolve(origin_dir, spec);
+        // Avoid tsconfig `baseUrl` shadowing an installed package with a same-named local file (e.g. `knip.ts` importing `"knip"`).
+        if profile != 0
+            && !spec.starts_with('.')
+            && !spec.starts_with('/')
+            && let Ok(ref resolved) = result
+            && resolved.path() == origin
+            && let Ok(pkg_res) = self.resolvers[0][usize::from(type_only)].resolve(origin_dir, spec)
+            && pkg_res
+                .path()
+                .components()
+                .any(|c| c.as_os_str() == "node_modules")
+        {
+            return Ok(None);
+        }
         if result.is_err() {
             if let Some(ws) = self.resolve_workspace_source(spec, type_only, cjs) {
                 return ws;
+            }
+            if !spec.starts_with('.')
+                && !spec.starts_with('/')
+                && let Some(id) = self.source_mapper.resolve_tsconfig_path(
+                    Path::new(&self.graph.paths[file]),
+                    spec,
+                    &self.root,
+                    &self.graph.paths,
+                    type_only,
+                )
+            {
+                return Ok(Some(id));
             }
             if spec.starts_with('.') {
                 let rel_origin = Path::new(&self.graph.paths[file]);
                 if let Some(rel) = normalize_rel(&rel_origin.parent().unwrap().join(spec))
                     && self.source_mapper.is_in_out_dir(&rel)
-                    && let Some(id) =
-                        self.source_mapper
-                            .map_to_source(&self.root, &self.graph.paths, &rel)
+                    && let Some(id) = self.source_mapper.map_to_source_mode(
+                        &self.root,
+                        &self.graph.paths,
+                        &rel,
+                        type_only,
+                    )
                 {
                     return Ok(Some(id));
                 }
@@ -851,15 +898,32 @@ impl Project {
                     result = package_resolver
                         .resolve(&pkg_info.dir, &format!("./{}", parts[count..].join("/")));
                 }
+            } else if let Some(types_spec) = mangle_types_spec(spec)
+                && let Ok(typed) = self.resolvers[0][1].resolve(origin_dir, &types_spec)
+                && typed
+                    .path()
+                    .components()
+                    .any(|c| c.as_os_str() == "node_modules")
+            {
+                return Ok(None);
             }
         }
         match result {
             Ok(resolved) => {
                 let path = resolved.path();
-                if resolved.query().is_some() {
-                    return Err(format!(
-                        "{spec:?} includes a loader query with bundler-specific module semantics."
-                    ));
+                if let Some(query) = resolved.query() {
+                    let q = query.trim_start_matches('?');
+                    if matches!(q, "url" | "raw" | "inline") {
+                        return Ok(None);
+                    }
+                    if !matches!(
+                        q,
+                        "worker" | "sharedworker" | "worker&inline" | "inline&worker"
+                    ) {
+                        return Err(format!(
+                            "{spec:?} includes a loader query with bundler-specific module semantics."
+                        ));
+                    }
                 }
                 if spec.ends_with(".css") && path.extension().is_some_and(|ext| ext == "css") {
                     return Ok(None);
@@ -886,10 +950,20 @@ impl Project {
                     }
                 };
                 if self.source_mapper.is_in_out_dir(Path::new(&rel))
-                    && let Some(id) = self.source_mapper.map_to_source(
+                    && let Some(id) = self.source_mapper.map_to_source_mode(
                         &self.root,
                         &self.graph.paths,
                         Path::new(&rel),
+                        type_only,
+                    )
+                {
+                    return Ok(Some(id));
+                }
+                if type_only
+                    && let Some(id) = crate::source_map::SourceMapper::lookup_direct_mode(
+                        &self.graph.paths,
+                        Path::new(&rel),
+                        true,
                     )
                 {
                     return Ok(Some(id));
@@ -897,10 +971,12 @@ impl Project {
                 if let Ok(id) = self.graph.paths.binary_search(&rel) {
                     return Ok(Some(id));
                 }
-                if let Some(id) =
-                    self.source_mapper
-                        .map_to_source(&self.root, &self.graph.paths, Path::new(&rel))
-                {
+                if let Some(id) = self.source_mapper.map_to_source_mode(
+                    &self.root,
+                    &self.graph.paths,
+                    Path::new(&rel),
+                    type_only,
+                ) {
                     return Ok(Some(id));
                 }
                 if is_non_code_export(&rel) {
@@ -913,6 +989,23 @@ impl Project {
             Err(ResolveError::Builtin { .. }) => Ok(None),
             Err(e) => Err(format!("Cannot resolve {spec:?}: {e}")),
         }
+    }
+}
+
+fn mangle_types_spec(spec: &str) -> Option<String> {
+    if spec.starts_with('.') || spec.starts_with('/') || spec.starts_with("@types/") {
+        return None;
+    }
+    if let Some(rest) = spec.strip_prefix('@') {
+        let mut it = rest.splitn(3, '/');
+        let scope = it.next()?;
+        let name = it.next()?;
+        match it.next() {
+            Some(sub) if !sub.is_empty() => Some(format!("@types/{scope}__{name}/{sub}")),
+            _ => Some(format!("@types/{scope}__{name}")),
+        }
+    } else {
+        Some(format!("@types/{spec}"))
     }
 }
 

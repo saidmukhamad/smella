@@ -551,10 +551,12 @@ test('React lazy supports a destructured alias and keeps public component depend
   assert.equal(subject(r,'views.tsx','Sibling').kind,'unused-export');
 });
 
-test('stylesheet imports resolve across CSS modules, literal import.meta.glob resolves statically, and dynamic glob/loader queries stay visible', async t => {
+test('stylesheet imports resolve across CSS modules, literal import.meta.glob and standard asset/worker queries resolve cleanly, while dynamic glob and unknown queries stay visible', async t => {
   const root = await fixture(t,{
-    'app.ts': 'import styles from "./a.module.css"; console.log(styles.title); import.meta.glob("./routes/*.tsx"); import.meta.glob(dynPattern); import "./missing.css"; import text from "./template.ts?raw"; console.log(text);',
+    'app.ts': 'import styles from "./a.module.css"; console.log(styles.title); import.meta.glob("./routes/*.tsx"); import.meta.glob(dynPattern); import "./missing.css"; import text from "./template.ts?raw"; import url from "./template.ts?url"; import InlineCss from "./a.module.css?inline"; import MyWorker from "./bg.ts?worker"; import custom from "./template.ts?custom"; console.log(text, url, InlineCss, MyWorker, custom);',
     'a.module.css':'.title { color: red }', 'template.ts':'export default 42;',
+    'bg.ts':'import { work } from "./bg-lib"; work();',
+    'bg-lib.ts':'export function work() {} export function unused() {}',
     'routes/landing.tsx':'export function Landing() { return <div />; }',
   });
   const r = await inspect(t,root,app);
@@ -564,6 +566,8 @@ test('stylesheet imports resolve across CSS modules, literal import.meta.glob re
   assert.deepEqual(candidate.usage.value,['runtime']);
   assert.equal(candidate.kind,null);
   assert.deepEqual(subject(r,'template.ts','default').usage.value,[]);
+  assert.deepEqual(subject(r,'bg-lib.ts','work').usage.value,['runtime']);
+  assert.equal(subject(r,'bg-lib.ts','unused').kind,'unused-export');
 });
 
 test('Nx respects a relocated root, literal paths and command overrides of inherited executors', async t => {
@@ -946,4 +950,55 @@ test('static import.meta.glob, inline primaryGaps and NDJSON CLI stream compact 
     assert.equal(item.primaryGaps.length, 1);
     assert.equal(item.primaryGaps[0].code, 'computed-import');
   }
+});
+
+test('type-only @types fallback, tsdown outDir, tsconfig compiled-type paths, default exports and companion declarations resolve cleanly', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ workspaces: ['packages/*'] }),
+    'node_modules/@types/bare-lib/package.json': JSON.stringify({ name: '@types/bare-lib', types: 'index.d.ts' }),
+    'node_modules/@types/bare-lib/index.d.ts': 'export interface BareReq { id: string }',
+    'node_modules/ext-tool/package.json': JSON.stringify({ name: 'ext-tool', types: 'index.d.ts' }),
+    'node_modules/ext-tool/index.d.ts': 'export interface ToolCfg { enabled: boolean }',
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: {
+        baseUrl: '.',
+        paths: {
+          'host/@/*': ['packages/host/dist/@mf-types/compiled-types/ui/*'],
+        },
+      },
+    }),
+    'ext-tool.ts': 'import type { ToolCfg } from "ext-tool"; export const cfg: ToolCfg = { enabled: true };',
+    'app.ts': [
+      'import type { BareReq } from "bare-lib";',
+      'import { Button } from "host/@/button";',
+      'import { cfg } from "./ext-tool";',
+      'import type { HelperOpts } from "./packages/helper/mod.mjs";',
+      'import { runHelper } from "@org/default-only";',
+      'const backend = require("./packages/bundled/dist/index.cjs");',
+      'const req: BareReq = { id: "1" };',
+      'const opts: HelperOpts = { retries: 1 };',
+      'backend.start(); Button(); runHelper(); console.log(req, opts, cfg);',
+    ].join('\n'),
+    'packages/host/tsconfig.mf.json': JSON.stringify({ compilerOptions: { outDir: './@mf-types', rootDir: './src' } }),
+    'packages/host/src/ui/button.ts': 'export function Button() {} export function unusedButton() {}',
+    'packages/bundled/tsdown.config.ts': 'export default defineConfig({ entry: ["src/index.ts"], outDir: "dist", format: "cjs" });',
+    'packages/bundled/src/index.ts': 'export function start() {} export function unusedStart() {}',
+    'packages/helper/mod.mjs': 'export function helperVal() { return 1; }',
+    'packages/helper/mod.d.ts': 'export interface HelperOpts { retries: number } export interface UnusedOpts { x: number }',
+    'packages/default-only/package.json': JSON.stringify({
+      name: '@org/default-only',
+      exports: { '.': { default: './src/index.ts' } },
+    }),
+    'packages/default-only/src/index.ts': 'export function runHelper() {}',
+  });
+
+  const r = await inspect(t, root, app);
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.deepEqual(subject(r, 'packages/host/src/ui/button.ts', 'Button').usage.value, ['runtime']);
+  assert.equal(subject(r, 'packages/host/src/ui/button.ts', 'unusedButton').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'packages/bundled/src/index.ts', 'start').usage.value, ['runtime']);
+  assert.equal(subject(r, 'packages/bundled/src/index.ts', 'unusedStart').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'packages/helper/mod.d.ts', 'HelperOpts').usage.type, ['runtime']);
+  assert.equal(subject(r, 'packages/helper/mod.d.ts', 'UnusedOpts').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'packages/default-only/src/index.ts', 'runHelper').usage.value, ['runtime']);
 });

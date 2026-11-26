@@ -905,6 +905,20 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
         else {
             continue;
         };
+        if import
+            .module_request
+            .name
+            .split_once('?')
+            .is_some_and(|(_, q)| {
+                matches!(
+                    q,
+                    "worker" | "sharedworker" | "worker&inline" | "inline&worker"
+                )
+            })
+        {
+            out.edge(from, to, false, import.local_name.span.into());
+            continue;
+        }
         let name = match &import.import_name {
             ImportImportName::Name(n) => n.name.as_str(),
             ImportImportName::Default(_) => "default",
