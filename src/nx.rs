@@ -244,6 +244,30 @@ impl Workspace {
 
     pub fn discover(&self, project: &mut Project, role: Role) -> Result<(), String> {
         let runtime = role == Role::Runtime;
+        if !runtime && let Some(plugins) = self.config["plugins"].as_array() {
+            for item in plugins {
+                let raw = item
+                    .as_str()
+                    .or_else(|| item.get("plugin").and_then(Value::as_str));
+                if let Some(spec) = raw.filter(|s| s.starts_with('.'))
+                    && let Some(norm) = workspace_path(spec)
+                    && let Some(file) = norm.to_str()
+                    && project
+                        .graph
+                        .paths
+                        .binary_search_by(|p| p.as_str().cmp(file))
+                        .is_ok()
+                {
+                    project.roots.push(Root {
+                        file: file.to_owned(),
+                        role: Role::Tooling,
+                        origin: "discovered",
+                        input: "nx.json#plugins".into(),
+                        mode: RootEntryMode::AllExports,
+                    });
+                }
+            }
+        }
         if runtime
             && (self.config["plugins"]
                 .as_array()

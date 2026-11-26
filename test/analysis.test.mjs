@@ -1079,3 +1079,38 @@ test('typeof import, Promise.all dynamic imports, Object.defineProperty exports,
   assert.deepEqual(subject(r, 'plugins/two.ts').usage.evaluation, ['runtime']);
   assert.deepEqual(subject(r, 'configured.ts').usage.evaluation, ['runtime']);
 });
+
+test('extensionless shebang bins, nodemon and framework start scripts, and spawn execPath children are discovered cleanly', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({
+      workspaces: ['packages/*'],
+      bin: {
+        'js-tool': './bin/js-tool',
+        'sh-tool': './bin/sh-tool',
+        'py-tool': './bin/py-tool',
+      },
+    }),
+    'bin/js-tool': '#!/usr/bin/env node\nconst { spawn } = require("node:child_process");\nconst path = require("node:path");\nconst { cliWork } = require("../src/cli-lib.cjs");\ncliWork();\nspawn(process.execPath, ["-r", "ts-node/register", path.join(__dirname, "../src/worker.ts")]);\n',
+    'bin/sh-tool': '#!/bin/sh\necho ok\n',
+    'bin/py-tool': '#!/usr/bin/env python3\nprint("ok")\n',
+    'src/cli-lib.cjs': 'exports.cliWork = () => 1; exports.unusedCli = () => 2;',
+    'src/worker.ts': 'import { runJob } from "./job"; runJob();',
+    'src/job.ts': 'export function runJob() {} export function deadJob() {}',
+    'packages/dev-srv/package.json': JSON.stringify({ name: '@org/dev-srv', scripts: { start: 'nodemon -w src --exec "tsx src/server.ts"' } }),
+    'packages/dev-srv/src/server.ts': 'import { serve } from "./serve"; serve();',
+    'packages/dev-srv/src/serve.ts': 'export function serve() {}',
+    'packages/docs/package.json': JSON.stringify({ name: '@org/docs', scripts: { start: 'next start' } }),
+    'packages/docs/app/page.tsx': 'import { DocHero } from "./hero"; export default function Page() { return DocHero(); }',
+    'packages/docs/app/hero.ts': 'export function DocHero() {}',
+  });
+
+  const r = await inspect(t, root, { publicEntries: [] });
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.ok(r.roots.some(x => x.file === 'bin/js-tool' && x.role === 'runtime'));
+  assert.deepEqual(subject(r, 'src/cli-lib.cjs', 'cliWork').usage.value, ['runtime']);
+  assert.equal(subject(r, 'src/cli-lib.cjs', 'unusedCli').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'src/job.ts', 'runJob').usage.value, ['runtime']);
+  assert.equal(subject(r, 'src/job.ts', 'deadJob').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'packages/dev-srv/src/serve.ts', 'serve').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'packages/docs/app/page.tsx').usage.evaluation, ['runtime']);
+});

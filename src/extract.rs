@@ -553,6 +553,89 @@ fn resolve_promise_all_use<'a>(
     }
 }
 
+fn extract_spawn_exec_paths(
+    call: &oxc_ast::ast::CallExpression<'_>,
+    scoping: &Scoping,
+    require_symbols: &HashSet<SymbolId>,
+    file_ext: &str,
+    file_ext_symbols: &HashSet<SymbolId>,
+    local_paths: &HashMap<SymbolId, Vec<(String, Span)>>,
+) -> Vec<(String, Span)> {
+    let Some(cmd) = call.arguments.first().and_then(|a| a.as_expression()) else {
+        return vec![];
+    };
+    let is_js_exec = match cmd.get_inner_expression() {
+        Expression::StaticMemberExpression(m) => {
+            m.property.name == "execPath"
+                && matches!(m.object.get_inner_expression(), Expression::Identifier(id) if id.name == "process")
+        }
+        other => static_string_expr(other).is_some_and(|(s, _)| {
+            matches!(
+                Path::new(s).file_name().and_then(|n| n.to_str()),
+                Some("node" | "bun" | "tsx" | "ts-node")
+            )
+        }),
+    };
+    if !is_js_exec {
+        return vec![];
+    }
+    let Some(Expression::ArrayExpression(args)) = call
+        .arguments
+        .get(1)
+        .and_then(|a| a.as_expression())
+        .map(Expression::get_inner_expression)
+    else {
+        return vec![];
+    };
+    let mut i = 0;
+    while i < args.elements.len() {
+        let Some(el) = args.elements[i].as_expression() else {
+            return vec![];
+        };
+        if let Some((flag, _)) = static_string_expr(el) {
+            if flag == "--" {
+                i += 1;
+                break;
+            }
+            if matches!(
+                flag,
+                "-r" | "--require"
+                    | "--import"
+                    | "--loader"
+                    | "--experimental-loader"
+                    | "--conditions"
+                    | "--env-file"
+                    | "--preload"
+            ) {
+                i += 2;
+                continue;
+            }
+            if matches!(flag, "-e" | "--eval" | "-p" | "--print") {
+                return vec![];
+            }
+            if flag.starts_with('-') {
+                i += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    args.elements
+        .get(i)
+        .and_then(|e| e.as_expression())
+        .map(|arg| {
+            resolve_arg_paths(
+                arg,
+                scoping,
+                require_symbols,
+                file_ext,
+                file_ext_symbols,
+                local_paths,
+            )
+        })
+        .unwrap_or_default()
+}
+
 fn leftmost_type_name<'a>(name: &'a TSTypeName<'a>) -> Option<&'a str> {
     match name {
         TSTypeName::IdentifierReference(id) => Some(id.name.as_str()),
@@ -943,7 +1026,8 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
         }
     };
 
-    let mut source_type = SourceType::from_path(&path).unwrap();
+    let mut source_type =
+        SourceType::from_path(&path).unwrap_or_else(|_| SourceType::unambiguous());
     if path.extension().is_some_and(|ext| ext == "js") {
         source_type = source_type.with_jsx(true);
     }
@@ -1583,6 +1667,29 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
             AstKind::CallExpression(call) => {
                 react.observe(call, scoping);
                 match call.callee.get_inner_expression() {
+                    Expression::Identifier(id)
+                        if matches!(
+                            id.name.as_str(),
+                            "spawn" | "spawnSync" | "execFile" | "execFileSync"
+                        ) =>
+                    {
+                        for (spec, _) in extract_spawn_exec_paths(
+                            call,
+                            scoping,
+                            &require_symbols,
+                            &file_ext,
+                            &file_ext_symbols,
+                            &local_paths,
+                        ) {
+                            if let Ok(Some(to)) =
+                                project.resolve_with_mode(file, &spec, false, true)
+                            {
+                                for from in owner.sources(file) {
+                                    out.edge(from, to, false, loc);
+                                }
+                            }
+                        }
+                    }
                     Expression::Identifier(id) if id.name == "fork" => {
                         if let Some(arg) = call.arguments.first().and_then(|a| a.as_expression()) {
                             for (spec, _) in resolve_arg_paths(
@@ -1819,6 +1926,24 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                                 if mp.meta.name == "import" && mp.property.name == "meta") =>
                         {
                             handle_import_meta_glob(project, out, file, owner, call, loc);
+                        }
+                        "spawn" | "spawnSync" | "execFile" | "execFileSync" => {
+                            for (spec, _) in extract_spawn_exec_paths(
+                                call,
+                                scoping,
+                                &require_symbols,
+                                &file_ext,
+                                &file_ext_symbols,
+                                &local_paths,
+                            ) {
+                                if let Ok(Some(to)) =
+                                    project.resolve_with_mode(file, &spec, false, true)
+                                {
+                                    for from in owner.sources(file) {
+                                        out.edge(from, to, false, loc);
+                                    }
+                                }
+                            }
                         }
                         "fork" if !matches!(m.object.get_inner_expression(), Expression::Identifier(id) if id.name == "cluster") => {
                             if let Some(arg) =

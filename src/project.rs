@@ -212,7 +212,58 @@ impl Project {
                 excluded.push(file);
             }
         }
+        let mut non_js_bins = BTreeSet::new();
+        for manifest_path in &manifests {
+            let Ok(pkg) = json(manifest_path) else {
+                continue;
+            };
+            let Some(dir) = manifest_path
+                .parent()
+                .and_then(|d| d.strip_prefix(&root).ok())
+            else {
+                continue;
+            };
+            let mut bin_targets = Vec::new();
+            manifest_targets(&pkg["bin"], true, &mut bin_targets);
+            for raw in bin_targets {
+                let trimmed = raw.trim().trim_start_matches("./");
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Some(norm) = normalize_rel(&dir.join(trimmed)) else {
+                    continue;
+                };
+                if norm
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| EXTENSIONS.contains(&e))
+                {
+                    continue;
+                }
+                let abs = root.join(&norm);
+                if !abs.is_file() {
+                    continue;
+                }
+                let file = to_slash(&norm);
+                match classify_bin_shebang(&abs) {
+                    Some(true) => {
+                        if include
+                            .as_ref()
+                            .is_none_or(|v| v.iter().any(|p| p.is_match(&file)))
+                            && !exclude.iter().any(|p| p.is_match(&file))
+                        {
+                            paths.push(file);
+                        }
+                    }
+                    Some(false) => {
+                        non_js_bins.insert(file);
+                    }
+                    None => {}
+                }
+            }
+        }
         paths.sort();
+        paths.dedup();
         excluded.sort();
         if paths.is_empty() {
             return Err("No analyzable JS or TS files in the effective scope.".into());
@@ -546,6 +597,9 @@ impl Project {
                             continue;
                         }
                         let file = to_slash(&dir.join(trimmed.trim_start_matches("./")));
+                        if role == Role::Runtime && field == "bin" && non_js_bins.contains(&file) {
+                            continue;
+                        }
                         if role == Role::Public && trimmed.contains('*') {
                             // Non-code asset wildcard directories (e.g. `./skills/*`) have no JS/TS files.
                             let prefix = file.split('*').next().unwrap_or("");
@@ -1000,6 +1054,32 @@ impl Project {
             Err(e) => Err(format!("Cannot resolve {spec:?}: {e}")),
         }
     }
+}
+
+fn classify_bin_shebang(path: &Path) -> Option<bool> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut buf = [0u8; 160];
+    let n = file.read(&mut buf).ok()?;
+    let header = std::str::from_utf8(&buf[..n]).ok()?;
+    let line = header.lines().next()?.trim();
+    let rest = line.strip_prefix("#!")?.trim();
+    let mut tokens = rest.split_whitespace();
+    let first = Path::new(tokens.next()?)
+        .file_name()
+        .and_then(|s| s.to_str())?;
+    let interp = if first == "env" {
+        tokens
+            .find(|t| !t.starts_with('-') && !t.contains('='))
+            .and_then(|t| Path::new(t).file_name().and_then(|s| s.to_str()))
+            .unwrap_or("")
+    } else {
+        first
+    };
+    Some(matches!(
+        interp,
+        "node" | "nodejs" | "bun" | "deno" | "tsx" | "ts-node"
+    ))
 }
 
 fn mangle_types_spec(spec: &str) -> Option<String> {
