@@ -794,6 +794,6 @@ pub fn is_non_code_export(target: &str) -> bool {
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("json" | "css" | "scss" | "less" | "md" | "html" | "svg" | "png" | "wasm")
+        Some("json" | "css" | "scss" | "less" | "md" | "html" | "svg" | "png" | "wasm" | "node")
     )
 }

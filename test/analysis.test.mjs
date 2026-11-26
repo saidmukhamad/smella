@@ -558,8 +558,8 @@ test('React lazy supports a destructured alias and keeps public component depend
 
 test('stylesheet imports resolve across CSS modules, literal import.meta.glob and standard asset/worker queries resolve cleanly, while dynamic glob and unknown queries stay visible', async t => {
   const root = await fixture(t,{
-    'app.ts': 'import styles from "./a.module.css"; console.log(styles.title); import.meta.glob("./routes/*.tsx"); import.meta.glob(dynPattern); import "./missing.css"; import text from "./template.ts?raw"; import url from "./template.ts?url"; import InlineCss from "./a.module.css?inline"; import MyWorker from "./bg.ts?worker"; import custom from "./template.ts?custom"; console.log(text, url, InlineCss, MyWorker, custom);',
-    'a.module.css':'.title { color: red }', 'template.ts':'export default 42;',
+    'app.ts': 'import styles from "./a.module.css"; console.log(styles.title); import.meta.glob("./routes/*.tsx"); import.meta.glob(dynPattern); import "./missing.css"; import text from "./template.ts?raw"; import url from "./template.ts?url"; import InlineCss from "./a.module.css?inline"; import MyWorker from "./bg.ts?worker"; import custom from "./template.ts?custom"; const addon = require("./native.node"); console.log(text, url, InlineCss, MyWorker, custom, addon);',
+    'a.module.css':'.title { color: red }', 'template.ts':'export default 42;', 'native.node':'',
     'bg.ts':'import { work } from "./bg-lib"; work();',
     'bg-lib.ts':'export function work() {} export function unused() {}',
     'routes/landing.tsx':'export function Landing() { return <div />; }',
