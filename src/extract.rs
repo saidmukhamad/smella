@@ -23,7 +23,7 @@ use oxc_syntax::node::NodeId;
 use oxc_syntax::symbol::SymbolId;
 
 use crate::deps::{PackageRef, extract_dep_package};
-use crate::graph::{Edge, Export, Gap, Graph, Id, Link, Loc, Module, Node, PendingGap};
+use crate::graph::{Edge, Export, Gap, GapScope, Graph, Id, Link, Loc, Module, Node, PendingGap};
 use crate::project::{Project, StaleConfigItem};
 
 #[derive(Clone, Debug)]
@@ -97,7 +97,7 @@ impl FileSummary {
         guard: Option<Id>,
         target_file: Option<Id>,
     ) {
-        self.gap_scoped(code, loc, message, guard, target_file, None);
+        self.gap_scoped(code, loc, message, guard, target_file, GapScope::Global);
     }
     fn gap_scoped(
         &mut self,
@@ -106,7 +106,7 @@ impl FileSummary {
         message: String,
         guard: Option<Id>,
         target_file: Option<Id>,
-        affected_files: Option<Vec<String>>,
+        scope: GapScope,
     ) {
         self.gaps.push(PendingGap {
             record: Gap {
@@ -114,7 +114,7 @@ impl FileSummary {
                 file: Some(self.path.clone()),
                 location: loc,
                 message,
-                affected_files,
+                scope,
                 id: String::new(),
                 test_only: false,
             },
@@ -570,29 +570,29 @@ fn is_json_dynamic_spec(expr: &Expression<'_>) -> bool {
     }
 }
 
-fn relative_template_scope(
-    project: &Project,
-    file: Id,
-    expr: &Expression<'_>,
-) -> Option<Vec<String>> {
+fn relative_template_scope(project: &Project, file: Id, expr: &Expression<'_>) -> GapScope {
     let Expression::TemplateLiteral(t) = expr.get_inner_expression() else {
-        return None;
+        return GapScope::Global;
     };
-    let first = t.quasis.first()?.value.cooked.as_ref()?.as_str();
+    let Some(first) = t
+        .quasis
+        .first()
+        .and_then(|q| q.value.cooked.as_ref())
+        .map(|s| s.as_str())
+    else {
+        return GapScope::Global;
+    };
     if !(first.starts_with("./") || first.starts_with("../")) {
-        return None;
+        return GapScope::Global;
     }
     let dir_part = first.rsplit_once('/').map_or(".", |(d, _)| d);
     let file_dir = Path::new(&project.graph.paths[file])
         .parent()
         .unwrap_or_else(|| Path::new(""));
-    let norm = crate::source_map::normalize_rel(&file_dir.join(dir_part))?;
-    let mut files = project.files_in_dir(&norm);
-    if !files.contains(&project.graph.paths[file]) {
-        files.push(project.graph.paths[file].clone());
-        files.sort();
-    }
-    Some(files)
+    let Some(norm) = crate::source_map::normalize_rel(&file_dir.join(dir_part)) else {
+        return GapScope::Global;
+    };
+    GapScope::from_range_and_file(project.files_in_dir_range(&norm), file)
 }
 
 fn cjs_exports_target(scoping: &Scoping, expr: &Expression<'_>) -> Option<Span> {
@@ -1354,7 +1354,11 @@ fn extract(
             start: s.offset() as u32,
             end: (s.offset() + s.len()) as u32,
         });
-        let scope = project.is_multi_workspace().then(|| vec![out.path.clone()]);
+        let scope = if project.is_multi_workspace() {
+            GapScope::Files(vec![file as u32])
+        } else {
+            GapScope::Global
+        };
         out.gap_scoped(
             "parse-error",
             loc,
@@ -1972,14 +1976,15 @@ fn extract(
                     )
                 {
                     let scope = if ident.name == "require" && !project.is_multi_workspace() {
-                        None
+                        GapScope::Global
                     } else if ident.name == "require" {
                         let dir = Path::new(&out.path)
                             .parent()
                             .unwrap_or_else(|| Path::new(""));
-                        Some(project.files_in_dir(dir))
+                        let (s, e) = project.files_in_dir_range(dir);
+                        GapScope::Range(s, e)
                     } else {
-                        Some(vec![out.path.clone()])
+                        GapScope::Files(vec![file as u32])
                     };
                     for from in owner.sources(file) {
                         out.gap_scoped(
@@ -2090,8 +2095,9 @@ fn extract(
                         }
                         if specs.is_empty() && glob_targets.is_empty() {
                             if !req_arg.is_some_and(is_json_dynamic_spec) {
-                                let scope =
-                                    req_arg.and_then(|a| relative_template_scope(project, file, a));
+                                let scope = req_arg.map_or(GapScope::Global, |a| {
+                                    relative_template_scope(project, file, a)
+                                });
                                 for from in owner.sources(file) {
                                     out.gap_scoped(
                                         "computed-import",
@@ -2612,7 +2618,7 @@ fn extract(
                         "This TypeScript module construct requires additional resolution.".into(),
                         Some(owner.binding),
                         None,
-                        Some(vec![out.path.clone()]),
+                        GapScope::Files(vec![file as u32]),
                     );
                 }
             }

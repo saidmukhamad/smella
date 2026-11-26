@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::deps::{
     WorkspaceManifest, manifest_bins, manifest_dep_set, manifest_path_for, manifest_scripts,
 };
-use crate::graph::{Graph, Id, ROLES, Role, Root, RootEntryMode};
+use crate::graph::{GapScope, Graph, Id, ROLES, Role, Root, RootEntryMode};
 use crate::source_map::{
     SourceMapper, is_non_code_export, normalize_rel, resolve_exports_targets, to_slash,
 };
@@ -1162,7 +1162,7 @@ impl Project {
                     .unwrap_or_else(|| Path::new(""));
                 self.scope_for_discovered_dir(manifest_dir)
             } else {
-                None
+                GapScope::Global
             };
             if origin == "explicit" {
                 self.stale_config.push(StaleConfigItem {
@@ -1359,48 +1359,49 @@ impl Project {
         self.workspace_dirs.len() > 1
     }
 
-    pub fn files_in_dir(&self, dir: &Path) -> Vec<String> {
+    pub fn files_in_dir_range(&self, dir: &Path) -> (u32, u32) {
         let prefix = to_slash(dir);
         if prefix.is_empty() {
-            return self.graph.paths.clone();
+            return (0, self.graph.paths.len() as u32);
         }
         let slash = format!("{prefix}/");
         let start = self
             .graph
             .paths
             .partition_point(|p| p.as_str() < slash.as_str());
-        self.graph.paths[start..]
+        let len = self.graph.paths[start..]
             .iter()
             .take_while(|p| p.starts_with(&slash))
-            .cloned()
-            .collect()
+            .count();
+        (start as u32, (start + len) as u32)
     }
 
-    pub fn scope_for_discovered_dir(&self, dir: &Path) -> Option<Vec<String>> {
+    pub fn scope_for_discovered_dir(&self, dir: &Path) -> GapScope {
         if dir.as_os_str().is_empty() || !self.is_multi_workspace() {
-            None
+            GapScope::Global
         } else {
-            Some(self.files_in_dir(dir))
+            let (s, e) = self.files_in_dir_range(dir);
+            GapScope::Range(s, e)
         }
     }
 
-    pub fn scope_unresolved_import(&self, file: Id, spec: &str) -> Option<Vec<String>> {
-        let importer = self.graph.paths[file].clone();
+    pub fn scope_unresolved_import(&self, file: Id, spec: &str) -> GapScope {
+        let importer = &self.graph.paths[file];
         let clean_spec = spec.split('?').next().unwrap_or(spec);
         if is_non_code_export(clean_spec) {
-            return Some(vec![importer]);
+            return GapScope::Files(vec![file as u32]);
         }
         if spec.contains('?')
             && let Ok(resolved) = self.resolve_with_mode(file, clean_spec, false, false)
         {
-            let mut affected = vec![importer];
+            let mut affected = vec![file as u32];
             if let Some(id) = resolved
-                && self.graph.paths[id] != affected[0]
+                && id != file
             {
-                affected.push(self.graph.paths[id].clone());
-                affected.sort();
+                affected.push(id as u32);
+                affected.sort_unstable();
             }
-            return Some(affected);
+            return GapScope::Files(affected);
         }
         if !self.is_multi_workspace() {
             if !clean_spec.starts_with('.')
@@ -1409,16 +1410,15 @@ impl Project {
                     .is_none_or(|(pkg, _)| !self.workspaces.contains_key(&pkg))
                 && self
                     .source_mapper
-                    .matches_tsconfig_path(Path::new(&importer), clean_spec)
+                    .matches_tsconfig_path(Path::new(importer), clean_spec)
                     .is_empty()
             {
-                return Some(vec![importer]);
+                return GapScope::Files(vec![file as u32]);
             }
-            return None;
+            return GapScope::Global;
         }
-        let mut affected = BTreeSet::from([importer.clone()]);
         if clean_spec.starts_with('.') || clean_spec.starts_with('/') {
-            let file_dir = Path::new(&importer)
+            let file_dir = Path::new(importer)
                 .parent()
                 .unwrap_or_else(|| Path::new(""));
             if let Some(rel) = normalize_rel(&file_dir.join(clean_spec)) {
@@ -1431,36 +1431,53 @@ impl Project {
                     || target_ws_dir.is_some_and(|d| d != self.workspace_dir_for(file))
                 {
                     if let Some(ws_dir) = target_ws_dir {
-                        affected.extend(self.files_in_dir(ws_dir));
+                        return GapScope::from_range_and_file(
+                            self.files_in_dir_range(ws_dir),
+                            file,
+                        );
                     }
                 } else if let Some(parent) = rel.parent()
                     && !parent.as_os_str().is_empty()
                 {
-                    affected.extend(self.files_in_dir(parent));
+                    return GapScope::from_range_and_file(self.files_in_dir_range(parent), file);
                 }
             }
-            return Some(affected.into_iter().collect());
+            return GapScope::Files(vec![file as u32]);
         }
         if let Some((pkg_name, _)) = Self::split_package_spec(clean_spec)
             && let Some(WorkspacePackage::Unique(pkg)) = self.workspaces.get(&pkg_name)
         {
-            affected.extend(self.files_in_dir(&pkg.rel_dir));
-            return Some(affected.into_iter().collect());
+            return GapScope::from_range_and_file(self.files_in_dir_range(&pkg.rel_dir), file);
         }
         let ts_targets = self
             .source_mapper
-            .matches_tsconfig_path(Path::new(&importer), clean_spec);
+            .matches_tsconfig_path(Path::new(importer), clean_spec);
         if !ts_targets.is_empty() {
+            let mut ranges: Vec<(u32, u32)> = Vec::new();
             for t in &ts_targets {
                 if let Some(parent) = t.parent()
                     && !parent.as_os_str().is_empty()
                 {
-                    affected.extend(self.files_in_dir(parent));
+                    let r = self.files_in_dir_range(parent);
+                    if r.0 < r.1 {
+                        ranges.push(r);
+                    }
                 }
             }
-            return Some(affected.into_iter().collect());
+            if ranges.len() == 1 {
+                return GapScope::from_range_and_file(ranges[0], file);
+            }
+            if !ranges.is_empty() {
+                let mut ids = vec![file as u32];
+                for (s, e) in ranges {
+                    ids.extend(s..e);
+                }
+                ids.sort_unstable();
+                ids.dedup();
+                return GapScope::Files(ids);
+            }
         }
-        Some(affected.into_iter().collect())
+        GapScope::Files(vec![file as u32])
     }
 
     /// None means a resolved external package, Node builtin or plain stylesheet.

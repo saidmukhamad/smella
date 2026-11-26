@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use rustc_hash::FxHashMap;
 use serde_json::{Value, json};
 
-use crate::graph::{Gap, Graph, Id, Loc, Reach, Role};
+use crate::graph::{Gap, GapScope, Graph, Id, Loc, Reach, Role};
 
 #[derive(Clone, Copy, Default)]
 struct Step {
@@ -210,19 +210,18 @@ impl Evidence {
             }
             let id = "unrooted-workspace".to_string();
             result.gap_id = Some(id.clone());
-            let files = graph
-                .paths
+            let files: Vec<u32> = affected
                 .iter()
-                .zip(affected)
-                .filter(|(_, found)| *found)
-                .map(|(p, _)| p.clone())
+                .enumerate()
+                .filter(|(_, found)| **found)
+                .map(|(idx, _)| idx as u32)
                 .collect();
             gaps.push(Gap {
                 id,
                 code: "unrooted-workspace-reference",
                 file: Some(graph.paths[file].clone()),
                 location: Some(loc),
-                affected_files: Some(files),
+                scope: GapScope::Files(files),
                 message: concat!(
                     "Cross-workspace references originate in files with no effective root path. ",
                     "Supply the callers' entry roles. Explanations identify the source locations."

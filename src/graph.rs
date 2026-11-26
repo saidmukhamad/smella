@@ -49,6 +49,37 @@ pub struct Root {
     pub mode: RootEntryMode,
 }
 
+/// Compact representation of which analyzed files a gap can affect.
+/// Avoids cloning thousands of file path strings per gap and keeps N-API metadata tiny.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GapScope {
+    #[default]
+    Global,
+    /// Contiguous range `[start, end)` in `graph.paths`.
+    Range(u32, u32),
+    /// Contiguous range `[start, end)` in `graph.paths` union `{ extra }`.
+    RangePlus(u32, u32, u32),
+    /// Explicit sorted, deduplicated file IDs.
+    Files(Vec<u32>),
+}
+
+impl GapScope {
+    pub fn is_global(&self) -> bool {
+        matches!(self, Self::Global)
+    }
+    pub fn from_range_and_file(range: (u32, u32), file: Id) -> Self {
+        let f = file as u32;
+        if range.0 >= range.1 {
+            Self::Files(vec![f])
+        } else if f >= range.0 && f < range.1 {
+            Self::Range(range.0, range.1)
+        } else {
+            Self::RangePlus(range.0, range.1, f)
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Gap {
@@ -56,7 +87,8 @@ pub struct Gap {
     pub file: Option<String>,
     pub location: Option<Loc>,
     pub message: String,
-    pub affected_files: Option<Vec<String>>,
+    #[serde(rename = "affectedScope")]
+    pub scope: GapScope,
     pub id: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub test_only: bool,
@@ -162,7 +194,15 @@ impl Graph {
         guard: Option<Id>,
         target_file: Option<Id>,
     ) {
-        self.gap_scoped(code, file, loc, message, guard, target_file, None);
+        self.gap_scoped(
+            code,
+            file,
+            loc,
+            message,
+            guard,
+            target_file,
+            GapScope::Global,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -174,14 +214,14 @@ impl Graph {
         message: String,
         guard: Option<Id>,
         target_file: Option<Id>,
-        affected_files: Option<Vec<String>>,
+        scope: GapScope,
     ) {
         let record = Gap {
             code,
             file: file.map(|f| self.paths[f].clone()),
             location: loc,
             message,
-            affected_files,
+            scope,
             id: String::new(),
             test_only: false,
         };
@@ -351,10 +391,10 @@ impl Graph {
                     self.nodes[from].edges.clear();
                 }
                 let from_file = self.nodes[from].file;
-                let mut affected = vec![self.paths[file].clone()];
+                let mut affected = vec![file as u32];
                 if from_file != file {
-                    affected.push(self.paths[from_file].clone());
-                    affected.sort();
+                    affected.push(from_file as u32);
+                    affected.sort_unstable();
                 }
                 self.gap_scoped(
                     "missing-export",
@@ -363,7 +403,7 @@ impl Graph {
                     format!("{} has no unambiguous export {name}.", self.paths[file]),
                     None,
                     None,
-                    Some(affected),
+                    GapScope::Files(affected),
                 );
             }
         }
@@ -558,12 +598,12 @@ impl Reach {
         let mut records = Vec::with_capacity(graph.gaps.len());
         // Escaped namespace values can retain implementations beyond the target file.
         // Follow their possible dependencies without recording any positive usage.
-        let mut closures: FxHashMap<(Id, bool, bool), Option<Vec<String>>> = FxHashMap::default();
+        let mut closures: FxHashMap<(Id, bool, bool), GapScope> = FxHashMap::default();
         let mut seen_stamp = vec![0u32; graph.nodes.len()];
         let mut file_stamp = vec![0u32; graph.paths.len()];
         let mut stamp = 0u32;
         let mut stack: Vec<Id> = Vec::new();
-        let mut touched_files: Vec<usize> = Vec::new();
+        let mut touched_files: Vec<u32> = Vec::new();
 
         for pending in &graph.gaps {
             if !active(pending.guard) {
@@ -583,32 +623,31 @@ impl Reach {
                     && origin_file_id.is_some_and(|f| {
                         roles[f] == (1 << Role::Test as usize) && node_test_only(f)
                     }));
-            if record.affected_files.is_none()
+            if record.scope.is_global()
                 && pending.target_file.is_none()
                 && multi_workspace
                 && matches!(record.code, "computed-import" | "bundler-glob")
-                && let Some(file_path) = &record.file
+                && let (Some(file_id), Some(file_path)) = (origin_file_id, &record.file)
             {
                 if pending.guard.is_some_and(&node_test_or_tooling_only) {
-                    record.affected_files = Some(vec![file_path.clone()]);
+                    record.scope = GapScope::Files(vec![file_id as u32]);
                 } else {
                     let prefix = file_path.rsplit_once('/').map_or("", |(dir, _)| dir);
-                    let scoped: Vec<String> = if prefix.is_empty() {
-                        vec![file_path.clone()]
+                    let scoped: Vec<u32> = if prefix.is_empty() {
+                        vec![file_id as u32]
                     } else {
                         let slash = format!("{prefix}/");
-                        graph
-                            .paths
+                        let start = graph.paths.partition_point(|p| p.as_str() < slash.as_str());
+                        graph.paths[start..]
                             .iter()
-                            .filter(|p| {
-                                p.strip_prefix(&slash)
-                                    .is_some_and(|rest| !rest.contains('/'))
-                            })
-                            .cloned()
+                            .enumerate()
+                            .take_while(|(_, p)| p.starts_with(&slash))
+                            .filter(|(_, p)| !p[slash.len()..].contains('/'))
+                            .map(|(i, _)| (start + i) as u32)
                             .collect()
                     };
-                    record.affected_files = Some(if scoped.is_empty() {
-                        vec![file_path.clone()]
+                    record.scope = GapScope::Files(if scoped.is_empty() {
+                        vec![file_id as u32]
                     } else {
                         scoped
                     });
@@ -628,7 +667,7 @@ impl Reach {
                 } else {
                     0b0100_0101
                 };
-                record.affected_files = closures
+                record.scope = closures
                     .entry((target, guard_runtime, guard_tooling))
                     .or_insert_with(|| {
                         stamp = stamp.wrapping_add(1);
@@ -655,7 +694,7 @@ impl Reach {
                                 let f = graph.nodes[n].file;
                                 if file_stamp[f] != stamp {
                                     file_stamp[f] = stamp;
-                                    touched_files.push(f);
+                                    touched_files.push(f as u32);
                                 }
                                 for edge in graph.edges(n) {
                                     if (self.masks[edge.target] & cover_mask) == 0
@@ -668,21 +707,16 @@ impl Reach {
                         }
                         if !multi_workspace
                             && graph.gaps.iter().any(|gap| {
-                                gap.record.affected_files.is_none()
+                                gap.record.scope.is_global()
                                     && gap.target_file.is_none()
                                     && matches!(gap.record.code, "computed-import" | "bundler-glob")
                                     && gap.guard.is_some_and(|n| seen_stamp[n] == stamp)
                             })
                         {
-                            None
+                            GapScope::Global
                         } else {
                             touched_files.sort_unstable();
-                            Some(
-                                touched_files
-                                    .iter()
-                                    .map(|&f| graph.paths[f].clone())
-                                    .collect(),
-                            )
+                            GapScope::Files(touched_files.clone())
                         }
                     })
                     .clone();
@@ -702,7 +736,7 @@ impl Reach {
                 && a.file == b.file
                 && a.location.map(|l| l.start) == b.location.map(|l| l.start)
                 && a.message == b.message
-                && a.affected_files == b.affected_files
+                && a.scope == b.scope
         });
         for (i, gap) in records.iter_mut().enumerate() {
             gap.id = format!("g{i}");
