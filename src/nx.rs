@@ -6,7 +6,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use crate::graph::{Role, Root};
+use crate::graph::{Role, Root, RootEntryMode};
 use crate::project::{Project, matcher};
 
 fn read_config(path: &Path) -> Result<Value, String> {
@@ -304,9 +304,12 @@ impl Workspace {
                 } else if runtime {
                     if app && target.is_builder() {
                         target.select_build(project, def, config);
+                    } else if target.executor() == "nx:noop" {
+                        // Explicit no-op aggregator target has no entry point of its own.
                     } else if target.is_builder()
                         || target.is_launcher()
-                        || matches!(name.as_str(), "build" | "serve" | "dev" | "start")
+                        || (matches!(name.as_str(), "build" | "serve" | "dev" | "start")
+                            && (app || !target.executor().is_empty()))
                     {
                         gap(
                             project,
@@ -519,6 +522,7 @@ fn select_file(project: &mut Project, def: &Definition, role: Role, source: &str
             role,
             origin: "discovered",
             input: source.into(),
+            mode: RootEntryMode::ModuleOnly,
         });
     } else {
         project.graph.gap("invalid-root",None,None,format!("{source} in project {:?} selects {value}, which has no included source file. Supply an explicit source entry.",def.dir),None,None);

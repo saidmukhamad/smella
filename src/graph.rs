@@ -30,12 +30,22 @@ pub enum Role {
 }
 pub const ROLES: [Role; 4] = [Role::Runtime, Role::Test, Role::Tooling, Role::Public];
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RootEntryMode {
+    #[default]
+    ModuleOnly,
+    DefaultExport,
+    AllExports,
+}
+
 #[derive(Clone, Serialize)]
 pub struct Root {
     pub file: String,
     pub role: Role,
     pub origin: &'static str,
     pub input: String,
+    #[serde(skip)]
+    pub mode: RootEntryMode,
 }
 
 #[derive(Clone, Serialize)]
@@ -75,6 +85,7 @@ pub struct Export {
 pub struct Module {
     pub exports: BTreeMap<String, Export>,
     pub stars: Vec<Edge>, // target file IDs
+    pub cjs_opaque_default: bool,
 }
 
 pub struct PendingGap {
@@ -231,11 +242,40 @@ impl Graph {
                 .retain(|_, export| export.explicit || origins[export.surface].len() == 1);
         }
         for (from, file, name, type_only, loc) in links {
+            if name == "**" {
+                for export in self.modules[file].exports.values() {
+                    self.nodes[from].edges.push(Edge {
+                        target: export.surface,
+                        type_only,
+                        loc,
+                    });
+                }
+                continue;
+            }
+            if name == "*" {
+                if let Some(default_target) = self.modules[file].exports.get("default") {
+                    self.edge(from, default_target.surface, type_only, loc);
+                } else {
+                    self.gap(
+                        "namespace-escape",
+                        Some(self.nodes[from].file),
+                        Some(loc),
+                        format!("The properties read from {} are unknown.", self.paths[file]),
+                        Some(from),
+                        Some(file),
+                    );
+                }
+                continue;
+            }
             let target = self.modules[file].exports.get(&name);
             if let Some(target) = target.filter(|e| origins[e.surface].len() == 1) {
                 if !forwarded.contains(&from) {
                     self.edge(from, target.surface, type_only, loc);
                 }
+            } else if self.modules[file].cjs_opaque_default
+                && let Some(default_target) = self.modules[file].exports.get("default")
+            {
+                self.edge(from, default_target.surface, type_only, loc);
             } else {
                 if forwarded.contains(&from) {
                     self.nodes[from].edges.clear();
@@ -276,9 +316,23 @@ impl Reach {
             let lane = root.role as usize * 2;
             visited[file][lane] = Some(Visit::Root);
             queue.push_back((file, lane));
-            if root.role == Role::Public {
+            if root.role == Role::Public || root.mode == RootEntryMode::AllExports {
                 for export in g.modules[file].exports.values() {
                     let surface = export.surface;
+                    if visited[surface][lane].is_none() {
+                        visited[surface][lane] = Some(Visit::From {
+                            node: file,
+                            lane,
+                            loc: g.nodes[surface].loc,
+                        });
+                        queue.push_back((surface, lane));
+                    }
+                }
+            } else if root.mode == RootEntryMode::DefaultExport
+                && let Some(export) = g.modules[file].exports.get("default")
+            {
+                let surface = export.surface;
+                if visited[surface][lane].is_none() {
                     visited[surface][lane] = Some(Visit::From {
                         node: file,
                         lane,

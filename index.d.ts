@@ -12,13 +12,21 @@ export interface Root { file: string; role: Role; origin: 'explicit' | 'discover
 /** Zero-based, half-open UTF-8 byte offsets within the source file. */
 export interface Location { start: number; end: number }
 export interface Gap { id: string; code: string; file: string | null; location: Location | null; message: string; affectedFiles: string[] | null }
+export interface InlineGap { id: string; code: string; file: string | null; location: Location | null; message: string }
 export interface Coverage { status: 'complete' | 'partial'; files: string[]; excluded: string[]; gaps: Gap[] }
 export interface Usage { value: Context[]; type: Context[]; contract: boolean; evaluation: Context[] }
 interface SubjectRecord {
   id: string; file: string; exportName: string | null; bindingName?: string; location: Location; usage: Usage;
-  status: 'complete' | 'conditional'; gapIds: readonly string[];
+  status: 'complete' | 'conditional'; gapIds: readonly string[]; primaryGaps: readonly InlineGap[];
 }
-export interface Finding extends SubjectRecord { kind: FindingKind }
+export type DiffStatus = 'introduced' | 'pre-existing';
+export interface Finding extends SubjectRecord { kind: FindingKind; diff?: DiffStatus }
+export interface DiffSummary {
+  base: string;
+  changedFiles: readonly string[];
+  introduced: number;
+  preExisting: number;
+}
 export interface Step { file: string; kind: string; name: string; location: Location; via: { file: string; location: Location } | null }
 export interface Witness { role: Role; fact: 'value' | 'type' | 'evaluation' | 'contract'; path: Step[] }
 export type TestFact = 'value' | 'type' | 'evaluation';
@@ -36,11 +44,12 @@ export type Subject = string | { file: string; exportName?: string; bindingName?
 export interface Report {
   readonly roots: readonly Root[];
   readonly coverage: Coverage;
-  findings(filter?: { kind?: FindingKind }): Finding[];
+  readonly diff?: DiffSummary;
+  findings(filter?: { kind?: FindingKind; diff?: DiffStatus }): Finding[];
   explain(subject: Subject): Explanation;
   dispose(): void;
 }
 export class AnalysisError extends Error {
   readonly code: 'NATIVE_LOAD' | 'ANALYSIS_FAILED' | 'REPORT_DISPOSED' | 'UNKNOWN_SUBJECT';
 }
-export function analyze(options?: Config & { root?: string }): Promise<Report>;
+export function analyze(options?: Config & { root?: string; base?: string }): Promise<Report>;

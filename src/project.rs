@@ -10,7 +10,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::graph::{Graph, Id, ROLES, Role, Root};
+use crate::graph::{Graph, Id, ROLES, Role, Root, RootEntryMode};
+use crate::source_map::{
+    SourceMapper, is_non_code_export, normalize_rel, resolve_exports_targets, to_slash,
+};
 
 pub(crate) const EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "mjs", "cts", "cjs"];
 const SKIP: &[&str] = &[
@@ -69,8 +72,19 @@ fn strings(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
+struct WorkspacePkgInfo {
+    dir: PathBuf,
+    rel_dir: PathBuf,
+    has_exports: bool,
+    source: Option<String>,
+    exports: Option<Value>,
+    main: Option<String>,
+    module: Option<String>,
+    types: Option<String>,
+}
+
 enum WorkspacePackage {
-    Unique { dir: PathBuf, has_exports: bool },
+    Unique(Box<WorkspacePkgInfo>),
     Ambiguous,
 }
 
@@ -83,7 +97,9 @@ pub struct Project {
     file_profile: Vec<usize>,
     workspaces: BTreeMap<String, WorkspacePackage>,
     pub workspace_for_file: Vec<usize>,
+    workspace_dirs: Vec<PathBuf>,
     pub react_entry: Option<Id>,
+    pub source_mapper: SourceMapper,
 }
 
 impl Project {
@@ -117,6 +133,7 @@ impl Project {
         let mut nx_dirs = BTreeSet::new();
         let mut manifests = vec![];
         let mut config_dirs = BTreeMap::new();
+        let mut tsconfig_files = vec![];
         let mut walker = WalkDir::new(&root).sort_by_file_name().into_iter();
         while let Some(entry) = walker.next() {
             let entry = entry.map_err(|e| format!("Cannot enumerate source scope: {e}"))?;
@@ -141,6 +158,9 @@ impl Project {
             }
             if nx_enabled && name == "project.json" {
                 nx_dirs.insert(Path::new(&file).parent().unwrap().to_owned());
+            }
+            if name.starts_with("tsconfig") && name.ends_with(".json") {
+                tsconfig_files.push(PathBuf::from(&file));
             }
             if name == "tsconfig.json" {
                 config_dirs.insert(
@@ -281,12 +301,27 @@ impl Project {
             if member || nx_dirs.contains(rel) {
                 let package = json(&path)?;
                 if let Some(name) = package["name"].as_str() {
+                    let non_empty = |k: &str| {
+                        package[k]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                    };
                     workspaces
                         .entry(name.to_owned())
                         .and_modify(|pkg| *pkg = WorkspacePackage::Ambiguous)
-                        .or_insert_with(|| WorkspacePackage::Unique {
-                            dir: dir.to_owned(),
-                            has_exports: package.get("exports").is_some(),
+                        .or_insert_with(|| {
+                            WorkspacePackage::Unique(Box::new(WorkspacePkgInfo {
+                                dir: dir.to_owned(),
+                                rel_dir: rel.to_owned(),
+                                has_exports: package.get("exports").is_some(),
+                                source: non_empty("source"),
+                                exports: package.get("exports").cloned(),
+                                main: non_empty("main"),
+                                module: non_empty("module"),
+                                types: non_empty("types").or_else(|| non_empty("typings")),
+                            }))
                         });
                 }
                 if !uses_pnpm {
@@ -296,6 +331,7 @@ impl Project {
                 packages.push((rel.to_owned(), package));
             }
         }
+        let source_mapper = SourceMapper::build(&root, &tsconfig_files);
         let nx = if nx_enabled {
             let nx = crate::nx::Workspace::read(&root, &nx_dirs, &packages)?;
             for dir in nx.directories() {
@@ -307,21 +343,30 @@ impl Project {
             None
         };
         let react_entry = match workspaces.get("react") {
-            Some(WorkspacePackage::Unique { dir, has_exports }) => {
-                let spec = if *has_exports { "react" } else { "./" };
-                resolvers[0][0].resolve(dir, spec).ok().and_then(|entry| {
-                    let file = entry
-                        .path()
-                        .strip_prefix(&root)
-                        .ok()?
-                        .to_str()?
-                        .replace('\\', "/");
-                    paths.binary_search(&file).ok()
-                })
+            Some(WorkspacePackage::Unique(pkg)) => {
+                let spec = if pkg.has_exports { "react" } else { "./" };
+                resolvers[0][0]
+                    .resolve(&pkg.dir, spec)
+                    .ok()
+                    .and_then(|entry| {
+                        let file = entry
+                            .path()
+                            .strip_prefix(&root)
+                            .ok()?
+                            .to_str()?
+                            .replace('\\', "/");
+                        paths.binary_search(&file).ok()
+                    })
             }
             _ => None,
         };
         let workspace_for_file = closest_directories(&paths, &directories);
+        let mut workspace_dirs = vec![PathBuf::new(); directories.len()];
+        for (dir, &id) in &directories {
+            if id < workspace_dirs.len() {
+                workspace_dirs[id] = dir.clone();
+            }
+        }
         let mut project = Self {
             root,
             graph: Graph::new(paths),
@@ -331,7 +376,9 @@ impl Project {
             resolvers,
             file_profile,
             workspace_for_file,
+            workspace_dirs,
             react_entry,
+            source_mapper,
         };
         for (role, supplied) in
             ROLES
@@ -359,24 +406,99 @@ impl Project {
                 let p =
                     "**/{vite,vitest,jest,webpack,rollup,eslint}.config.{ts,js,mjs,cjs,mts,cts}";
                 project.select(role, p, "discovered", p, false)?;
+                crate::discover::discover_extra_tooling_configs(&mut project);
+                crate::discover::discover_storybook_stories(&mut project)?;
             } else {
+                if role == Role::Runtime {
+                    crate::discover::discover_bundler_entries(&mut project);
+                }
                 for (dir, pkg) in &packages {
+                    if role == Role::Runtime {
+                        let manifest = dir.join("package.json");
+                        for (field_label, entry_file) in collect_plugin_entries(pkg) {
+                            let file = to_slash(&dir.join(entry_file.trim_start_matches("./")));
+                            let label = format!("{}#{field_label}", manifest.display());
+                            project.select_with_mode(
+                                role,
+                                &file,
+                                "discovered",
+                                &label,
+                                true,
+                                RootEntryMode::DefaultExport,
+                            )?;
+                            let html_rel = Path::new(&file).with_extension("html");
+                            for script_file in
+                                html_script_sources(&project.root, &html_rel, &project.graph.paths)
+                            {
+                                project.roots.push(Root {
+                                    file: script_file,
+                                    role,
+                                    origin: "discovered",
+                                    input: format!("{}#<script>", to_slash(&html_rel)),
+                                    mode: RootEntryMode::ModuleOnly,
+                                });
+                            }
+                        }
+                    }
                     if role == Role::Runtime
                         && pkg["bin"].is_null()
-                        && pkg.pointer("/scripts/start").is_some()
+                        && let Some(script) = pkg.pointer("/scripts/start").and_then(Value::as_str)
                     {
                         let manifest = dir.join("package.json");
-                        project.graph.gap("ambiguous-entry", None, None,
-                            format!("{}#scripts.start is a command. Supply entries.runtime to identify its source entry.", manifest.display()), None, None);
+                        let label = format!("{}#scripts.start", manifest.display());
+                        match crate::discover::parse_start_script(
+                            &project, dir, script, &packages, 0,
+                        ) {
+                            crate::discover::ScriptOutcome::Entries(found) => {
+                                for file in found {
+                                    project.roots.push(Root {
+                                        file,
+                                        role,
+                                        origin: "discovered",
+                                        input: label.clone(),
+                                        mode: RootEntryMode::ModuleOnly,
+                                    });
+                                }
+                            }
+                            crate::discover::ScriptOutcome::DelegatedOrNoop => {}
+                            crate::discover::ScriptOutcome::Ambiguous => {
+                                project.graph.gap(
+                                    "ambiguous-entry",
+                                    None,
+                                    None,
+                                    format!(
+                                        "{label} is a command. Supply entries.runtime to identify its source entry."
+                                    ),
+                                    None,
+                                    None,
+                                );
+                            }
+                        }
                     }
                     if role == Role::Public {
                         let manifest = dir.join("package.json");
+                        if let Some(path) = pkg["source"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            let pattern = to_slash(&dir.join(path.trim_start_matches("./")));
+                            project.select(
+                                role,
+                                &pattern,
+                                "discovered",
+                                &format!("{}#source", manifest.display()),
+                                true,
+                            )?;
+                        }
                         for key in ["types", "typings"] {
-                            if let Some(path) = pkg[key].as_str() {
-                                let pattern = dir.join(path.trim_start_matches("./"));
+                            if let Some(path) =
+                                pkg[key].as_str().map(str::trim).filter(|s| !s.is_empty())
+                            {
+                                let pattern = to_slash(&dir.join(path.trim_start_matches("./")));
                                 project.select(
                                     role,
-                                    &pattern.to_string_lossy(),
+                                    &pattern,
                                     "discovered",
                                     &format!("{}#{key}", manifest.display()),
                                     true,
@@ -399,10 +521,32 @@ impl Project {
                     let label = format!("{}#{field}", dir.join("package.json").display());
                     let has_targets = !targets.is_empty();
                     for target in targets {
-                        let file = dir
-                            .join(target.trim_start_matches("./"))
-                            .to_string_lossy()
-                            .replace('\\', "/");
+                        let trimmed = target.trim();
+                        if trimmed.is_empty()
+                            || (role == Role::Public && is_non_code_export(trimmed))
+                        {
+                            continue;
+                        }
+                        let file = to_slash(&dir.join(trimmed.trim_start_matches("./")));
+                        if role == Role::Public && trimmed.contains('*') {
+                            // Non-code asset wildcard directories (e.g. `./skills/*`) have no JS/TS files.
+                            let prefix = file.split('*').next().unwrap_or("");
+                            let has_code_ext = file
+                                .rsplit('.')
+                                .next()
+                                .is_some_and(|e| EXTENSIONS.contains(&e));
+                            if !has_code_ext
+                                && !prefix.is_empty()
+                                && project.root.join(prefix).is_dir()
+                                && !project.graph.paths.iter().any(|p| p.starts_with(prefix))
+                                && project
+                                    .source_mapper
+                                    .map_pattern(&project.root, &project.graph.paths, &file)
+                                    .is_none()
+                            {
+                                continue;
+                            }
+                        }
                         project.select(role, &file, "discovered", &label, true)?;
                     }
                     if role == Role::Public
@@ -422,9 +566,14 @@ impl Project {
                 }
             }
         }
-        project
-            .roots
-            .sort_by(|a, b| (&a.file, a.role, &a.input).cmp(&(&b.file, b.role, &b.input)));
+        project.roots.sort_by(|a, b| {
+            (&a.file, a.role, &a.input, std::cmp::Reverse(a.mode)).cmp(&(
+                &b.file,
+                b.role,
+                &b.input,
+                std::cmp::Reverse(b.mode),
+            ))
+        });
         project
             .roots
             .dedup_by(|a, b| a.file == b.file && a.role == b.role && a.input == b.input);
@@ -440,7 +589,7 @@ impl Project {
         }
         Ok(project)
     }
-    fn select(
+    pub(crate) fn select(
         &mut self,
         role: Role,
         pattern: &str,
@@ -448,7 +597,42 @@ impl Project {
         input: &str,
         required: bool,
     ) -> Result<(), String> {
-        let glob = matcher(pattern)?;
+        self.select_with_mode(
+            role,
+            pattern,
+            origin,
+            input,
+            required,
+            RootEntryMode::ModuleOnly,
+        )
+    }
+
+    pub(crate) fn select_with_mode(
+        &mut self,
+        role: Role,
+        pattern: &str,
+        origin: &'static str,
+        input: &str,
+        required: bool,
+        mode: RootEntryMode,
+    ) -> Result<(), String> {
+        // For discovered manifest entries pointing at build outputs (e.g. dist/ or lib/),
+        // prefer the mapped source entry over generated output.
+        let effective = if origin == "discovered" {
+            let clean = pattern.trim().trim_start_matches("./");
+            let in_out = normalize_rel(Path::new(clean))
+                .is_some_and(|p| self.source_mapper.is_in_out_dir(&p));
+            if in_out {
+                self.source_mapper
+                    .map_pattern(&self.root, &self.graph.paths, pattern)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let active_pattern = effective.as_deref().unwrap_or(pattern);
+        let glob = matcher(active_pattern)?;
         let before = self.roots.len();
         for file in self.graph.paths.iter().filter(|f| glob.is_match(f)) {
             self.roots.push(Root {
@@ -456,7 +640,26 @@ impl Project {
                 role,
                 origin,
                 input: input.into(),
+                mode,
             });
+        }
+        if before == self.roots.len()
+            && origin == "discovered"
+            && effective.is_none()
+            && let Some(mapped) =
+                self.source_mapper
+                    .map_pattern(&self.root, &self.graph.paths, pattern)
+        {
+            let mapped_glob = matcher(&mapped)?;
+            for file in self.graph.paths.iter().filter(|f| mapped_glob.is_match(f)) {
+                self.roots.push(Root {
+                    file: file.clone(),
+                    role,
+                    origin,
+                    input: input.into(),
+                    mode,
+                });
+            }
         }
         if required && before == self.roots.len() {
             let message = format!(
@@ -468,8 +671,144 @@ impl Project {
         Ok(())
     }
 
+    fn split_package_spec(spec: &str) -> Option<(String, Option<&str>)> {
+        if spec.starts_with('.') || spec.starts_with('/') || spec.is_empty() {
+            return None;
+        }
+        if let Some(rest) = spec.strip_prefix('@') {
+            let mut it = rest.splitn(3, '/');
+            let scope = it.next()?;
+            let name = it.next()?;
+            let sub = it.next().filter(|s| !s.is_empty());
+            Some((format!("@{scope}/{name}"), sub))
+        } else {
+            let mut it = spec.splitn(2, '/');
+            let name = it.next()?;
+            let sub = it.next().filter(|s| !s.is_empty());
+            Some((name.to_owned(), sub))
+        }
+    }
+
+    fn resolve_workspace_source(
+        &self,
+        spec: &str,
+        type_only: bool,
+        cjs: bool,
+    ) -> Option<Result<Option<Id>, String>> {
+        let (pkg_name, subpath) = Self::split_package_spec(spec)?;
+        let package = self.workspaces.get(&pkg_name)?;
+        let WorkspacePackage::Unique(pkg) = package else {
+            return Some(Err(format!(
+                "Multiple workspace packages match {spec:?}. Supply an unambiguous path mapping."
+            )));
+        };
+        let WorkspacePkgInfo {
+            rel_dir,
+            source,
+            exports,
+            main,
+            module,
+            types,
+            ..
+        } = pkg.as_ref();
+        if let Some(exp) = exports {
+            let sub = match subpath {
+                None => ".".to_owned(),
+                Some(s) => format!("./{s}"),
+            };
+            let targets = resolve_exports_targets(exp, &sub, type_only, cjs);
+            for target in &targets {
+                if is_non_code_export(target) {
+                    return Some(Ok(None));
+                }
+                let rel = rel_dir.join(target.trim_start_matches("./"));
+                if let Some(id) =
+                    self.source_mapper
+                        .map_to_source(&self.root, &self.graph.paths, &rel)
+                {
+                    return Some(Ok(Some(id)));
+                }
+            }
+            // Only fall back when the subpath wasn't in `exports` and explicitly points into a configured outDir.
+            if targets.is_empty()
+                && let Some(s) = subpath
+            {
+                if is_non_code_export(s) {
+                    return Some(Ok(None));
+                }
+                let rel = rel_dir.join(s);
+                if self.source_mapper.is_in_out_dir(&rel)
+                    && let Some(id) =
+                        self.source_mapper
+                            .map_to_source(&self.root, &self.graph.paths, &rel)
+                {
+                    return Some(Ok(Some(id)));
+                }
+            }
+            return None;
+        }
+        match subpath {
+            None => {
+                let mut candidates: Vec<&str> = Vec::new();
+                if let Some(s) = source.as_deref() {
+                    candidates.push(s);
+                }
+                if type_only {
+                    for f in [types, module, main] {
+                        if let Some(s) = f.as_deref() {
+                            candidates.push(s);
+                        }
+                    }
+                } else {
+                    for f in [module, main, types] {
+                        if let Some(s) = f.as_deref() {
+                            candidates.push(s);
+                        }
+                    }
+                }
+                candidates.push("./index");
+                for target in candidates {
+                    let rel = rel_dir.join(target.trim_start_matches("./"));
+                    if let Some(id) =
+                        self.source_mapper
+                            .map_to_source(&self.root, &self.graph.paths, &rel)
+                    {
+                        return Some(Ok(Some(id)));
+                    }
+                }
+                None
+            }
+            Some(s) => {
+                if is_non_code_export(s) {
+                    return Some(Ok(None));
+                }
+                let rel = rel_dir.join(s);
+                self.source_mapper
+                    .map_to_source(&self.root, &self.graph.paths, &rel)
+                    .map(|id| Ok(Some(id)))
+            }
+        }
+    }
+
+    pub fn workspace_dir_for(&self, file: Id) -> &Path {
+        let ws_id = self.workspace_for_file.get(file).copied().unwrap_or(0);
+        self.workspace_dirs
+            .get(ws_id)
+            .map(PathBuf::as_path)
+            .unwrap_or_else(|| Path::new(""))
+    }
+
     /// None means a resolved external package, Node builtin or plain stylesheet.
-    pub fn resolve(&self, file: Id, spec: &str, type_only: bool) -> Result<Option<Id>, String> {
+    pub fn resolve_with_mode(
+        &self,
+        file: Id,
+        spec: &str,
+        type_only: bool,
+        cjs: bool,
+    ) -> Result<Option<Id>, String> {
+        if spec.starts_with("bun:") {
+            return Ok(None);
+        }
         let origin = self.root.join(&self.graph.paths[file]);
         let profile = if spec.starts_with('.') || spec.starts_with('/') {
             0
@@ -479,6 +818,20 @@ impl Project {
         let resolver = &self.resolvers[profile][usize::from(type_only)];
         let mut result = resolver.resolve(origin.parent().unwrap(), spec);
         if result.is_err() {
+            if let Some(ws) = self.resolve_workspace_source(spec, type_only, cjs) {
+                return ws;
+            }
+            if spec.starts_with('.') {
+                let rel_origin = Path::new(&self.graph.paths[file]);
+                if let Some(rel) = normalize_rel(&rel_origin.parent().unwrap().join(spec))
+                    && self.source_mapper.is_in_out_dir(&rel)
+                    && let Some(id) =
+                        self.source_mapper
+                            .map_to_source(&self.root, &self.graph.paths, &rel)
+                {
+                    return Ok(Some(id));
+                }
+            }
             let parts: Vec<_> = spec.split('/').collect();
             let count = if spec.starts_with('@') && parts.len() >= 2 {
                 2
@@ -486,21 +839,17 @@ impl Project {
                 1
             };
             if let Some(package) = self.workspaces.get(&parts[..count].join("/")) {
-                let WorkspacePackage::Unique {
-                    dir: pkg,
-                    has_exports,
-                } = package
-                else {
+                let WorkspacePackage::Unique(pkg_info) = package else {
                     return Err(format!(
                         "Multiple workspace packages match {spec:?}. Supply an unambiguous path mapping."
                     ));
                 };
                 // Resolve as a package self-reference to respect its exports map.
                 let package_resolver = &self.resolvers[0][usize::from(type_only)];
-                result = package_resolver.resolve(pkg, spec);
-                if !has_exports && matches!(result, Err(ResolveError::NotFound(_))) {
-                    result =
-                        package_resolver.resolve(pkg, &format!("./{}", parts[count..].join("/")));
+                result = package_resolver.resolve(&pkg_info.dir, spec);
+                if !pkg_info.has_exports && matches!(result, Err(ResolveError::NotFound(_))) {
+                    result = package_resolver
+                        .resolve(&pkg_info.dir, &format!("./{}", parts[count..].join("/")));
                 }
             }
         }
@@ -515,19 +864,51 @@ impl Project {
                 if spec.ends_with(".css") && path.extension().is_some_and(|ext| ext == "css") {
                     return Ok(None);
                 }
-                if path.components().any(|p| p.as_os_str() == "node_modules") {
+                if path.extension().is_some_and(|ext| ext == "json") {
                     return Ok(None);
                 }
-                let rel = path
-                    .strip_prefix(&self.root)
-                    .map_err(|_| format!("{spec:?} resolves outside the repository."))?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                self.graph
-                    .paths
-                    .binary_search(&rel)
-                    .map(Some)
-                    .map_err(|_| format!("{spec:?} resolves to {rel}, outside the analyzed files."))
+                if path.components().any(|p| p.as_os_str() == "node_modules") {
+                    // If a workspace package is also installed inside node_modules, prefer its workspace source.
+                    if let Some(ws) = self.resolve_workspace_source(spec, type_only, cjs) {
+                        return ws;
+                    }
+                    return Ok(None);
+                }
+                let rel = match path.strip_prefix(&self.root) {
+                    Ok(p) => p.to_string_lossy().replace('\\', "/"),
+                    Err(_) => {
+                        // A symlinked node_modules tree (e.g. during --base diff analysis) can point
+                        // a workspace package symlink at the original checkout; prefer this checkout's workspace.
+                        if let Some(ws) = self.resolve_workspace_source(spec, type_only, cjs) {
+                            return ws;
+                        }
+                        return Err(format!("{spec:?} resolves outside the repository."));
+                    }
+                };
+                if self.source_mapper.is_in_out_dir(Path::new(&rel))
+                    && let Some(id) = self.source_mapper.map_to_source(
+                        &self.root,
+                        &self.graph.paths,
+                        Path::new(&rel),
+                    )
+                {
+                    return Ok(Some(id));
+                }
+                if let Ok(id) = self.graph.paths.binary_search(&rel) {
+                    return Ok(Some(id));
+                }
+                if let Some(id) =
+                    self.source_mapper
+                        .map_to_source(&self.root, &self.graph.paths, Path::new(&rel))
+                {
+                    return Ok(Some(id));
+                }
+                if is_non_code_export(&rel) {
+                    return Ok(None);
+                }
+                Err(format!(
+                    "{spec:?} resolves to {rel}, outside the analyzed files."
+                ))
             }
             Err(ResolveError::Builtin { .. }) => Ok(None),
             Err(e) => Err(format!("Cannot resolve {spec:?}: {e}")),
@@ -583,6 +964,143 @@ fn closest_directories(paths: &[String], directories: &BTreeMap<PathBuf, usize>)
         .collect()
 }
 
+const STANDARD_MANIFEST_KEYS: &[&str] = &[
+    "scripts",
+    "exports",
+    "imports",
+    "bin",
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+    "bundledDependencies",
+    "overrides",
+    "resolutions",
+    "patchedDependencies",
+    "workspaces",
+    "engines",
+    "directories",
+    "publishConfig",
+    "repository",
+    "bugs",
+    "author",
+    "nx",
+    "knip",
+    "jest",
+    "eslintConfig",
+    "babel",
+    "browserslist",
+];
+
+/// Discover plugin/node runtime entries declared in `package.json` under any
+/// plugin-host namespace containing `{ nodes, plugins }` maps of JS/TS files.
+fn collect_plugin_entries(pkg: &Value) -> Vec<(String, &str)> {
+    let Some(root_map) = pkg.as_object() else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for (section, section_val) in root_map {
+        if STANDARD_MANIFEST_KEYS.contains(&section.as_str()) {
+            continue;
+        }
+        let Some(section_obj) = section_val.as_object() else {
+            continue;
+        };
+        for sub in ["nodes", "plugins"] {
+            let Some(map) = section_obj.get(sub).and_then(Value::as_object) else {
+                continue;
+            };
+            for (name, val) in map {
+                let file = val
+                    .as_str()
+                    .or_else(|| val.get("file").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|s| {
+                        !s.is_empty()
+                            && Path::new(s)
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .is_some_and(|e| EXTENSIONS.contains(&e))
+                    });
+                if let Some(f) = file {
+                    out.push((format!("{section}.{sub}.{name}"), f));
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn html_script_sources(
+    repo_root: &Path,
+    html_rel: &Path,
+    paths: &[String],
+) -> Vec<String> {
+    let abs = repo_root.join(html_rel);
+    let Ok(text) = fs::read_to_string(&abs) else {
+        return vec![];
+    };
+    let html_dir = html_rel.parent().unwrap_or_else(|| Path::new(""));
+    let mut results = Vec::new();
+    let lower = text.to_ascii_lowercase();
+    let mut cursor = 0;
+    while let Some(pos) = lower[cursor..].find("<script") {
+        let tag_start = cursor + pos;
+        let Some(tag_end_rel) = text[tag_start..].find('>') else {
+            break;
+        };
+        let tag = &text[tag_start..tag_start + tag_end_rel];
+        cursor = tag_start + tag_end_rel + 1;
+        // Find src="..." or src='...'
+        let tag_lower = tag.to_ascii_lowercase();
+        let Some(src_pos) = tag_lower.find("src=") else {
+            continue;
+        };
+        let after = tag[src_pos + 4..].trim_start();
+        let (quote, rest) = match after.as_bytes().first() {
+            Some(b'"') => ('"', &after[1..]),
+            Some(b'\'') => ('\'', &after[1..]),
+            _ => continue,
+        };
+        let Some(end_q) = rest.find(quote) else {
+            continue;
+        };
+        let src = rest[..end_q].trim();
+        if src.is_empty()
+            || src.starts_with("http://")
+            || src.starts_with("https://")
+            || src.starts_with("//")
+            || src.starts_with("data:")
+        {
+            continue;
+        }
+        let clean = src.split(['?', '#']).next().unwrap_or("");
+        let candidate = if let Some(rooted) = clean.strip_prefix('/') {
+            // Try relative to package root (html_dir's ancestor) or html_dir.
+            let mut found = None;
+            for anc in html_dir.ancestors() {
+                if let Some(norm) = normalize_rel(&anc.join(rooted)) {
+                    let s = to_slash(&norm);
+                    if paths.binary_search(&s).is_ok() {
+                        found = Some(s);
+                        break;
+                    }
+                }
+            }
+            found
+        } else {
+            normalize_rel(&html_dir.join(clean)).and_then(|norm| {
+                let s = to_slash(&norm);
+                paths.binary_search(&s).ok().map(|_| s)
+            })
+        };
+        if let Some(file) = candidate {
+            results.push(file);
+        }
+    }
+    results
+}
+
 fn manifest_targets<'a>(value: &'a Value, bin_map: bool, out: &mut Vec<&'a str>) {
     match value {
         Value::String(s) => out.push(s),
@@ -594,7 +1112,7 @@ fn manifest_targets<'a>(value: &'a Value, bin_map: bool, out: &mut Vec<&'a str>)
         Value::Object(map) => {
             if let Some((_, target)) = map
                 .iter()
-                .find(|(k, _)| matches!(k.as_str(), "node" | "import" | "default"))
+                .find(|(k, _)| matches!(k.as_str(), "source" | "node" | "import" | "default"))
             {
                 manifest_targets(target, false, out);
             }

@@ -250,17 +250,24 @@ test('JSX component references and ambient declarations retain source identities
   assert.deepEqual(subject(r,'types.d.ts','Props').usage.type,['runtime']);
 });
 
-test('discovery preserves declared public types and diagnoses ambiguous application scripts', async t => {
+test('discovery preserves declared public types, parses node scripts, and diagnoses ambiguous scripts', async t => {
   const root = await fixture(t,{
     'package.json':JSON.stringify({scripts:{start:'node run.js'},exports:{'.':{types:'./api.d.ts',import:'./api.js'}}}),
     'api.js':'export const x = 1;', 'api.d.ts':'export declare const x: number;', 'run.js':'import { x } from "./api.js"; void x;',
   });
   const discovered = await inspect(t,root);
-  assert.deepEqual(discovered.roots.map(r => r.file),['api.d.ts','api.js']);
-  assert.equal(discovered.coverage.gaps[0].code,'ambiguous-entry');
-  const configured = await inspect(t,root,{entries:{runtime:['run.js']}});
+  assert.deepEqual(discovered.roots.map(r => r.file),['api.d.ts','api.js','run.js']);
+  assert.equal(discovered.coverage.status,'complete');
+  assert.equal(subject(discovered,'api.d.ts','x').usage.contract,true);
+  const opaque = await fixture(t,{
+    'package.json':JSON.stringify({scripts:{start:'custom-launcher --prod'},exports:{'.':{types:'./api.d.ts',import:'./api.js'}}}),
+    'api.js':'export const x = 1;', 'api.d.ts':'export declare const x: number;', 'run.js':'import { x } from "./api.js"; void x;',
+  });
+  const amb = await inspect(t,opaque);
+  assert.deepEqual(amb.roots.map(r => r.file),['api.d.ts','api.js']);
+  assert.equal(amb.coverage.gaps[0].code,'ambiguous-entry');
+  const configured = await inspect(t,opaque,{entries:{runtime:['run.js']}});
   assert.equal(configured.coverage.status,'complete');
-  assert.equal(subject(configured,'api.d.ts','x').usage.contract,true);
 });
 
 test('large partial reports share immutable gap lists across subjects', async t => {
@@ -544,9 +551,9 @@ test('React lazy supports a destructured alias and keeps public component depend
   assert.equal(subject(r,'views.tsx','Sibling').kind,'unused-export');
 });
 
-test('stylesheet imports resolve across CSS modules and keep missing files, loader queries and Vite glob gaps visible', async t => {
+test('stylesheet imports resolve across CSS modules, literal import.meta.glob resolves statically, and dynamic glob/loader queries stay visible', async t => {
   const root = await fixture(t,{
-    'app.ts': 'import styles from "./a.module.css"; console.log(styles.title); import.meta.glob("./routes/*.tsx"); import "./missing.css"; import text from "./template.ts?raw"; console.log(text);',
+    'app.ts': 'import styles from "./a.module.css"; console.log(styles.title); import.meta.glob("./routes/*.tsx"); import.meta.glob(dynPattern); import "./missing.css"; import text from "./template.ts?raw"; console.log(text);',
     'a.module.css':'.title { color: red }', 'template.ts':'export default 42;',
     'routes/landing.tsx':'export function Landing() { return <div />; }',
   });
@@ -554,7 +561,8 @@ test('stylesheet imports resolve across CSS modules and keep missing files, load
   assert.deepEqual(r.coverage.gaps.map(g=>g.code),['bundler-glob','unresolved-import','unresolved-import']);
   assert.ok(r.coverage.gaps.some(g=>g.message.includes('loader query')));
   const candidate = subject(r,'routes/landing.tsx','Landing');
-  assert.equal(candidate.status,'conditional');
+  assert.deepEqual(candidate.usage.value,['runtime']);
+  assert.equal(candidate.kind,null);
   assert.deepEqual(subject(r,'template.ts','default').usage.value,[]);
 });
 
@@ -698,4 +706,244 @@ test('a workspace manifest subpath protects its public binding through a barrel 
   const after = await inspect(t, root);
   assert.equal(subject(after, file, 'request').kind, 'test-only-export');
   assert.equal(subject(after, barrel).kind, 'unreferenced-module');
+});
+
+const cliPath = fileURLToPath(new URL('../bin/smella.mjs', import.meta.url));
+
+test('workspace build outputs map back to source through tsconfig, declaration maps and source fields', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ workspaces: ['packages/*'] }),
+    'app.ts': [
+      'import { verifyArchive, ArchiveError } from "@org/registry";',
+      'import type { Config } from "@org/registry/lib/config";',
+      'import { runRuntime } from "@org/runtime";',
+      'import { featureFlag } from "@org/features/registry";',
+      'import { fromSourceField } from "@org/srcfield";',
+      'import { fromDeclMap } from "@org/dmap";',
+      'verifyArchive(); new ArchiveError(); runRuntime(); featureFlag(); fromSourceField(); fromDeclMap();',
+      'type AppCfg = Config; void (null as unknown as AppCfg);',
+    ].join('\n'),
+    'packages/registry/package.json': JSON.stringify({ name: '@org/registry', main: './lib/index.js', types: './lib/index.d.ts' }),
+    'packages/registry/tsconfig.json': JSON.stringify({ compilerOptions: { outDir: './lib', rootDir: './src' } }),
+    'packages/registry/src/index.ts': 'export { verifyArchive, ArchiveError } from "./archive";',
+    'packages/registry/src/archive.ts': 'export function verifyArchive() {} export class ArchiveError {} export function dead() {}',
+    'packages/registry/src/config.ts': 'export interface Config { id: string }',
+    'packages/runtime/package.json': JSON.stringify({
+      name: '@org/runtime',
+      exports: { '.': { types: './dist/index.d.ts', import: './dist/index.js' } },
+    }),
+    'packages/runtime/tsconfig.json': JSON.stringify({ compilerOptions: { outDir: './dist', rootDir: './lib' } }),
+    'packages/runtime/lib/index.ts': 'export function runRuntime() {}',
+    'packages/features/package.json': JSON.stringify({
+      name: '@org/features',
+      exports: { './registry': { import: { types: './lib/esm/registry.d.ts', default: './lib/esm/registry.js' } } },
+    }),
+    'packages/features/tsconfig.json': JSON.stringify({ compilerOptions: { rootDir: 'src' } }),
+    'packages/features/tsconfig.esm.json': JSON.stringify({ extends: './tsconfig.json', compilerOptions: { outDir: 'lib/esm' } }),
+    'packages/features/src/registry.ts': 'export function featureFlag() {}',
+    'packages/srcfield/package.json': JSON.stringify({ name: '@org/srcfield', main: './out/index.js', source: './custom/entry.ts' }),
+    'packages/srcfield/custom/entry.ts': 'export function fromSourceField() {}',
+    'packages/dmap/package.json': JSON.stringify({ name: '@org/dmap', main: './compiled/index.js', types: './compiled/index.d.ts' }),
+    'packages/dmap/compiled/index.d.ts': 'export declare function fromDeclMap(): void;',
+    'packages/dmap/compiled/index.d.ts.map': JSON.stringify({ version: 3, sources: ['../orig/impl.ts'] }),
+    'packages/dmap/orig/impl.ts': 'export function fromDeclMap() {}',
+  });
+
+  const r = await inspect(t, root, app);
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.deepEqual(subject(r, 'packages/registry/src/archive.ts', 'verifyArchive').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'packages/registry/src/archive.ts', 'ArchiveError').usage.value, ['runtime']);
+  assert.equal(subject(r, 'packages/registry/src/archive.ts', 'dead').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'packages/registry/src/config.ts', 'Config').usage.type, ['runtime']);
+  assert.deepEqual(subject(r, 'packages/runtime/lib/index.ts', 'runRuntime').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'packages/features/src/registry.ts', 'featureFlag').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'packages/srcfield/custom/entry.ts', 'fromSourceField').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'packages/dmap/orig/impl.ts', 'fromDeclMap').usage.value, ['runtime']);
+});
+
+test('namespace imports and dynamic imports resolve static members, destructuring, qualified types and spyOn', async t => {
+  const root = await fixture(t, {
+    'app.ts': [
+      'import * as loader from "./loader";',
+      'export async function run(x: loader.LoadResult) {',
+      '  const a = loader.sharedErrors;',
+      '  const b = loader["computedKey"];',
+      '  const { destructured } = loader;',
+      '  const { dynRead } = await import("./dyn");',
+      '  const mod = await import("./dyn2");',
+      '  return [x, a, b, destructured, dynRead(), mod.second()];',
+      '}',
+      'run({} as any);',
+    ].join('\n'),
+    'app.test.ts': 'import * as loader from "./loader"; jest.spyOn(loader, "spied");',
+    'loader.ts': [
+      'export interface LoadResult { ok: boolean }',
+      'export const sharedErrors = [];',
+      'export const computedKey = 1;',
+      'export const destructured = 2;',
+      'export function spied() {}',
+      'export const unused = 3;',
+    ].join('\n'),
+    'dyn.ts': 'export function dynRead() { return 1; } export const dynUnused = 2;',
+    'dyn2.ts': 'export function second() { return 2; } export const secondUnused = 3;',
+  });
+
+  const r = await inspect(t, root, { entries: { runtime: ['app.ts'], test: ['app.test.ts'], tooling: [] }, publicEntries: [] });
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.deepEqual(subject(r, 'loader.ts', 'LoadResult').usage.type, ['runtime']);
+  assert.deepEqual(subject(r, 'loader.ts', 'sharedErrors').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'loader.ts', 'computedKey').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'loader.ts', 'destructured').usage.value, ['runtime']);
+  assert.equal(subject(r, 'loader.ts', 'spied').kind, 'test-only-export');
+  assert.equal(subject(r, 'loader.ts', 'unused').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'dyn.ts', 'dynRead').usage.value, ['runtime']);
+  assert.equal(subject(r, 'dyn.ts', 'dynUnused').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'dyn2.ts', 'second').usage.value, ['runtime']);
+  assert.equal(subject(r, 'dyn2.ts', 'secondUnused').kind, 'unused-export');
+});
+
+test('CommonJS require, module.exports, exports properties and TS import types retain exact bindings', async t => {
+  const root = await fixture(t, {
+    'app.cjs': [
+      'const { add } = require("./math.cjs");',
+      'const greet = require("./greet.cjs");',
+      'const util = require("./util.cjs");',
+      'if (require.main === module) console.log(add(1, 2), greet(), util.fmt());',
+    ].join('\n'),
+    'math.cjs': 'function add(a, b) { return a + b; } function unused() {} module.exports = { add, unused };',
+    'greet.cjs': 'module.exports = function greet() { return "hi"; };',
+    'util.cjs': 'exports.fmt = () => "ok"; exports.dead = () => "no";',
+    'types-user.ts': 'type Val = import("./types").MyVal; void (null as unknown as Val);',
+    'types.ts': 'export interface MyVal { v: number } export interface UnusedVal { u: number }',
+  });
+
+  const r = await inspect(t, root, { entries: { runtime: ['app.cjs', 'types-user.ts'], test: [], tooling: [] }, publicEntries: [] });
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.deepEqual(subject(r, 'math.cjs', 'add').usage.value, ['runtime']);
+  assert.equal(subject(r, 'math.cjs', 'unused').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'greet.cjs', 'default').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'util.cjs', 'fmt').usage.value, ['runtime']);
+  assert.equal(subject(r, 'util.cjs', 'dead').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'types.ts', 'MyVal').usage.type, ['runtime']);
+  assert.equal(subject(r, 'types.ts', 'UnusedVal').kind, 'unused-export');
+});
+
+test('git base diff scopes findings to changed files and marks introduced vs pre-existing', async t => {
+  const root = await fixture(t, {
+    'app.ts': 'import { used } from "./lib"; used();',
+    'lib.ts': 'export function used() {} export function oldDead() {}',
+    'untouched.ts': 'export function untouchedDead() {}',
+  });
+  const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
+  git('init', '-q');
+  git('config', 'user.email', 'test@example.com');
+  git('config', 'user.name', 'Test');
+  git('add', '.');
+  git('commit', '-q', '-m', 'base');
+
+  await writeFile(join(root, 'lib.ts'), 'export function used() {} export function oldDead() {} export function newDead() {}');
+  await writeFile(join(root, 'newfile.ts'), 'export const orphanExport = 1;');
+
+  const r = await inspect(t, root, { ...app, base: 'HEAD' });
+  assert.equal(r.diff.base, 'HEAD');
+  assert.deepEqual(r.diff.changedFiles, ['lib.ts', 'newfile.ts']);
+  assert.equal(r.diff.preExisting, 1);
+  assert.equal(r.diff.introduced, 3);
+  const all = r.findings();
+  assert.ok(!all.some(f => f.file === 'untouched.ts'));
+  assert.equal(all.find(f => f.exportName === 'oldDead')?.diff, 'pre-existing');
+  assert.equal(all.find(f => f.exportName === 'newDead')?.diff, 'introduced');
+  assert.deepEqual(
+    r.findings({ diff: 'introduced' }).map(f => `${f.file}:${f.exportName ?? '<mod>'}`).sort(),
+    ['lib.ts:newDead', 'newfile.ts:<mod>', 'newfile.ts:orphanExport'],
+  );
+  assert.equal(subject(r, 'lib.ts', 'newDead').diff, 'introduced');
+  assert.equal(subject(r, 'lib.ts', 'oldDead').diff, 'pre-existing');
+});
+
+test('manifest plugin hosts, runtime scripts, bundler exposes, child processes and Storybook stories are discovered', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({
+      scripts: { start: 'sh -c \'exec node -r ts-node/register server.ts "$@"\' --' },
+      'plugin-host': { nodes: { demo: { file: 'nodes/demo.js' } }, plugins: { plug: 'nodes/plug.js' } },
+      'custom-host': { nodes: { extra: { file: 'nodes/extra.js' } } },
+    }),
+    'server.ts': [
+      'import { fork } from "node:child_process";',
+      'import path from "node:path";',
+      'const child = require.resolve("./child");',
+      'fork(child);',
+      'new Worker(new URL("./worker.ts", import.meta.url));',
+      'fork(path.join(__dirname, "child2.ts"));',
+    ].join('\n'),
+    'child.ts': 'import { childHelper } from "./helpers"; childHelper();',
+    'child2.ts': 'import { child2Helper } from "./helpers"; child2Helper();',
+    'worker.ts': 'import { workerHelper } from "./helpers"; workerHelper();',
+    'helpers.ts': 'export function childHelper() {} export function child2Helper() {} export function workerHelper() {} export function deadHelper() {}',
+    'nodes/demo.js': 'const { nodeWork } = require("./node-lib.js"); module.exports = function(host) { nodeWork(host); };',
+    'nodes/demo.html': '<script src="demo-ui.js"></script>',
+    'nodes/demo-ui.js': 'console.log("ui");',
+    'nodes/plug.js': 'module.exports = function(host) { void host; };',
+    'nodes/extra.js': 'module.exports = function(host) { void host; };',
+    'nodes/node-lib.js': 'exports.nodeWork = () => {};',
+    'vite.config.ts': 'export default { plugins: [federation({ exposes: { "./Widget": "./src/widget.tsx" } })] };',
+    'src/widget.tsx': 'export function Widget() { return null; }',
+    '.storybook/main.ts': 'export default { stories: ["../src/**/*.stories.@(ts|tsx)"] };',
+    'src/Widget.stories.tsx': 'import { storyHelper } from "./story-helper"; export default { title: "W" }; export const Primary = () => storyHelper();',
+    'src/story-helper.ts': 'export function storyHelper() { return 1; }',
+  });
+
+  const r = await inspect(t, root);
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.deepEqual(subject(r, 'nodes/node-lib.js', 'nodeWork').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'nodes/demo-ui.js').usage.evaluation, ['runtime']);
+  assert.deepEqual(subject(r, 'src/widget.tsx', 'Widget').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'helpers.ts', 'childHelper').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'helpers.ts', 'child2Helper').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'helpers.ts', 'workerHelper').usage.value, ['runtime']);
+  assert.equal(subject(r, 'helpers.ts', 'deadHelper').kind, 'unused-export');
+  assert.equal(subject(r, 'src/Widget.stories.tsx', 'Primary').kind, null);
+  assert.equal(subject(r, 'src/Widget.stories.tsx', 'default').kind, null);
+  assert.equal(subject(r, 'src/story-helper.ts', 'storyHelper').kind, 'tooling-only-export');
+});
+
+test('static import.meta.glob, inline primaryGaps and NDJSON CLI stream compact findings', async t => {
+  const root = await fixture(t, {
+    'app.ts': [
+      'const parts = import.meta.glob(["./parts/*.ts", "!./parts/*.ignored.ts"], { import: "default" });',
+      'const docs = import.meta.glob("./docs/*.md", { query: "?raw" });',
+      'void parts; void docs;',
+    ].join('\n'),
+    'parts/a.ts': 'export default function a() {} export const extra = 1;',
+    'parts/b.ignored.ts': 'export default function b() {}',
+    'orphan.ts': 'export const unused = 42;',
+  });
+
+  const r = await inspect(t, root, app);
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.deepEqual(subject(r, 'parts/a.ts', 'default').usage.value, ['runtime']);
+  assert.equal(subject(r, 'parts/a.ts', 'extra').kind, 'unused-export');
+  assert.equal(subject(r, 'parts/b.ignored.ts').kind, 'unreferenced-module');
+  assert.deepEqual(subject(r, 'orphan.ts', 'unused').primaryGaps, []);
+
+  await writeFile(join(root, 'app.ts'), 'import(dynSpec); import "./parts/a";');
+  const stdout = execFileSync(process.execPath, [
+    cliPath,
+    '--root', root,
+    '--entries', 'runtime:app.ts',
+    '--entries', 'test:',
+    '--entries', 'tooling:',
+    '--entries', 'public:',
+    '--kind', 'unused-export',
+  ], { encoding: 'utf8' });
+  const lines = stdout.trim().split('\n').map(l => JSON.parse(l));
+  assert.ok(lines.length >= 2);
+  for (const item of lines) {
+    assert.equal(item.kind, 'unused-export');
+    assert.equal(item.status, 'conditional');
+    assert.equal(item.gapIds, undefined);
+    assert.equal(item.gapCount, 1);
+    assert.equal(item.primaryGaps.length, 1);
+    assert.equal(item.primaryGaps[0].code, 'computed-import');
+  }
 });
