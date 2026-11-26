@@ -1002,3 +1002,38 @@ test('type-only @types fallback, tsdown outDir, tsconfig compiled-type paths, de
   assert.equal(subject(r, 'packages/helper/mod.d.ts', 'UnusedOpts').kind, 'unused-export');
   assert.deepEqual(subject(r, 'packages/default-only/src/index.ts', 'runHelper').usage.value, ['runtime']);
 });
+
+test('export type star from .d.ts, mixed value/type companion .d.ts, declaration merging and ambient declarations resolve cleanly', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ workspaces: ['packages/*'], bin: { app: './app.ts' } }),
+    'app.ts': [
+      'import type { SharedApi } from "./lib/shared";',
+      'import { runTool, type ToolReceipt } from "./tool.mjs";',
+      'import { Merged } from "./merged";',
+      'const x: SharedApi = { id: "1" };',
+      'const y: ToolReceipt = { ok: true };',
+      'console.log(runTool(), x, y, Merged);',
+    ].join('\n'),
+    'reexport.ts': 'export type * from "./types/shared";',
+    'types/shared.d.ts': 'export type { SharedApi, UnusedShared } from "@org/types";',
+    'tsconfig.types.json': JSON.stringify({ compilerOptions: { outDir: './types', rootDir: './lib' } }),
+    'lib/shared.ts': 'export type * from "../types/shared";',
+    'packages/types/package.json': JSON.stringify({ name: '@org/types', exports: { '.': './index.ts' } }),
+    'packages/types/index.ts': 'export interface SharedApi { id: string } export interface GlobalUser { name: string } export interface UnusedShared { x: number }',
+    'tool.mjs': 'export function runTool() { return 1; }',
+    'tool.d.ts': 'export interface ToolReceipt { ok: boolean } export interface UnusedReceipt { no: boolean }',
+    'merged.ts': 'export interface Merged { value: number } export const Merged = { value: 1 };',
+    'ambient.d.ts': 'import type { GlobalUser } from "@org/types"; declare global { namespace Req { interface Context { user?: GlobalUser; } } } export {};',
+  });
+
+  const r = await inspect(t, root, { publicEntries: [] });
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.deepEqual(subject(r, 'packages/types/index.ts', 'SharedApi').usage.type, ['runtime']);
+  assert.deepEqual(subject(r, 'packages/types/index.ts', 'GlobalUser').usage.type, ['runtime']);
+  assert.deepEqual(subject(r, 'packages/types/index.ts', 'GlobalUser').usage.evaluation, []);
+  assert.equal(subject(r, 'packages/types/index.ts', 'UnusedShared').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'tool.mjs', 'runTool').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'tool.d.ts', 'ToolReceipt').usage.type, ['runtime']);
+  assert.equal(subject(r, 'tool.d.ts', 'UnusedReceipt').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'merged.ts', 'Merged').usage.value, ['runtime']);
+});

@@ -421,6 +421,7 @@ impl Project {
             } else {
                 if role == Role::Runtime {
                     crate::discover::discover_bundler_entries(&mut project);
+                    crate::discover::discover_ambient_declarations(&mut project);
                 }
                 for (dir, pkg) in &packages {
                     if role == Role::Runtime {
@@ -875,6 +876,7 @@ impl Project {
                         &rel,
                         type_only,
                     )
+                    && id != file
                 {
                     return Ok(Some(id));
                 }
@@ -956,6 +958,7 @@ impl Project {
                         Path::new(&rel),
                         type_only,
                     )
+                    && id != file
                 {
                     return Ok(Some(id));
                 }

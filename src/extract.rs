@@ -856,6 +856,11 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
             .entry(export.statement_span.start)
             .or_insert(true) &= export.is_type;
     }
+    for export in &record.star_export_entries {
+        *import_phases
+            .entry(export.statement_span.start)
+            .or_insert(true) &= export.is_type;
+    }
     let mut requests = BTreeMap::new();
     let mut occurrences: Vec<_> = record
         .requested_modules
@@ -1013,14 +1018,43 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                 None,
             );
         }
-        out.module.exports.insert(
-            name.into(),
-            Export {
-                surface,
-                binding,
-                explicit: true,
-            },
-        );
+        if let Some(existing) = out.module.exports.get(name) {
+            if binding != surface {
+                out.edge(existing.surface, binding, export.is_type, loc);
+            } else {
+                out.edge(existing.surface, surface, export.is_type, loc);
+            }
+        } else {
+            out.module.exports.insert(
+                name.into(),
+                Export {
+                    surface,
+                    binding,
+                    explicit: true,
+                },
+            );
+        }
+    }
+
+    // Companion declaration files (`.d.ts`/`.d.mts`/`.d.cts`) augment their sibling JS module's type surface.
+    if let Some(js_base) = [".js", ".mjs", ".cjs"]
+        .iter()
+        .find_map(|ext| out.path.strip_suffix(ext))
+    {
+        for dts in ["d.ts", "d.mts", "d.cts"] {
+            if let Ok(companion) = project
+                .graph
+                .paths
+                .binary_search(&format!("{js_base}.{dts}"))
+            {
+                out.module.stars.push(Edge {
+                    target: companion,
+                    type_only: true,
+                    loc: Loc::default(),
+                });
+                break;
+            }
+        }
     }
 
     for export in &record.star_export_entries {

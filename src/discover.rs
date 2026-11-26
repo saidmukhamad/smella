@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use oxc_allocator::Allocator;
 use oxc_ast::{
     AstKind,
-    ast::{Expression, ObjectPropertyKind, PropertyKey},
+    ast::{
+        Expression, ObjectPropertyKind, PropertyKey, Statement, TSModuleDeclarationKind,
+        TSModuleDeclarationName,
+    },
 };
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
@@ -451,6 +454,60 @@ pub fn discover_bundler_entries(project: &mut Project) {
         }
     }
     project.roots.extend(new_roots);
+}
+
+/// Discover ambient declaration files (`.d.ts`/`.d.mts`/`.d.cts` containing `declare global`
+/// or `declare module` augmentations) that TypeScript automatically includes in compilation.
+pub fn discover_ambient_declarations(project: &mut Project) {
+    let candidates: Vec<String> = project
+        .graph
+        .paths
+        .iter()
+        .filter(|p| p.ends_with(".d.ts") || p.ends_with(".d.mts") || p.ends_with(".d.cts"))
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let mut arena = Allocator::default();
+    let mut ambient = Vec::new();
+    for file in candidates {
+        let abs = project.root.join(&file);
+        let Ok(source) = fs::read_to_string(&abs) else {
+            continue;
+        };
+        if !source.contains("declare ") {
+            continue;
+        }
+        arena.reset();
+        let parsed = Parser::new(
+            &arena,
+            &source,
+            SourceType::from_path(&abs).unwrap_or_default(),
+        )
+        .parse();
+        if parsed.panicked {
+            continue;
+        }
+        let is_ambient = parsed.program.body.iter().any(|stmt| {
+            matches!(
+                stmt,
+                Statement::TSModuleDeclaration(m)
+                    if m.kind == TSModuleDeclarationKind::Global
+                        || matches!(m.id, TSModuleDeclarationName::StringLiteral(_))
+            )
+        });
+        if is_ambient {
+            ambient.push(Root {
+                file,
+                role: Role::Runtime,
+                origin: "discovered",
+                input: "ambient-declaration".into(),
+                mode: RootEntryMode::ModuleOnly,
+            });
+        }
+    }
+    project.roots.extend(ambient);
 }
 
 pub fn discover_extra_tooling_configs(project: &mut Project) {
