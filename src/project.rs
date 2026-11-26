@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use globset::{GlobBuilder, GlobMatcher};
+use ignore::WalkBuilder;
 use oxc_resolver::{
     ResolveError, ResolveOptions, Resolver, TsconfigDiscovery, TsconfigOptions, TsconfigReferences,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use walkdir::WalkDir;
 
 use crate::deps::{
     WorkspaceManifest, manifest_bins, manifest_dep_set, manifest_path_for, manifest_scripts,
@@ -205,9 +207,56 @@ impl Project {
         let mut config_dirs = BTreeMap::new();
         let mut tsconfig_files = vec![];
         let mut bundler_configs = vec![];
-        let mut walker = WalkDir::new(&root).sort_by_file_name().into_iter();
-        while let Some(entry) = walker.next() {
+        let in_git_repo = root.ancestors().any(|a| a.join(".git").exists());
+        let exclude_filter = exclude.clone();
+        let exclude_hits: Arc<Vec<AtomicBool>> =
+            Arc::new((0..exclude.len()).map(|_| AtomicBool::new(false)).collect());
+        let exclude_hits_cb = Arc::clone(&exclude_hits);
+        let excluded_dirs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let excluded_dirs_cb = Arc::clone(&excluded_dirs);
+        let root_cb = root.clone();
+        let mut builder = WalkBuilder::new(&root);
+        builder
+            .hidden(false)
+            .follow_links(false)
+            .git_ignore(true)
+            .git_exclude(true)
+            .git_global(false)
+            .ignore(false)
+            .require_git(in_git_repo)
+            .parents(in_git_repo)
+            .sort_by_file_name(|a, b| a.cmp(b))
+            .filter_entry(move |entry| {
+                if entry.depth() == 0 {
+                    return true;
+                }
+                if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                    let file = entry
+                        .path()
+                        .strip_prefix(&root_cb)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let name = entry.file_name().to_string_lossy();
+                    let mut excluded_by_rule = false;
+                    for (idx, p) in exclude_filter.iter().enumerate() {
+                        if p.is_match(&file) {
+                            exclude_hits_cb[idx].store(true, Ordering::Relaxed);
+                            excluded_by_rule = true;
+                        }
+                    }
+                    if SKIP.contains(&name.as_ref()) || excluded_by_rule {
+                        excluded_dirs_cb.lock().unwrap().push(format!("{file}/"));
+                        return false;
+                    }
+                }
+                true
+            });
+        for entry in builder.build() {
             let entry = entry.map_err(|e| format!("Cannot enumerate source scope: {e}"))?;
+            if entry.depth() == 0 || !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                continue;
+            }
             let file = entry
                 .path()
                 .strip_prefix(&root)
@@ -215,25 +264,6 @@ impl Project {
                 .to_string_lossy()
                 .replace('\\', "/");
             let name = entry.file_name().to_string_lossy();
-            if entry.file_type().is_dir() {
-                let mut excluded_by_rule = false;
-                if entry.depth() > 0 {
-                    for (idx, p) in exclude.iter().enumerate() {
-                        if p.is_match(&file) {
-                            exclude_matched[idx] = true;
-                            excluded_by_rule = true;
-                        }
-                    }
-                }
-                if entry.depth() > 0 && (SKIP.contains(&name.as_ref()) || excluded_by_rule) {
-                    excluded.push(format!("{file}/"));
-                    walker.skip_current_dir();
-                }
-                continue;
-            }
-            if !entry.file_type().is_file() {
-                continue;
-            }
             if nx_enabled && name == "project.json" {
                 nx_dirs.insert(Path::new(&file).parent().unwrap().to_owned());
             }
@@ -295,6 +325,13 @@ impl Project {
                 excluded.push(file);
             }
         }
+        for (idx, hit) in exclude_hits.iter().enumerate() {
+            if hit.load(Ordering::Relaxed) {
+                exclude_matched[idx] = true;
+            }
+        }
+        excluded.extend(std::mem::take(&mut *excluded_dirs.lock().unwrap()));
+        excluded.sort();
         let mut non_js_bins = BTreeSet::new();
         for manifest_path in &manifests {
             let Ok(pkg) = json(manifest_path) else {

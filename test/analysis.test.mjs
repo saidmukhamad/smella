@@ -1393,3 +1393,23 @@ test('package scripts discover tooling entries and CLI --check gates findings cl
   assert.equal(failed.code, 1);
   assert.ok(failed.stdout.includes('orphan'));
 });
+
+test('git-ignored build outputs are skipped while workspace source mapping still resolves them', async t => {
+  const root = await fixture(t, {
+    '.gitignore': 'packages/*/lib/\n*.generated.ts\n',
+    'package.json': JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
+    'packages/core/package.json': JSON.stringify({ name: '@mono/core', main: './lib/index.js', types: './lib/index.d.ts' }),
+    'packages/core/tsconfig.json': JSON.stringify({ compilerOptions: { rootDir: 'src', outDir: 'lib' } }),
+    'packages/core/src/index.ts': 'export function greet() { return "hi"; }',
+    'packages/core/lib/index.js': 'exports.greet = () => "hi"; exports.compiledNoise = () => 0;',
+    'packages/core/lib/index.d.ts': 'export declare function greet(): string;',
+    'packages/app/package.json': JSON.stringify({ name: '@mono/app', bin: { app: './src/main.ts' }, dependencies: { '@mono/core': '*' } }),
+    'packages/app/src/main.ts': 'import { greet } from "@mono/core"; console.log(greet());',
+    'packages/app/src/schema.generated.ts': 'export const generatedUnused = 1;',
+  });
+  const r = await inspect(t, root);
+  assert.equal(r.coverage.status, 'complete');
+  assert.ok(!r.coverage.files.some(f => f.includes('/lib/') || f.endsWith('.generated.ts')));
+  assert.deepEqual(subject(r, 'packages/core/src/index.ts', 'greet').usage.value, ['runtime']);
+  assert.deepEqual(r.findings(), []);
+});
