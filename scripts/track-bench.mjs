@@ -46,8 +46,9 @@ try {
     await mkdir(dir,{recursive:true});
     const filename = observedAt.replaceAll(':','-')+'-'+revision.slice(0,7)+'.json';
     await writeFile(join(dir,filename),JSON.stringify(entry,null,2)+'\n',{flag:'wx'});
-    console.log('Recorded',filename);
+    console.log('Recorded benchmarks/history/' + filename);
     run(process.execPath,['scripts/plot-bench.mjs']);
+    console.log('Updated benchmarks/history/progress.png');
   }
   console.table(entry.checks);
   if (check && entry.checks.some(c=>!c.pass)) process.exitCode=1;

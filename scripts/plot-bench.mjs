@@ -5,9 +5,13 @@ import { fileURLToPath } from 'node:url';
 const repo = fileURLToPath(new URL('..',import.meta.url));
 const folder = new URL('../benchmarks/history/',import.meta.url);
 const targets = JSON.parse(await readFile(new URL('../benchmarks/targets.json',import.meta.url),'utf8'));
-const entries = await Promise.all((await readdir(folder)).filter(f=>f.endsWith('.json')).sort().map(async f=>
+const files = await readdir(folder).catch(error => {
+  if (error.code === 'ENOENT') return [];
+  throw error;
+});
+const entries = await Promise.all(files.filter(f=>f.endsWith('.json')).sort().map(async f=>
   JSON.parse(await readFile(new URL(f,folder),'utf8'))));
-if (!entries.length) throw new Error('Record a benchmark before plotting');
+if (!entries.length) throw new Error('Run npm run bench:record to create the first local benchmark.');
 const latest = entries.at(-1).machine;
 const comparable = entries.filter(e=>['cpu','arch','platform','os','node','rust'].every(k=>e.machine[k]===latest[k]));
 const data = [
@@ -21,7 +25,7 @@ function quote(s) { return "'"+s.replaceAll("'","''").replaceAll('\n',' ')+"'"; 
 const labels = comparable.map((e,i)=>quote(e.revision.slice(0,7))+' '+(i+1)).join(', ');
 const program = [
   "set terminal pngcairo size 1560,1220 font 'DejaVu Sans,15' noenhanced",
-  "set output 'benchmarks/progress.png'",
+  "set output 'benchmarks/history/progress.png'",
   "set multiplot layout 3,2 rowsfirst title 'Smella benchmark history  ·  milliseconds per run' font ',23'",
   "set border 3 lc rgb '#73838f'",
   "set grid ytics back lc rgb '#e0e6eb'",

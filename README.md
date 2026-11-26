@@ -95,6 +95,6 @@ Once Smella reaches a function or class, it follows references in its body. A ru
 
 Run `npm test` for the Node suite. After building the addon, run `bun test test/analysis.test.mjs` for Bun. The public corpus checks specific call paths against pinned checkouts of React, Nx, and Transformers.js. [Corpus setup](benchmarks/README.md#verify-upstream-behavior)
 
-`npm run bench` measures fresh and resident Node processes on a 513-file export chain. Set `KNIP_BIN` to a Knip executable to compare both tools on the same expected findings. `npm run bench:record` records a run and updates the progress plot. [Workloads, measurements and targets](benchmarks/README.md)
+`npm run bench` measures fresh and resident Node processes on a 513-file export chain. Set `KNIP_BIN` to a Knip executable to compare both tools on the same expected findings. `npm run bench:record` saves raw timings and a plot in the Git-ignored `benchmarks/history/` directory. [Workloads, measurements and targets](benchmarks/README.md)
 
 To package a Linux x64 glibc build, run `npm pack` in `npm/linux-x64-gnu` and again in the repository root. This produces tarballs for the native addon and its JavaScript loader.

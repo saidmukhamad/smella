@@ -21,11 +21,11 @@ Each latency series uses 20 samples and nearest-rank percentiles. The resident s
 
 On the matched 513-file workload, resident p95 went from 8.06 ms at `16539b5` to 3.46 ms at `5defc13`. On the latter revision, cold p50 was 41.13 ms for Smella and 225.29 ms for Knip 6.48.0. Both produced the same 512 unused export pairs.
 
-The first 32-package run took 8.08 ms at p95 including its explanation. Many callers shared a suffix of the same reference path. Encoding each suffix once across the native boundary reduced full-query p95 to 2.00 ms, including findings, all 64 test origins, and the caller paths. The reference-machine target went from 25 ms to 6 ms. All seven published gates passed, including the package size checks. [Before entry](history/2026-11-25T15-13-06.523Z-c1b2300.json) · [After entry](history/2026-11-25T15-16-17.851Z-5defc13.json)
+The first 32-package run took 8.08 ms at p95 including its explanation. Many callers shared a suffix of the same reference path. Encoding each suffix once across the native boundary reduced full-query p95 to 2.00 ms, including findings, all 64 test origins, and the caller paths. The reference-machine target went from 25 ms to 6 ms. All seven published gates passed, including the package size checks.
 
 ## Nx and React measurement
 
-The first release build with Nx target discovery and React lazy-loader tracing took 1.08 ms at p95 for the four-project fixture, including all findings and two explanations. The target is 3 ms. On the matched 513-file chain, cold p95 was 46.41 ms for Smella and 241.52 ms for Knip 6.48.0. Each reported the same 512 unused exports. The Nx/React comparison records the actual Knip issue lists separately from the timed Smella run. [Measurement and comparison](history/2026-11-25T16-26-03.443Z-014d590.json)
+The first release build with Nx target discovery and React lazy-loader tracing took 1.08 ms at p95 for the four-project fixture, including all findings and two explanations. The target is 3 ms. On the matched 513-file chain, cold p95 was 46.41 ms for Smella and 241.52 ms for Knip 6.48.0. Each reported the same 512 unused exports. The Nx/React comparison records the actual Knip issue lists separately from the timed Smella run.
 
 ## Verify upstream behavior
 
@@ -54,16 +54,18 @@ An assertion or revision mismatch fails the run. These checks establish the sele
 
 ## Record progress
 
-From a checkout with Rust 1.88+, Node 24, npm, and Gnuplot with the pngcairo terminal, run:
+With Rust 1.88+, Node 24, npm and Gnuplot (pngcairo), run the following command to record a measurement.
 
 ```sh
 npm run bench:record
 ```
 
-This builds the release addon, writes a timestamped JSON entry, refreshes the plot, and returns a nonzero status for a missed budget. Failed measurements stay in the history. Use `npm run bench:check` to measure without writing history, and `npm run bench:plot` to regenerate the PNG from existing entries. Git status is recorded so development runs are distinguishable from pinned clean revisions.
+Each run saves a timestamped JSON file and updates `benchmarks/history/progress.png`. Git ignores that directory. The recorder keeps measurements that miss a budget and exits with a failure. Each file includes the Git revision, working tree status and active thresholds.
+
+Use `npm run bench:check` to check the budgets without recording a run. Use `npm run bench:plot` to redraw the local chart. To update the chart in this README, copy a reviewed local plot to `benchmarks/progress.png`.
 
 Set `KNIP_BIN` to the executable from a separate installation of Knip 6.48.0 with TypeScript 6.0.3 to run the matched comparison. The independent behavioral comparison uses `KNIP_BIN=/path/to/knip node scripts/compare-test-usage.mjs`.
 
-The plot groups runs matching the most recent machine and toolchain. Points correspond to stored runs. Dashed lines show today's targets, and missing measurements stay blank. Historical entries predating the tracker carry their source. [Measurement entries](history/)
+The plot groups runs matching the most recent machine and toolchain. Points correspond to stored runs. Dashed lines show today's targets, and missing measurements stay blank.
 
 ![Smella latency by revision and current p95 targets](progress.png)
