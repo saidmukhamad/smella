@@ -6,7 +6,7 @@ In the example below, searching the test files for `resetFixture` misses the cal
 
 ## Try it on a fixture
 
-Build from this checkout with Rust 1.88 or later and Node 24. The compiled addon also runs on Bun. The packaged native target is Linux x64 with glibc.
+Build from this checkout with Rust 1.88 or later and Node 22 or later. The compiled addon also runs on Bun. The packaged native target is Linux x64 with glibc.
 
 ```sh
 npm run build

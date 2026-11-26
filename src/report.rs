@@ -94,9 +94,13 @@ impl Report {
         let mut project = Project::open(root, config)?;
         let file_count = project.graph.paths.len();
         let mut roles = vec![0u8; file_count];
+        let mut entry_exports_used = vec![false; file_count];
         for root in &project.roots {
             let file = project.graph.paths.binary_search(&root.file).unwrap();
             roles[file] |= 1 << root.role as usize;
+            if root.mode == crate::graph::RootEntryMode::AllExports {
+                entry_exports_used[file] = true;
+            }
         }
         // Reuse workers across concurrent snapshots, and arenas across files.
         static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
@@ -189,12 +193,17 @@ impl Report {
                 kind,
             });
             for e in module.exports.values() {
+                let kind = if entry_exports_used[file] {
+                    None
+                } else {
+                    classification(&reach.visited[e.binding])
+                };
                 subjects.push(Subject {
                     file,
                     surface: e.surface,
                     binding: e.binding,
                     form: Form::Export,
-                    kind: classification(&reach.visited[e.binding]),
+                    kind,
                 });
             }
             private[file].sort_by(|&a, &b| graph.nodes[a].name.cmp(&graph.nodes[b].name));

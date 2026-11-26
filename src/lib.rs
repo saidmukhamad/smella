@@ -1,3 +1,4 @@
+mod discover;
 mod evidence;
 mod extract;
 mod graph;
@@ -5,6 +6,7 @@ mod nx;
 mod project;
 mod react;
 mod report;
+mod source_map;
 
 use std::path::Path;
 
