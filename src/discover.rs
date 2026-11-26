@@ -310,6 +310,45 @@ fn collect_shell_subcommands(script: &str, out: &mut Vec<Vec<String>>) {
     }
 }
 
+pub fn discover_tooling_scripts(project: &mut Project, packages: &[(PathBuf, Value)]) {
+    for (dir, pkg) in packages {
+        let Some(scripts) = pkg["scripts"].as_object() else {
+            continue;
+        };
+        let manifest = dir.join("package.json");
+        for (name, val) in scripts {
+            if name == "start" {
+                continue;
+            }
+            let Some(script) = val.as_str() else {
+                continue;
+            };
+            let mut subcommands = Vec::new();
+            collect_shell_subcommands(script, &mut subcommands);
+            let label = format!("{}#scripts.{name}", manifest.display());
+            for cmd in &subcommands {
+                if let Some(entry_arg) = extract_runner_entry(cmd) {
+                    let rel = dir.join(entry_arg.trim_start_matches("./"));
+                    if let Some(id) = project.source_mapper.map_to_source(
+                        &project.root,
+                        &project.graph.paths,
+                        &rel,
+                    ) {
+                        let file = project.graph.paths[id].clone();
+                        project.roots.push(Root {
+                            file,
+                            role: Role::Tooling,
+                            origin: "discovered",
+                            input: label.clone(),
+                            mode: RootEntryMode::ModuleOnly,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn parse_start_script(
     project: &Project,
     pkg_dir: &Path,

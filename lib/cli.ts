@@ -32,6 +32,8 @@ Options:
                       With --base: filter diff status ("introduced" | "pre-existing").
   --staged            Diff staged git index against HEAD (or HEAD + MERGE_HEAD),
                       exiting 1 if any finding is introduced
+  --check             Report all findings in human format and exit 1 if any
+                      finding or stale config entry is present
   --all               Report all findings without failing (always exits 0)
   --dependencies      Include dependency findings (unused-dependency,
                       unlisted-dependency, unlisted-binary, dev-dependency-in-runtime)
@@ -227,6 +229,14 @@ function renderHuman(
     }
   }
   const introduced = findings.filter(f => f.diff === 'introduced').length;
+  if (report.staleConfig.length > 0) {
+    lines.push('[stale-config]');
+    for (const entry of report.staleConfig) {
+      const target = entry.pattern ?? (entry.file ? `${entry.file}${entry.symbol ? `#${entry.symbol}` : ''}` : entry.source);
+      lines.push(`  ${entry.kind}  ${target}  ${entry.message}`);
+    }
+    lines.push('');
+  }
   const conditional = findings.filter(f => f.status === 'conditional').length;
   const header =
     hookMode && report.diff
@@ -249,6 +259,7 @@ async function main(): Promise<void> {
         base: { type: 'string' },
         diff: { type: 'string' },
         staged: { type: 'boolean', default: false },
+        check: { type: 'boolean', default: false },
         all: { type: 'boolean', default: false },
         kind: { type: 'string', multiple: true },
         dependencies: { type: 'boolean', default: false },
@@ -308,9 +319,16 @@ async function main(): Promise<void> {
   }
 
   const hookMode = Boolean(values.staged) || diffMode;
+  const checkMode = Boolean(values.check);
   const format =
     values.format ??
-    (values.json ? 'ndjson' : values.human ? 'human' : hookMode || values.all ? 'human' : 'ndjson');
+    (values.json
+      ? 'ndjson'
+      : values.human
+        ? 'human'
+        : hookMode || checkMode || values.all
+          ? 'human'
+          : 'ndjson');
 
   const workspaces: string[] = [];
   for (const raw of values.workspace ?? []) {
@@ -389,6 +407,8 @@ async function main(): Promise<void> {
     }
 
     if (hookMode && !values.all && findings.some(f => f.diff === 'introduced')) {
+      process.exitCode = 1;
+    } else if (checkMode && !values.all && (findings.length > 0 || report.staleConfig.length > 0)) {
       process.exitCode = 1;
     }
   } catch (err) {

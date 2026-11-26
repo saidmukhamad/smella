@@ -1360,3 +1360,36 @@ test('hook modes support --staged, --diff merge-base, two-parent merge commits, 
   assert.ok(!dirtyMerge.stdout.includes('deadA'));
   assert.ok(!dirtyMerge.stdout.includes('deadB'));
 });
+
+test('package scripts discover tooling entries and CLI --check gates findings cleanly', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({
+      name: 'tooling-check-demo',
+      type: 'module',
+      bin: { demo: './src/cli.ts' },
+      scripts: { build: 'bun scripts/build.mjs --release' },
+    }),
+    'src/cli.ts': 'export function run() { return 1; } run();',
+    'scripts/build.mjs': 'import { helper } from "./util.mjs"; helper();',
+    'scripts/util.mjs': '/** @smella-ignore Shared build helper */\nexport function helper() { return 2; }\n',
+  });
+  const r = await inspect(t, root);
+  assert.deepEqual(r.findings(), []);
+  assert.ok(r.roots.some(entry => entry.role === 'tooling' && entry.file === 'scripts/build.mjs'));
+  assert.equal(r.suppressed.length, 1);
+  assert.equal(r.suppressed[0].kind, 'tooling-only-export');
+
+  const runCli = (...args) => {
+    try {
+      return { code: 0, stdout: execFileSync(process.execPath, [cliPath, '--root', root, ...args], { encoding: 'utf8' }) };
+    } catch (err) {
+      return { code: err.status, stdout: err.stdout?.toString() ?? '' };
+    }
+  };
+  assert.equal(runCli('--check').code, 0);
+
+  await writeFile(join(root, 'src/dead.ts'), 'export const orphan = 1;');
+  const failed = runCli('--check');
+  assert.equal(failed.code, 1);
+  assert.ok(failed.stdout.includes('orphan'));
+});
