@@ -26,7 +26,7 @@ use crate::deps::{PackageRef, extract_dep_package};
 use crate::graph::{
     Edge, Export, Gap, GapScope, Graph, Id, Link, Loc, Module, Node, NodeKind, PendingGap, RawEdge,
 };
-use crate::project::{Project, StaleConfigItem};
+use crate::project::{Project, ResolveCache, StaleConfigItem};
 
 #[derive(Clone, Debug)]
 pub struct InlineSuppression {
@@ -125,10 +125,9 @@ impl FileSummary {
     }
     fn record_pkg_ref(&mut self, project: &Project, spec: &str, type_only: bool, span: Span) {
         if let Some(package) = extract_dep_package(spec)
-            && project
+            && !project
                 .source_mapper
-                .matches_tsconfig_path(Path::new(&project.graph.paths[self.file]), spec)
-                .is_empty()
+                .is_tsconfig_path_match(Path::new(&project.graph.paths[self.file]), spec)
         {
             self.package_refs.push(PackageRef {
                 file: self.file,
@@ -138,9 +137,11 @@ impl FileSummary {
             });
         }
     }
+    #[allow(clippy::too_many_arguments)]
     fn target_with_mode(
         &mut self,
         project: &Project,
+        cache: &mut ResolveCache,
         spec: &str,
         span: Span,
         guard: Option<Id>,
@@ -148,7 +149,7 @@ impl FileSummary {
         cjs: bool,
     ) -> Option<Id> {
         self.record_pkg_ref(project, spec, type_only, span);
-        match project.resolve_with_mode(self.file, spec, type_only, cjs) {
+        match project.resolve_with_cache(self.file, spec, type_only, cjs, cache) {
             Ok(target) => target,
             Err(message) => {
                 let scope = project.scope_unresolved_import(self.file, spec);
@@ -1317,6 +1318,7 @@ pub fn summarize(
     entry_file: bool,
     arena: &mut Allocator,
     read_buf: &mut Vec<u8>,
+    resolve_cache: &mut ResolveCache,
 ) -> FileSummary {
     arena.reset();
     let mut summary = FileSummary {
@@ -1334,7 +1336,14 @@ pub fn summarize(
         used_dynamic_imports: false,
         parsed: false,
     };
-    summary.parsed = extract(project, &mut summary, arena, read_buf, entry_file);
+    summary.parsed = extract(
+        project,
+        &mut summary,
+        arena,
+        read_buf,
+        resolve_cache,
+        entry_file,
+    );
     summary
 }
 
@@ -1343,6 +1352,7 @@ fn extract(
     out: &mut FileSummary,
     arena: &Allocator,
     read_buf: &mut Vec<u8>,
+    resolve_cache: &mut ResolveCache,
     entry_file: bool,
 ) -> bool {
     let file = out.file;
@@ -1478,7 +1488,15 @@ fn extract(
         let type_only = declaration_file
             || item.is_type
             || import_phases.get(&item.statement_span.start) == Some(&true);
-        let to = out.target_with_mode(project, spec, item.span, None, type_only, false);
+        let to = out.target_with_mode(
+            project,
+            resolve_cache,
+            spec,
+            item.span,
+            None,
+            type_only,
+            false,
+        );
         requests.insert(item.statement_span.start, to);
         if let Some(to) = to {
             out.edge(file, to, type_only, item.span.into());
@@ -1675,10 +1693,11 @@ fn extract(
                     type_only: export.is_type,
                     loc: spec.span.into(),
                 });
-            } else if !out.gaps.iter().any(|g| {
-                g.record.code == "unresolved-import"
-                    && g.record.file.as_ref() == Some(&project.graph.paths[file])
-            }) {
+            } else if !out
+                .gaps
+                .iter()
+                .any(|g| g.record.code == "unresolved-import")
+            {
                 out.gap(
                     "external-star",
                     Some(spec.span.into()),
@@ -2315,6 +2334,7 @@ fn extract(
                                 for from in owner.sources(file) {
                                     if let Some(to) = out.target_with_mode(
                                         project,
+                                        resolve_cache,
                                         spec,
                                         spec_span,
                                         Some(from),
@@ -2503,6 +2523,7 @@ fn extract(
                     if let Some((spec, spec_span)) = &static_spec {
                         if let Some(to) = out.target_with_mode(
                             project,
+                            resolve_cache,
                             spec.as_str(),
                             *spec_span,
                             Some(from),
@@ -2517,6 +2538,7 @@ fn extract(
                         for spec in configured {
                             if let Some(to) = out.target_with_mode(
                                 project,
+                                resolve_cache,
                                 spec.as_str(),
                                 expr.span,
                                 Some(from),
@@ -2642,9 +2664,15 @@ fn extract(
                 };
                 if let Some((spec, spec_span)) = literal_spec {
                     for from in owner.sources(file) {
-                        if let Some(to) =
-                            out.target_with_mode(project, spec, spec_span, Some(from), true, false)
-                        {
+                        if let Some(to) = out.target_with_mode(
+                            project,
+                            resolve_cache,
+                            spec,
+                            spec_span,
+                            Some(from),
+                            true,
+                            false,
+                        ) {
                             out.edge(from, to, true, loc);
                             if let Some(prop) = imp.qualifier.as_ref().and_then(leftmost_type_name)
                             {
@@ -2672,6 +2700,7 @@ fn extract(
                     TSModuleReference::ExternalModuleReference(ext) => {
                         if let Some(to) = out.target_with_mode(
                             project,
+                            resolve_cache,
                             ext.expression.value.as_str(),
                             ext.expression.span,
                             None,

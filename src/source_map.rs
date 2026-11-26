@@ -466,8 +466,13 @@ impl SourceMapper {
         }
     }
 
+    #[inline]
+    pub fn has_out_dirs(&self) -> bool {
+        !self.mappings.is_empty()
+    }
+
     pub fn is_in_out_dir(&self, rel: &Path) -> bool {
-        self.mappings.iter().any(|m| rel.starts_with(&m.out_dir))
+        !self.mappings.is_empty() && self.mappings.iter().any(|m| rel.starts_with(&m.out_dir))
     }
 
     pub fn lookup_direct(paths: &[String], rel: &Path) -> Option<Id> {
@@ -628,7 +633,33 @@ impl SourceMapper {
         None
     }
 
+    /// Fast zero-allocation check for whether `spec` matches any tsconfig `paths` rule for `file_rel`.
+    pub fn is_tsconfig_path_match(&self, file_rel: &Path, spec: &str) -> bool {
+        if self.tsconfig_paths.is_empty() {
+            return false;
+        }
+        let Some(rules) = file_rel
+            .ancestors()
+            .skip(1)
+            .find_map(|anc| self.tsconfig_paths.get(anc))
+        else {
+            return false;
+        };
+        rules.iter().any(|rule| {
+            if rule.wildcard {
+                spec.starts_with(&rule.prefix)
+                    && spec.ends_with(&rule.suffix)
+                    && spec.len() >= rule.prefix.len() + rule.suffix.len()
+            } else {
+                spec == rule.prefix
+            }
+        })
+    }
+
     pub fn matches_tsconfig_path(&self, file_rel: &Path, spec: &str) -> Vec<PathBuf> {
+        if self.tsconfig_paths.is_empty() {
+            return vec![];
+        }
         let Some(rules) = file_rel
             .ancestors()
             .skip(1)

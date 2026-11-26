@@ -127,6 +127,15 @@ pub struct WorkspaceInfo {
     pub name: Option<String>,
 }
 
+type ResolveResult = Result<Option<Id>, String>;
+
+/// Per-worker thread-local cache for module resolution plus a reusable path scratch buffer.
+#[derive(Default)]
+pub struct ResolveCache {
+    scratch: String,
+    entries: FxHashMap<(u32, u16, u8), FxHashMap<String, ResolveResult>>,
+}
+
 pub struct Project {
     pub root: PathBuf,
     pub roots: Vec<Root>,
@@ -135,6 +144,8 @@ pub struct Project {
     pub excluded: Vec<String>,
     resolvers: Vec<[Resolver; 2]>,
     file_profile: Vec<usize>,
+    pub file_dir_id: Vec<u32>,
+    has_custom_file_filter: bool,
     workspaces: BTreeMap<String, WorkspacePackage>,
     pub workspace_for_file: Vec<usize>,
     workspace_dirs: Vec<PathBuf>,
@@ -834,6 +845,8 @@ impl Project {
         #[cfg(not(target_os = "linux"))]
         let sources = Vec::new();
         let t_sources = std::time::Instant::now();
+        let has_custom_file_filter = include_raw.is_some() || !exclude_raw.is_empty();
+        let file_dir_id = compute_dir_ids(&paths);
         let mut project = Self {
             root,
             graph: Graph::new(paths),
@@ -843,6 +856,8 @@ impl Project {
             roots: vec![],
             resolvers,
             file_profile,
+            file_dir_id,
+            has_custom_file_filter,
             workspace_for_file,
             workspace_dirs,
             workspace_infos,
@@ -1480,6 +1495,157 @@ impl Project {
         GapScope::Files(vec![file as u32])
     }
 
+    /// Fast path for relative imports (`./`, `../`) directly against sorted `graph.paths`
+    /// using a reusable scratch buffer (zero syscalls, zero locks, zero heap allocations).
+    fn resolve_relative_fast(
+        &self,
+        file: Id,
+        spec: &str,
+        type_only: bool,
+        scratch: &mut String,
+    ) -> Option<Result<Option<Id>, String>> {
+        if !(spec.starts_with("./") || spec.starts_with("../")) || spec.contains(['?', '#']) {
+            return None;
+        }
+        let dir = dir_of(&self.graph.paths[file]);
+        if !normalize_relative_into(dir, spec, scratch) {
+            return None;
+        }
+        if self.source_mapper.has_out_dirs()
+            && self
+                .source_mapper
+                .is_in_out_dir(Path::new(scratch.as_str()))
+        {
+            return None;
+        }
+        let paths = &self.graph.paths;
+        if let Some(ext) = code_ext_of(scratch) {
+            if type_only && matches!(ext, "js" | "mjs" | "cjs") {
+                let base_len = scratch.len() - ext.len() - 1;
+                for dts in [".d.ts", ".d.mts", ".d.cts"] {
+                    scratch.truncate(base_len);
+                    scratch.push_str(dts);
+                    if let Ok(id) = paths.binary_search(scratch) {
+                        return Some(Ok(Some(id)));
+                    }
+                }
+                scratch.truncate(base_len);
+                scratch.push('.');
+                scratch.push_str(ext);
+            }
+            if let Ok(id) = paths.binary_search(scratch) {
+                return Some(Ok(Some(id)));
+            }
+            if !self.has_custom_file_filter {
+                let aliases: &[&str] = match (ext, type_only) {
+                    ("js", false) => &[".ts", ".tsx"],
+                    ("js", true) => &[".ts", ".tsx", ".d.ts"],
+                    ("jsx", _) => &[".tsx"],
+                    ("mjs", false) => &[".mts"],
+                    ("mjs", true) => &[".mts", ".d.mts"],
+                    ("cjs", false) => &[".cts"],
+                    ("cjs", true) => &[".cts", ".d.cts"],
+                    _ => &[],
+                };
+                if !aliases.is_empty() {
+                    let base_len = scratch.len() - ext.len() - 1;
+                    for alias in aliases {
+                        scratch.truncate(base_len);
+                        scratch.push_str(alias);
+                        if let Ok(id) = paths.binary_search(scratch) {
+                            return Some(Ok(Some(id)));
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+        let last_seg = scratch.rsplit('/').next().unwrap_or("");
+        if !last_seg.is_empty() && !last_seg.contains('.') {
+            let base_len = scratch.len();
+            scratch.push_str(".ts");
+            if let Ok(id) = paths.binary_search(scratch) {
+                return Some(Ok(Some(id)));
+            }
+            if !self.has_custom_file_filter {
+                let exts: &[&str] = if type_only {
+                    &[
+                        ".tsx", ".js", ".jsx", ".mts", ".mjs", ".cts", ".cjs", ".d.ts", ".d.mts",
+                        ".d.cts",
+                    ]
+                } else {
+                    &[".tsx", ".js", ".jsx", ".mts", ".mjs", ".cts", ".cjs"]
+                };
+                for ext in exts {
+                    scratch.truncate(base_len);
+                    scratch.push_str(ext);
+                    if let Ok(id) = paths.binary_search(scratch) {
+                        if type_only && matches!(*ext, ".js" | ".mjs" | ".cjs") {
+                            for dts in [".d.ts", ".d.mts", ".d.cts"] {
+                                scratch.truncate(base_len);
+                                scratch.push_str(dts);
+                                if let Ok(dts_id) = paths.binary_search(scratch) {
+                                    return Some(Ok(Some(dts_id)));
+                                }
+                            }
+                        }
+                        return Some(Ok(Some(id)));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Cached resolution wrapper for per-worker parallel extraction.
+    pub fn resolve_with_cache(
+        &self,
+        file: Id,
+        spec: &str,
+        type_only: bool,
+        cjs: bool,
+        cache: &mut ResolveCache,
+    ) -> Result<Option<Id>, String> {
+        if spec.starts_with("bun:")
+            || spec.ends_with(".node")
+            || spec.strip_prefix("node:").is_some_and(is_node_builtin)
+        {
+            return Ok(None);
+        }
+        if let Some(hit) = self.resolve_relative_fast(file, spec, type_only, &mut cache.scratch) {
+            return hit;
+        }
+        let is_rel = spec.starts_with('.') || spec.starts_with('/');
+        let profile = if is_rel { 0 } else { self.file_profile[file] };
+        let key = (
+            self.file_dir_id[file],
+            profile as u16,
+            (u8::from(type_only) << 1) | u8::from(cjs),
+        );
+        // Guard against tsconfig baseUrl self-shadowing (e.g. `knip.ts` importing `"knip"`).
+        let may_self_shadow = !is_rel
+            && profile != 0
+            && Path::new(&self.graph.paths[file])
+                .file_stem()
+                .and_then(|s| s.to_str())
+                == Some(spec);
+        if !may_self_shadow
+            && let Some(dir_cache) = cache.entries.get(&key)
+            && let Some(hit) = dir_cache.get(spec)
+        {
+            return hit.clone();
+        }
+        let res = self.resolve_with_mode(file, spec, type_only, cjs);
+        if !may_self_shadow && res.as_ref().ok() != Some(&Some(file)) {
+            cache
+                .entries
+                .entry(key)
+                .or_default()
+                .insert(spec.to_owned(), res.clone());
+        }
+        res
+    }
+
     /// None means a resolved external package, Node builtin or plain stylesheet.
     pub fn resolve_with_mode(
         &self,
@@ -1488,7 +1654,10 @@ impl Project {
         type_only: bool,
         cjs: bool,
     ) -> Result<Option<Id>, String> {
-        if spec.starts_with("bun:") || spec.ends_with(".node") {
+        if spec.starts_with("bun:")
+            || spec.ends_with(".node")
+            || spec.strip_prefix("node:").is_some_and(is_node_builtin)
+        {
             return Ok(None);
         }
         let origin = self.root.join(&self.graph.paths[file]);
@@ -1737,17 +1906,161 @@ fn workspace_patterns(manifest: &Value) -> Result<WorkspacePatterns, String> {
     )
 }
 
+#[inline]
+fn dir_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(d, _)| d)
+}
+
+#[inline]
+fn code_ext_of(path: &str) -> Option<&'static str> {
+    let last = path.rsplit('/').next().unwrap_or(path);
+    let ext = last.rsplit_once('.')?.1;
+    EXTENSIONS.iter().copied().find(|&e| e == ext)
+}
+
+fn normalize_relative_into(dir: &str, spec: &str, out: &mut String) -> bool {
+    let mut segs = [""; 64];
+    let mut len = 0usize;
+    for part in dir.split('/') {
+        if !part.is_empty() {
+            if len == segs.len() {
+                return false;
+            }
+            segs[len] = part;
+            len += 1;
+        }
+    }
+    for part in spec.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if len == 0 {
+                    return false;
+                }
+                len -= 1;
+            }
+            seg => {
+                if len == segs.len() {
+                    return false;
+                }
+                segs[len] = seg;
+                len += 1;
+            }
+        }
+    }
+    if len == 0 {
+        return false;
+    }
+    out.clear();
+    for (i, seg) in segs[..len].iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(seg);
+    }
+    true
+}
+
+fn is_node_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "assert"
+            | "assert/strict"
+            | "async_hooks"
+            | "buffer"
+            | "child_process"
+            | "cluster"
+            | "console"
+            | "constants"
+            | "crypto"
+            | "dgram"
+            | "diagnostics_channel"
+            | "dns"
+            | "dns/promises"
+            | "domain"
+            | "events"
+            | "fs"
+            | "fs/promises"
+            | "http"
+            | "http2"
+            | "https"
+            | "inspector"
+            | "inspector/promises"
+            | "module"
+            | "net"
+            | "os"
+            | "path"
+            | "path/posix"
+            | "path/win32"
+            | "perf_hooks"
+            | "process"
+            | "punycode"
+            | "querystring"
+            | "readline"
+            | "readline/promises"
+            | "repl"
+            | "sqlite"
+            | "stream"
+            | "stream/consumers"
+            | "stream/promises"
+            | "stream/web"
+            | "string_decoder"
+            | "sys"
+            | "test"
+            | "timers"
+            | "timers/promises"
+            | "tls"
+            | "trace_events"
+            | "tty"
+            | "url"
+            | "util"
+            | "util/types"
+            | "v8"
+            | "vm"
+            | "wasi"
+            | "worker_threads"
+            | "zlib"
+    )
+}
+
+fn compute_dir_ids(paths: &[String]) -> Vec<u32> {
+    let mut ids = Vec::with_capacity(paths.len());
+    let mut prev: Option<&str> = None;
+    let mut cur = 0u32;
+    for p in paths {
+        let d = dir_of(p);
+        if prev != Some(d) {
+            if prev.is_some() {
+                cur += 1;
+            }
+            prev = Some(d);
+        }
+        ids.push(cur);
+    }
+    ids
+}
+
 fn closest_directories(paths: &[String], directories: &BTreeMap<PathBuf, usize>) -> Vec<usize> {
-    paths
-        .iter()
-        .map(|p| {
-            Path::new(p)
+    if directories.is_empty() || (directories.len() == 1 && directories.contains_key(Path::new("")))
+    {
+        return vec![0; paths.len()];
+    }
+    let mut out = Vec::with_capacity(paths.len());
+    let mut last_dir: Option<&str> = None;
+    let mut last_val = 0usize;
+    for p in paths {
+        let dir = dir_of(p);
+        if last_dir != Some(dir) {
+            last_dir = Some(dir);
+            last_val = Path::new(p)
                 .ancestors()
                 .skip(1)
                 .find_map(|a| directories.get(a).copied())
-                .unwrap_or(0)
-        })
-        .collect()
+                .unwrap_or(0);
+        }
+        out.push(last_val);
+    }
+    out
 }
 
 const STANDARD_MANIFEST_KEYS: &[&str] = &[

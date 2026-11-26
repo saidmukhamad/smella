@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::deps::{DependencyFinding, analyze_dependencies};
 use crate::extract::summarize;
 use crate::graph::{Gap, Graph, Id, Loc, NodeKind, ROLES, Reach, Role, Root, Visit};
-use crate::project::{Config, Project, StaleConfigItem, WorkspaceInfo};
+use crate::project::{Config, Project, ResolveCache, StaleConfigItem, WorkspaceInfo};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -203,13 +203,14 @@ impl Report {
                 entry_exports_used[file] = true;
             }
         }
-        let read = |(arena, buf): &mut (Allocator, Vec<u8>), file| {
+        let read = |(arena, buf, cache): &mut (Allocator, Vec<u8>, ResolveCache), file| {
             summarize(
                 &project,
                 file,
                 roles[file] & !(1 << Role::Public as usize) != 0,
                 arena,
                 buf,
+                cache,
             )
         };
         let mut summaries: Vec<_> = if file_count >= 32
@@ -219,13 +220,23 @@ impl Report {
                 (0..file_count)
                     .into_par_iter()
                     .map_init(
-                        || (Allocator::default(), Vec::with_capacity(16 * 1024)),
+                        || {
+                            (
+                                Allocator::default(),
+                                Vec::with_capacity(16 * 1024),
+                                ResolveCache::default(),
+                            )
+                        },
                         read,
                     )
                     .collect()
             })
         } else {
-            let mut state = (Allocator::default(), Vec::with_capacity(16 * 1024));
+            let mut state = (
+                Allocator::default(),
+                Vec::with_capacity(16 * 1024),
+                ResolveCache::default(),
+            );
             (0..file_count).map(|file| read(&mut state, file)).collect()
         };
         project.sources = Vec::new();
