@@ -1284,3 +1284,79 @@ test('per-symbol suppressions require a reason and stale configuration entries a
     'stale-suppression:nonExistent',
   ]);
 });
+
+test('hook modes support --staged, --diff merge-base, two-parent merge commits, --all and human witness output', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ name: 'hook-demo', bin: { app: './app.ts' } }),
+    'app.ts': 'import { live } from "./lib"; live();',
+    'lib.ts': 'export function live() {} export function preExistingDead() {}',
+    'lib.test.ts': 'import { live } from "./lib"; live();',
+  });
+  const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
+  const runCli = (...args) => {
+    try {
+      const stdout = execFileSync(process.execPath, [cliPath, '--root', root, ...args], { encoding: 'utf8' });
+      return { code: 0, stdout };
+    } catch (err) {
+      return { code: err.status ?? 1, stdout: err.stdout ?? '', stderr: err.stderr ?? '' };
+    }
+  };
+  git('init', '-q', '-b', 'main');
+  git('config', 'user.email', 'test@example.com');
+  git('config', 'user.name', 'Test');
+  git('add', '.');
+  git('commit', '-q', '-m', 'base');
+
+  // --all always exits 0 even with pre-existing findings, and renders human format.
+  const allRes = runCli('--all');
+  assert.equal(allRes.code, 0);
+  assert.ok(allRes.stdout.includes('preExistingDead'));
+
+  // Stage a test-only export while leaving an unstaged dead export in the working tree.
+  await writeFile(join(root, 'lib.ts'), 'export function live() {} export function preExistingDead() {} export function onlyTested() {}');
+  await writeFile(join(root, 'lib.test.ts'), 'import { live, onlyTested } from "./lib"; live(); onlyTested();');
+  git('add', 'lib.ts', 'lib.test.ts');
+  await writeFile(join(root, 'lib.ts'), 'export function live() {} export function preExistingDead() {} export function onlyTested() {} export function unstagedDead() {}');
+
+  // --staged inspects only the index (sees onlyTested with witness path, ignores unstagedDead) and exits 1.
+  const stagedRes = runCli('--staged');
+  assert.equal(stagedRes.code, 1);
+  assert.ok(stagedRes.stdout.includes('test-only-export'));
+  assert.ok(stagedRes.stdout.includes('onlyTested'));
+  assert.ok(stagedRes.stdout.includes('via lib.test.ts -> lib.ts'));
+  assert.ok(!stagedRes.stdout.includes('unstagedDead'));
+
+  // --diff against main sees the working-tree unstagedDead too and exits 1.
+  const diffRes = runCli('--diff', 'main');
+  assert.equal(diffRes.code, 1);
+  assert.ok(diffRes.stdout.includes('unstagedDead'));
+
+  // Commit branch A with deadA, branch B with deadB, then merge cleanly:
+  // merge commit judged against both parents has 0 introduced findings.
+  git('reset', '--hard', '-q', 'HEAD');
+  git('checkout', '-q', '-b', 'branch-a');
+  await writeFile(join(root, 'a.ts'), 'export function deadA() {}');
+  git('add', 'a.ts');
+  git('commit', '-q', '-m', 'branch a');
+
+  git('checkout', '-q', 'main');
+  git('checkout', '-q', '-b', 'branch-b');
+  await writeFile(join(root, 'b.ts'), 'export function deadB() {}');
+  git('add', 'b.ts');
+  git('commit', '-q', '-m', 'branch b');
+
+  git('merge', '-q', '--no-edit', 'branch-a');
+  const cleanMerge = runCli('--diff');
+  assert.equal(cleanMerge.code, 0);
+  assert.ok(cleanMerge.stdout.includes('0 introduced'));
+
+  // If a merge commit itself adds a new dead export, --diff catches it.
+  await writeFile(join(root, 'b.ts'), 'export function deadB() {} export function mergeAuthoredDead() {}');
+  git('add', 'b.ts');
+  git('commit', '-q', '--amend', '--no-edit');
+  const dirtyMerge = runCli('--diff');
+  assert.equal(dirtyMerge.code, 1);
+  assert.ok(dirtyMerge.stdout.includes('mergeAuthoredDead'));
+  assert.ok(!dirtyMerge.stdout.includes('deadA'));
+  assert.ok(!dirtyMerge.stdout.includes('deadB'));
+});

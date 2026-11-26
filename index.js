@@ -282,26 +282,22 @@ function gitRun(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 }
 
-function collectGitDiff(rootDir, base) {
-  let topLevel;
+function gitTry(cwd, args) {
   try {
-    const out = gitRun(rootDir, ['rev-parse', '--show-toplevel', '--verify', `${base}^{commit}`]).trim().split('\n');
-    topLevel = out[0];
-  } catch (cause) {
-    throw new AnalysisError('ANALYSIS_FAILED', `Cannot resolve git base ref ${JSON.stringify(base)} in ${rootDir}: ${cause.message}`, cause);
+    return execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    return null;
   }
-  const canonTop = realpathSync(topLevel);
-  const canonRoot = realpathSync(rootDir);
-  const relPrefixRaw = relative(canonTop, canonRoot).replaceAll('\\', '/');
-  const relPrefix = relPrefixRaw === '' || relPrefixRaw === '.' ? '' : `${relPrefixRaw}/`;
-  const stripPrefix = path => {
-    const norm = path.replaceAll('\\', '/');
-    if (!relPrefix) return norm;
-    return norm.startsWith(relPrefix) ? norm.slice(relPrefix.length) : null;
-  };
+}
+
+function parseNameStatusZ(raw, stripPrefix) {
   const changedFiles = new Set();
   const renameMap = new Map();
-  const raw = gitRun(topLevel, ['diff', '--name-status', '-M', '-z', base]);
   const tokens = raw.split('\0');
   for (let i = 0; i < tokens.length; ) {
     const status = tokens[i++];
@@ -324,13 +320,110 @@ function collectGitDiff(rootDir, base) {
       }
     }
   }
+  return { changedFiles, renameMap };
+}
+
+function resolveGitRoot(rootDir) {
+  let topLevel;
+  try {
+    topLevel = gitRun(rootDir, ['rev-parse', '--show-toplevel']).trim();
+  } catch (cause) {
+    throw new AnalysisError('ANALYSIS_FAILED', `Cannot locate git repository for ${rootDir}: ${cause.message}`, cause);
+  }
+  const canonTop = realpathSync(topLevel);
+  const canonRoot = realpathSync(rootDir);
+  const relPrefixRaw = relative(canonTop, canonRoot).replaceAll('\\', '/');
+  const relPrefix = relPrefixRaw === '' || relPrefixRaw === '.' ? '' : `${relPrefixRaw}/`;
+  const stripPrefix = path => {
+    const norm = path.replaceAll('\\', '/');
+    if (!relPrefix) return norm;
+    return norm.startsWith(relPrefix) ? norm.slice(relPrefix.length) : null;
+  };
+  return { topLevel, relPrefix: relPrefixRaw === '.' ? '' : relPrefixRaw, stripPrefix };
+}
+
+function resolveMergeBase(topLevel, ref) {
+  const candidate = ref || ['origin/main', 'origin/master', 'main', 'master', 'HEAD']
+    .find(r => gitTry(topLevel, ['rev-parse', '--verify', `${r}^{commit}`]));
+  if (!candidate) {
+    throw new AnalysisError('ANALYSIS_FAILED', `Cannot resolve git base ref in ${topLevel}`);
+  }
+  const mb = gitTry(topLevel, ['merge-base', 'HEAD', candidate]);
+  return mb || candidate;
+}
+
+function collectGitDiff(rootDir, { base, staged = false, mergeBase = undefined } = {}) {
+  const { topLevel, relPrefix, stripPrefix } = resolveGitRoot(rootDir);
+  let parents = [];
+  let label = '';
+  let stagedTree = null;
+
+  if (staged) {
+    stagedTree = gitRun(topLevel, ['write-tree']).trim();
+    const headCommit = gitTry(topLevel, ['rev-parse', '--verify', 'HEAD^{commit}']);
+    const mergeHead = gitTry(topLevel, ['rev-parse', '--verify', 'MERGE_HEAD^{commit}']);
+    if (headCommit) parents.push(headCommit);
+    if (mergeHead) parents.push(mergeHead);
+    label = mergeHead ? 'HEAD+MERGE_HEAD (staged)' : 'HEAD (staged)';
+    const changedFiles = new Set();
+    const renameMap = new Map();
+    if (parents.length === 0) {
+      const cached = gitRun(topLevel, ['ls-files', '--cached', '-z']);
+      for (const p of cached.split('\0')) {
+        if (!p) continue;
+        const rel = stripPrefix(p);
+        if (rel) changedFiles.add(rel);
+      }
+    } else {
+      for (const p of parents) {
+        const raw = gitRun(topLevel, ['diff', '--cached', '--name-status', '-M', '-z', p]);
+        const parsed = parseNameStatusZ(raw, stripPrefix);
+        for (const f of parsed.changedFiles) changedFiles.add(f);
+        for (const [k, v] of parsed.renameMap) if (!renameMap.has(k)) renameMap.set(k, v);
+      }
+    }
+    return { topLevel, relPrefix, parents, label, stagedTree, changedFiles, renameMap };
+  }
+
+  if (mergeBase !== undefined && mergeBase !== false) {
+    const explicitRef = typeof mergeBase === 'string' && mergeBase.length > 0 ? mergeBase : null;
+    const headParentsLine = gitTry(topLevel, ['rev-list', '--parents', '-n', '1', 'HEAD']) ?? '';
+    const headParents = headParentsLine.split(/\s+/).slice(1).filter(Boolean);
+    const workDirty = Boolean(gitTry(topLevel, ['status', '--porcelain']));
+    if (!explicitRef && headParents.length >= 2 && !workDirty) {
+      // Merge commit with clean working tree: judge against all parents so only merge-authored issues fail.
+      parents = headParents;
+      label = `merge(${headParents.map(p => p.slice(0, 7)).join(',')})`;
+    } else {
+      const mb = resolveMergeBase(topLevel, explicitRef);
+      parents = [mb];
+      label = explicitRef ? `merge-base(${explicitRef})` : mb.slice(0, 7);
+    }
+  } else {
+    try {
+      gitRun(rootDir, ['rev-parse', '--verify', `${base}^{commit}`]);
+    } catch (cause) {
+      throw new AnalysisError('ANALYSIS_FAILED', `Cannot resolve git base ref ${JSON.stringify(base)} in ${rootDir}: ${cause.message}`, cause);
+    }
+    parents = [base];
+    label = base;
+  }
+
+  const changedFiles = new Set();
+  const renameMap = new Map();
+  for (const p of parents) {
+    const raw = gitRun(topLevel, ['diff', '--name-status', '-M', '-z', p]);
+    const parsed = parseNameStatusZ(raw, stripPrefix);
+    for (const f of parsed.changedFiles) changedFiles.add(f);
+    for (const [k, v] of parsed.renameMap) if (!renameMap.has(k)) renameMap.set(k, v);
+  }
   const untracked = gitRun(topLevel, ['ls-files', '--others', '--exclude-standard', '-z']);
   for (const filePath of untracked.split('\0')) {
     if (!filePath) continue;
     const rel = stripPrefix(filePath);
     if (rel) changedFiles.add(rel);
   }
-  return { topLevel, relPrefix: relPrefixRaw === '.' ? '' : relPrefixRaw, changedFiles, renameMap };
+  return { topLevel, relPrefix, parents, label, stagedTree, changedFiles, renameMap };
 }
 
 async function extractGitArchive(topLevel, base, relPrefix, destDir) {
@@ -366,35 +459,57 @@ async function extractGitArchive(topLevel, base, relPrefix, destDir) {
   });
 }
 
-export async function analyze({ root = process.cwd(), base, dependencies = false, ...options } = {}) {
+export async function analyze({
+  root = process.cwd(),
+  base,
+  staged = false,
+  mergeBase,
+  dependencies = false,
+  ...options
+} = {}) {
   native ??= load();
   const rootDir = resolve(root);
   const optionsJson = JSON.stringify(options);
 
   let diffContext = null;
   let snapshot;
-  if (base !== undefined && base !== null) {
-    const gitInfo = collectGitDiff(rootDir, base);
-    const tmpDir = gitInfo.changedFiles.size > 0 ? await mkdtemp(join(tmpdir(), 'smella-base-')) : null;
+  const hasDiffMode = (base !== undefined && base !== null) || Boolean(staged) || (mergeBase !== undefined && mergeBase !== false);
+  if (hasDiffMode) {
+    const gitInfo = collectGitDiff(rootDir, { base, staged, mergeBase });
+    const tmpDirs = [];
     try {
-      const headPromise = native.analyzeNative(rootDir, optionsJson);
-      let baseKeys = new Set();
-      let baseDepKeys = new Set();
-      if (tmpDir) {
-        await extractGitArchive(gitInfo.topLevel, base, gitInfo.relPrefix, tmpDir);
-        const baseRoot = gitInfo.relPrefix ? join(tmpDir, gitInfo.relPrefix) : tmpDir;
-        linkNodeModules(rootDir, baseRoot);
-        let baseSnapshot;
-        try {
-          baseSnapshot = await native.analyzeNative(baseRoot, optionsJson);
-          for (const f of JSON.parse(baseSnapshot.findings(undefined))) {
-            baseKeys.add(findingKey(f));
+      let headPromise;
+      if (gitInfo.stagedTree) {
+        const stagedDir = await mkdtemp(join(tmpdir(), 'smella-staged-'));
+        tmpDirs.push(stagedDir);
+        await extractGitArchive(gitInfo.topLevel, gitInfo.stagedTree, gitInfo.relPrefix, stagedDir);
+        const stagedRoot = gitInfo.relPrefix ? join(stagedDir, gitInfo.relPrefix) : stagedDir;
+        linkNodeModules(rootDir, stagedRoot);
+        headPromise = native.analyzeNative(stagedRoot, optionsJson);
+      } else {
+        headPromise = native.analyzeNative(rootDir, optionsJson);
+      }
+      const baseKeys = new Set();
+      const baseDepKeys = new Set();
+      if (gitInfo.changedFiles.size > 0) {
+        for (const parentRef of gitInfo.parents) {
+          const tmpDir = await mkdtemp(join(tmpdir(), 'smella-base-'));
+          tmpDirs.push(tmpDir);
+          await extractGitArchive(gitInfo.topLevel, parentRef, gitInfo.relPrefix, tmpDir);
+          const baseRoot = gitInfo.relPrefix ? join(tmpDir, gitInfo.relPrefix) : tmpDir;
+          linkNodeModules(rootDir, baseRoot);
+          let baseSnapshot;
+          try {
+            baseSnapshot = await native.analyzeNative(baseRoot, optionsJson);
+            for (const f of JSON.parse(baseSnapshot.findings(undefined))) {
+              baseKeys.add(findingKey(f));
+            }
+            for (const d of JSON.parse(baseSnapshot.dependencies())) {
+              baseDepKeys.add(depFindingKey(d));
+            }
+          } finally {
+            baseSnapshot?.dispose();
           }
-          for (const d of JSON.parse(baseSnapshot.dependencies())) {
-            baseDepKeys.add(depFindingKey(d));
-          }
-        } finally {
-          baseSnapshot?.dispose();
         }
       }
       snapshot = await headPromise;
@@ -421,7 +536,9 @@ export async function analyze({ root = process.cwd(), base, dependencies = false
         changedFiles: gitInfo.changedFiles,
         renameMap: gitInfo.renameMap,
         summary: Object.freeze({
-          base,
+          base: gitInfo.label,
+          parents: Object.freeze([...gitInfo.parents]),
+          staged: Boolean(staged),
           changedFiles: Object.freeze([...gitInfo.changedFiles].sort()),
           introduced,
           preExisting,
@@ -432,7 +549,9 @@ export async function analyze({ root = process.cwd(), base, dependencies = false
       if (cause instanceof AnalysisError) throw cause;
       throw new AnalysisError('ANALYSIS_FAILED', cause.message, cause);
     } finally {
-      if (tmpDir) await rm(tmpDir, { recursive: true, force: true });
+      for (const dir of tmpDirs) {
+        await rm(dir, { recursive: true, force: true });
+      }
     }
   } else {
     try {

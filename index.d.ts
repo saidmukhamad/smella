@@ -64,6 +64,8 @@ export type DiffStatus = 'introduced' | 'pre-existing';
 export interface Finding extends SubjectRecord { kind: FindingKind; diff?: DiffStatus }
 export interface DiffSummary {
   base: string;
+  parents?: readonly string[];
+  staged?: boolean;
   changedFiles: readonly string[];
   introduced: number;
   preExisting: number;
@@ -97,4 +99,10 @@ export interface Report {
 export class AnalysisError extends Error {
   readonly code: 'NATIVE_LOAD' | 'ANALYSIS_FAILED' | 'REPORT_DISPOSED' | 'UNKNOWN_SUBJECT';
 }
-export function analyze(options?: Config & { root?: string; base?: string; dependencies?: boolean }): Promise<Report>;
+export function analyze(options?: Config & {
+  root?: string;
+  base?: string;
+  staged?: boolean;
+  mergeBase?: string | boolean;
+  dependencies?: boolean;
+}): Promise<Report>;
