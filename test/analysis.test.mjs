@@ -1037,3 +1037,45 @@ test('export type star from .d.ts, mixed value/type companion .d.ts, declaration
   assert.equal(subject(r, 'tool.d.ts', 'UnusedReceipt').kind, 'unused-export');
   assert.deepEqual(subject(r, 'merged.ts', 'Merged').usage.value, ['runtime']);
 });
+
+test('typeof import, Promise.all dynamic imports, Object.defineProperty exports, template-prefix globs and dynamicImports config resolve cleanly', async t => {
+  const root = await fixture(t, {
+    'app.ts': [
+      'type WholeApi = typeof import("./api");',
+      'type ReqRet = ReturnType<typeof require>;',
+      'const cjs = require("./defined.cjs");',
+      'export async function run(name: string, dyn: string) {',
+      '  const [{ alpha }, modB] = await Promise.all([import("./modA"), import("./modB")]);',
+      '  const { cmd } = await import(new URL("./cmd.mjs", import.meta.url).href);',
+      '  const plugin = require(`./plugins/${name}`);',
+      '  const { cfgTarget } = await import(dyn);',
+      '  return [alpha(), modB.beta(), cmd(), cjs.definedFn(), plugin, cfgTarget(), null as unknown as WholeApi, null as unknown as ReqRet];',
+      '}',
+      'run("x", "y");',
+    ].join('\n'),
+    'api.ts': 'export interface ApiShape { ok: boolean }',
+    'modA.ts': 'export function alpha() {} export function unusedA() {}',
+    'modB.ts': 'export function beta() {} export function unusedB() {}',
+    'cmd.mjs': 'export function cmd() {} export function unusedCmd() {}',
+    'defined.cjs': 'function definedFn() { return 1; } function deadCjs() {} Object.defineProperty(exports, "definedFn", { enumerable: true, get: () => definedFn }); Object.defineProperty(exports, "deadCjs", { value: deadCjs });',
+    'plugins/one.ts': 'export function initOne() {}',
+    'plugins/two.ts': 'export function initTwo() {}',
+    'configured.ts': 'export function cfgTarget() {}',
+  });
+
+  const r = await inspect(t, root, { ...app, dynamicImports: { 'app.ts': ['./configured'] } });
+  assert.deepEqual(r.coverage.gaps, []);
+  assert.deepEqual(subject(r, 'api.ts', 'ApiShape').usage.type, ['runtime']);
+  assert.deepEqual(subject(r, 'api.ts').usage.evaluation, []);
+  assert.deepEqual(subject(r, 'modA.ts', 'alpha').usage.value, ['runtime']);
+  assert.equal(subject(r, 'modA.ts', 'unusedA').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'modB.ts', 'beta').usage.value, ['runtime']);
+  assert.equal(subject(r, 'modB.ts', 'unusedB').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'cmd.mjs', 'cmd').usage.value, ['runtime']);
+  assert.equal(subject(r, 'cmd.mjs', 'unusedCmd').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'defined.cjs', 'definedFn').usage.value, ['runtime']);
+  assert.equal(subject(r, 'defined.cjs', 'deadCjs').kind, 'unused-export');
+  assert.deepEqual(subject(r, 'plugins/one.ts').usage.evaluation, ['runtime']);
+  assert.deepEqual(subject(r, 'plugins/two.ts').usage.evaluation, ['runtime']);
+  assert.deepEqual(subject(r, 'configured.ts').usage.evaluation, ['runtime']);
+});

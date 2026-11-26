@@ -280,6 +280,17 @@ fn extract_static_path_expr(
         return Some(res);
     }
     match inner {
+        Expression::StaticMemberExpression(m)
+            if matches!(m.property.name.as_str(), "href" | "pathname") =>
+        {
+            extract_static_path_expr(
+                &m.object,
+                scoping,
+                require_symbols,
+                file_ext,
+                file_ext_symbols,
+            )
+        }
         Expression::NewExpression(ne)
             if matches!(ne.callee.get_inner_expression(), Expression::Identifier(id) if id.name == "URL")
                 && ne
@@ -301,8 +312,10 @@ fn extract_static_path_expr(
             Some((spec, sp))
         }
         Expression::CallExpression(call) => {
-            if matches!(call.callee.get_inner_expression(), Expression::Identifier(id) if id.name == "fileURLToPath")
-                && let Some(arg) = call.arguments.first().and_then(|a| a.as_expression())
+            if matches!(
+                call.callee.get_inner_expression(),
+                Expression::Identifier(id) if matches!(id.name.as_str(), "fileURLToPath" | "pathToFileURL")
+            ) && let Some(arg) = call.arguments.first().and_then(|a| a.as_expression())
             {
                 return extract_static_path_expr(
                     arg,
@@ -394,6 +407,150 @@ fn resolve_arg_paths(
         return list.clone();
     }
     vec![]
+}
+
+fn match_template_prefix_glob(
+    project: &Project,
+    file: Id,
+    expr: &Expression<'_>,
+) -> Option<Vec<Id>> {
+    let Expression::TemplateLiteral(t) = expr.get_inner_expression() else {
+        return None;
+    };
+    if t.expressions.is_empty() {
+        return None;
+    }
+    let first = t.quasis.first()?.value.cooked.as_ref()?.as_str();
+    if !(first.starts_with("./") || first.starts_with("../")) {
+        return None;
+    }
+    // Require at least a concrete subdirectory or filename prefix beyond `./` or `../`.
+    let trimmed = first.trim_start_matches("../").trim_start_matches("./");
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut pattern = String::new();
+    for (idx, q) in t.quasis.iter().enumerate() {
+        pattern.push_str(q.value.cooked.as_ref()?.as_str());
+        if idx < t.expressions.len() {
+            pattern.push('*');
+        }
+    }
+    let file_dir = Path::new(&project.graph.paths[file])
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let norm = crate::source_map::normalize_rel(&file_dir.join(&pattern))?;
+    let base_pat = crate::source_map::to_slash(&norm);
+    let mut matchers = Vec::new();
+    if let Ok(m) = crate::project::matcher(&base_pat) {
+        matchers.push(m);
+    }
+    if !base_pat.ends_with('*')
+        && Path::new(&base_pat).extension().is_none()
+        && let Ok(m) = crate::project::matcher(&format!(
+            "{base_pat}.{{{}}}",
+            crate::project::EXTENSIONS.join(",")
+        ))
+    {
+        matchers.push(m);
+    } else if base_pat.ends_with('*') {
+        if let Ok(m) = crate::project::matcher(&format!(
+            "{base_pat}.{{{}}}",
+            crate::project::EXTENSIONS.join(",")
+        )) {
+            matchers.push(m);
+        }
+        if let Ok(m) = crate::project::matcher(&format!("{base_pat}/index.*")) {
+            matchers.push(m);
+        }
+    }
+    if matchers.is_empty() {
+        return None;
+    }
+    let matched: Vec<Id> = project
+        .graph
+        .paths
+        .iter()
+        .enumerate()
+        .filter(|&(id, p)| id != file && matchers.iter().any(|m| m.is_match(p)))
+        .map(|(id, _)| id)
+        .collect();
+    (!matched.is_empty()).then_some(matched)
+}
+
+fn cjs_exports_target(scoping: &Scoping, expr: &Expression<'_>) -> Option<Span> {
+    is_unbound_ident(scoping, expr, "exports").or_else(|| {
+        if let Expression::StaticMemberExpression(inner) = expr.get_inner_expression()
+            && inner.property.name == "exports"
+        {
+            is_unbound_ident(scoping, &inner.object, "module")
+        } else {
+            None
+        }
+    })
+}
+
+fn resolve_promise_all_use<'a>(
+    nodes: &'a AstNodes<'a>,
+    import_id: NodeId,
+    expr_span: Span,
+) -> Option<NsUse<'a>> {
+    // Match `const [a, { b }] = await Promise.all([import(...), ...])`.
+    let arr_node = nodes.ancestors(import_id).skip(1).find(|n| {
+        !matches!(
+            n.kind(),
+            AstKind::ParenthesizedExpression(_) | AstKind::Argument(_)
+        )
+    })?;
+    let AstKind::ArrayExpression(arr) = arr_node.kind() else {
+        return None;
+    };
+    let elem_idx = arr
+        .elements
+        .iter()
+        .position(|el| el.as_expression().is_some_and(|e| e.span() == expr_span))?;
+    let call_node = nodes.ancestors(arr_node.id()).skip(1).find(|n| {
+        !matches!(
+            n.kind(),
+            AstKind::Argument(_) | AstKind::ParenthesizedExpression(_)
+        )
+    })?;
+    let AstKind::CallExpression(call) = call_node.kind() else {
+        return None;
+    };
+    let Expression::StaticMemberExpression(m) = call.callee.get_inner_expression() else {
+        return None;
+    };
+    if m.property.name != "all"
+        || !matches!(m.object.get_inner_expression(), Expression::Identifier(id) if id.name == "Promise")
+    {
+        return None;
+    }
+    let (call_span, parent, awaited) = unwrap_parent(nodes, call_node.id(), call.span, true);
+    if !awaited {
+        return None;
+    }
+    let Some(AstKind::VariableDeclarator(v)) = parent.map(|p| p.kind()) else {
+        return None;
+    };
+    if !v.init.as_ref().is_some_and(|i| i.span() == call_span) {
+        return None;
+    }
+    let BindingPatternKind::ArrayPattern(pat) = &v.id.kind else {
+        return None;
+    };
+    let Some(Some(slot)) = pat.elements.get(elem_idx) else {
+        return Some(NsUse::Discarded);
+    };
+    match &slot.kind {
+        BindingPatternKind::ObjectPattern(obj) => {
+            Some(object_pattern_keys(obj).map_or(NsUse::Escape, NsUse::Props))
+        }
+        BindingPatternKind::BindingIdentifier(bind) => {
+            Some(bind.symbol_id.get().map_or(NsUse::Escape, NsUse::Alias))
+        }
+        _ => Some(NsUse::Escape),
+    }
 }
 
 fn leftmost_type_name<'a>(name: &'a TSTypeName<'a>) -> Option<&'a str> {
@@ -1194,6 +1351,14 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                     }
                 }
             }
+            AstKind::UnaryExpression(un) if un.operator == oxc_ast::ast::UnaryOperator::Typeof => {
+                if let Some(sp) = is_unbound_ident(scoping, &un.argument, "require")
+                    .or_else(|| is_unbound_ident(scoping, &un.argument, "exports"))
+                    .or_else(|| is_unbound_ident(scoping, &un.argument, "module"))
+                {
+                    handled_cjs_idents.insert(sp.start);
+                }
+            }
             AstKind::BinaryExpression(bin) => {
                 let is_req_main = |e: &Expression<'_>| {
                     matches!(e.get_inner_expression(), Expression::StaticMemberExpression(m)
@@ -1374,6 +1539,8 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                                         effective_type,
                                         loc,
                                     );
+                                } else if effective_type {
+                                    out.link_member(from, to, ident.name.as_str(), "**", true, loc);
                                 } else {
                                     out.gap(
                                         "namespace-escape",
@@ -1394,7 +1561,8 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                     for from in owner.sources(file) {
                         out.edge(from, binding, is_type, loc);
                     }
-                } else if reference.symbol_id().is_none()
+                } else if !is_type
+                    && reference.symbol_id().is_none()
                     && !handled_cjs_idents.contains(&ident.span.start)
                     && matches!(
                         ident.name.as_str(),
@@ -1440,10 +1608,8 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                             is_require_ident(scoping, &require_symbols, &call.callee) =>
                     {
                         handled_cjs_idents.insert(req_span.start);
-                        let specs = call
-                            .arguments
-                            .first()
-                            .and_then(|a| a.as_expression())
+                        let req_arg = call.arguments.first().and_then(|a| a.as_expression());
+                        let mut specs = req_arg
                             .map(|a| {
                                 resolve_arg_paths(
                                     a,
@@ -1455,7 +1621,22 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                                 )
                             })
                             .unwrap_or_default();
+                        let mut glob_targets = Vec::new();
                         if specs.is_empty() {
+                            if let Some(arg) = req_arg
+                                && let Some(matched) =
+                                    match_template_prefix_glob(project, file, arg)
+                            {
+                                glob_targets = matched;
+                            } else if let Some(configured) =
+                                project.dynamic_imports.get(&project.graph.paths[file])
+                            {
+                                for s in configured {
+                                    specs.push((s.clone(), call.span));
+                                }
+                            }
+                        }
+                        if specs.is_empty() && glob_targets.is_empty() {
                             for from in owner.sources(file) {
                                 out.gap(
                                     "computed-import",
@@ -1467,7 +1648,8 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                                 );
                             }
                         } else {
-                            let mut targets = Vec::new();
+                            let is_glob = !glob_targets.is_empty();
+                            let mut targets = glob_targets;
                             let mut first_err = None;
                             let mut any_external = false;
                             for (spec, spec_span) in &specs {
@@ -1508,6 +1690,10 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                             for to in targets {
                                 for from in owner.sources(file) {
                                     out.edge(from, to, false, loc);
+                                    if is_glob {
+                                        out.link_member(from, to, "*", "**", false, loc);
+                                        continue;
+                                    }
                                     match &usage {
                                         NsUse::Discarded => {}
                                         NsUse::Props(props) => {
@@ -1527,6 +1713,48 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                         }
                     }
                     Expression::StaticMemberExpression(m) => match m.property.name.as_str() {
+                        "defineProperty" if matches!(m.object.get_inner_expression(), Expression::Identifier(id) if id.name == "Object") => {
+                            if let Some(first_arg) =
+                                call.arguments.first().and_then(|a| a.as_expression())
+                                && let Some(sp) = cjs_exports_target(scoping, first_arg)
+                            {
+                                handled_cjs_idents.insert(sp.start);
+                                if let Some((prop_name, prop_span)) = call
+                                    .arguments
+                                    .get(1)
+                                    .and_then(|a| a.as_expression())
+                                    .and_then(static_string_expr)
+                                    && prop_name != "__esModule"
+                                    && let Some(Expression::ObjectExpression(desc)) = call
+                                        .arguments
+                                        .get(2)
+                                        .and_then(|a| a.as_expression())
+                                        .map(Expression::get_inner_expression)
+                                {
+                                    let val_expr = desc.properties.iter().find_map(|p| {
+                                        let ObjectPropertyKind::ObjectProperty(prop) = p else {
+                                            return None;
+                                        };
+                                        matches!(
+                                            static_property_key(&prop.key, prop.computed),
+                                            Some("value" | "get")
+                                        )
+                                        .then_some(&prop.value)
+                                    });
+                                    if let Some(rhs) = val_expr {
+                                        register_cjs_export(
+                                            out,
+                                            prop_name,
+                                            rhs,
+                                            prop_span.into(),
+                                            scoping,
+                                            &bindings,
+                                            &mut owner_overrides,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         "assign" if matches!(m.object.get_inner_expression(), Expression::Identifier(id) if id.name == "Object") => {
                             if let Some(first_arg) =
                                 call.arguments.first().and_then(|a| a.as_expression())
@@ -1686,8 +1914,53 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                 }
             }
             AstKind::ImportExpression(expr) => {
+                let static_spec = extract_static_path_expr(
+                    &expr.source,
+                    scoping,
+                    &require_symbols,
+                    &file_ext,
+                    &file_ext_symbols,
+                );
+                let glob_targets = if static_spec.is_none() {
+                    match_template_prefix_glob(project, file, &expr.source)
+                } else {
+                    None
+                };
+                let configured_specs = if static_spec.is_none() && glob_targets.is_none() {
+                    project.dynamic_imports.get(&project.graph.paths[file])
+                } else {
+                    None
+                };
                 for from in owner.sources(file) {
-                    let Expression::StringLiteral(s) = &expr.source else {
+                    let mut targets = Vec::new();
+                    if let Some((spec, spec_span)) = &static_spec {
+                        if let Some(to) = out.target_with_mode(
+                            project,
+                            spec.as_str(),
+                            *spec_span,
+                            Some(from),
+                            false,
+                            false,
+                        ) {
+                            targets.push(to);
+                        }
+                    } else if let Some(matched) = &glob_targets {
+                        targets.extend_from_slice(matched);
+                    } else if let Some(configured) = configured_specs {
+                        for spec in configured {
+                            if let Some(to) = out.target_with_mode(
+                                project,
+                                spec.as_str(),
+                                expr.span,
+                                Some(from),
+                                false,
+                                false,
+                            ) && !targets.contains(&to)
+                            {
+                                targets.push(to);
+                            }
+                        }
+                    } else {
                         out.gap(
                             "computed-import",
                             Some(loc),
@@ -1696,77 +1969,85 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                             None,
                         );
                         continue;
-                    };
-                    let Some(to) = out.target_with_mode(
-                        project,
-                        s.value.as_str(),
-                        s.span,
-                        Some(from),
-                        false,
-                        false,
-                    ) else {
-                        continue;
-                    };
-                    out.edge(from, to, false, loc);
-                    if let Some(member) = react.member(expr.span.start) {
-                        out.link_member(from, to, member, member, false, loc);
-                        continue;
                     }
-                    let (expr_span, parent, awaited) =
-                        unwrap_parent(nodes, node.id(), expr.span, true);
-                    let usage = if awaited {
-                        classify_ns_use(nodes, scoping, parent, expr_span, false, true, |_| true)
-                    } else if parent.is_some_and(|p| {
-                        matches!(p.kind(), AstKind::ExpressionStatement(_))
-                            && !nodes
-                                .parent_id(p.id())
-                                .and_then(|id| nodes.parent_kind(id))
-                                .is_some_and(|k| matches!(k, AstKind::ArrowFunctionExpression(a) if a.expression))
-                    }) {
-                        NsUse::Discarded
-                    } else if let Some(p) = parent
-                        && matches!(p.kind(), AstKind::StaticMemberExpression(m) if m.property.name == "then")
-                        && let Some(AstKind::CallExpression(call)) = nodes.parent_kind(p.id())
-                        && let Some(cb) = call.arguments.first().and_then(|a| a.as_expression()).map(Expression::get_inner_expression)
-                    {
-                        let params = match cb {
-                            Expression::ArrowFunctionExpression(a) => Some(&a.params),
-                            Expression::FunctionExpression(f) => Some(&f.params),
-                            _ => None,
-                        };
-                        match params.and_then(|ps| ps.items.first().filter(|_| ps.items.len() == 1)) {
-                            Some(param) => match &param.pattern.kind {
-                                BindingPatternKind::ObjectPattern(pat) => {
-                                    object_pattern_keys(pat).map_or(NsUse::Escape, NsUse::Props)
-                                }
-                                BindingPatternKind::BindingIdentifier(bind) => {
-                                    bind.symbol_id.get().map_or(NsUse::Escape, NsUse::Alias)
-                                }
-                                _ => NsUse::Escape,
-                            },
-                            None => NsUse::Escape,
+                    for to in targets {
+                        out.edge(from, to, false, loc);
+                        if let Some(member) = react.member(expr.span.start) {
+                            out.link_member(from, to, member, member, false, loc);
+                            continue;
                         }
-                    } else {
-                        NsUse::Escape
-                    };
-                    match usage {
-                        NsUse::Discarded => {}
-                        NsUse::Props(props) => {
-                            for p in props {
-                                out.link_member(from, to, p, p, false, loc);
+                        if glob_targets.is_some() {
+                            out.link_member(from, to, "*", "**", false, loc);
+                            continue;
+                        }
+                        let (expr_span, parent, awaited) =
+                            unwrap_parent(nodes, node.id(), expr.span, true);
+                        let usage = if let Some(pa) =
+                            resolve_promise_all_use(nodes, node.id(), expr_span)
+                        {
+                            pa
+                        } else if awaited {
+                            classify_ns_use(
+                                nodes,
+                                scoping,
+                                parent,
+                                expr_span,
+                                false,
+                                true,
+                                |_| true,
+                            )
+                        } else if parent.is_some_and(|p| {
+                            matches!(p.kind(), AstKind::ExpressionStatement(_))
+                                && !nodes
+                                    .parent_id(p.id())
+                                    .and_then(|id| nodes.parent_kind(id))
+                                    .is_some_and(|k| matches!(k, AstKind::ArrowFunctionExpression(a) if a.expression))
+                        }) {
+                            NsUse::Discarded
+                        } else if let Some(p) = parent
+                            && matches!(p.kind(), AstKind::StaticMemberExpression(m) if m.property.name == "then")
+                            && let Some(AstKind::CallExpression(call)) = nodes.parent_kind(p.id())
+                            && let Some(cb) = call.arguments.first().and_then(|a| a.as_expression()).map(Expression::get_inner_expression)
+                        {
+                            let params = match cb {
+                                Expression::ArrowFunctionExpression(a) => Some(&a.params),
+                                Expression::FunctionExpression(f) => Some(&f.params),
+                                _ => None,
+                            };
+                            match params.and_then(|ps| ps.items.first().filter(|_| ps.items.len() == 1)) {
+                                Some(param) => match &param.pattern.kind {
+                                    BindingPatternKind::ObjectPattern(pat) => {
+                                        object_pattern_keys(pat).map_or(NsUse::Escape, NsUse::Props)
+                                    }
+                                    BindingPatternKind::BindingIdentifier(bind) => {
+                                        bind.symbol_id.get().map_or(NsUse::Escape, NsUse::Alias)
+                                    }
+                                    _ => NsUse::Escape,
+                                },
+                                None => NsUse::Escape,
                             }
+                        } else {
+                            NsUse::Escape
+                        };
+                        match usage {
+                            NsUse::Discarded => {}
+                            NsUse::Props(props) => {
+                                for p in props {
+                                    out.link_member(from, to, p, p, false, loc);
+                                }
+                            }
+                            NsUse::Alias(sym) => {
+                                symbol_namespaces.insert(sym, (to, false, false));
+                            }
+                            NsUse::Escape => out.gap(
+                                "namespace-escape",
+                                Some(loc),
+                                "The literal import resolves, but uses of its namespace are unknown."
+                                    .into(),
+                                Some(from),
+                                Some(to),
+                            ),
                         }
-                        NsUse::Alias(sym) => {
-                            symbol_namespaces.insert(sym, (to, false, false));
-                        }
-                        NsUse::Escape => out.gap(
-                            "namespace-escape",
-                            Some(loc),
-                            "The literal import resolves, but uses of its namespace are unknown."
-                                .into(),
-                            Some(from),
-                            Some(to),
-                        ),
                     }
                 }
             }
@@ -1788,13 +2069,8 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                             {
                                 out.link_member(from, to, prop, prop, true, loc);
                             } else {
-                                out.gap(
-                                    "namespace-escape",
-                                    Some(loc),
-                                    "The type import resolves, but uses of its namespace are unknown.".into(),
-                                    Some(from),
-                                    Some(to),
-                                );
+                                // Whole-module `typeof import("...")` retains the module's type surface without evaluating it.
+                                out.link_member(from, to, "*", "**", true, loc);
                             }
                         }
                     }

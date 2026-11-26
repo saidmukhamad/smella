@@ -52,6 +52,7 @@ pub struct Config {
     pub public_entries: Option<Vec<String>>,
     pub include: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
+    pub dynamic_imports: Option<BTreeMap<String, Vec<String>>>,
 }
 
 pub(crate) fn matcher(pattern: &str) -> Result<GlobMatcher, String> {
@@ -100,6 +101,7 @@ pub struct Project {
     workspace_dirs: Vec<PathBuf>,
     pub react_entry: Option<Id>,
     pub source_mapper: SourceMapper,
+    pub dynamic_imports: BTreeMap<String, Vec<String>>,
 }
 
 impl Project {
@@ -124,6 +126,10 @@ impl Project {
         let exclude = matchers(&input.exclude.or(defaults.exclude).unwrap_or_default())?;
         let entries = input.entries.merge(defaults.entries);
         let public = input.public_entries.or(defaults.public_entries);
+        let dynamic_imports = input
+            .dynamic_imports
+            .or(defaults.dynamic_imports)
+            .unwrap_or_default();
         let mut paths = vec![];
         let mut excluded = vec![];
         let nx_enabled = root
@@ -389,6 +395,7 @@ impl Project {
             workspace_dirs,
             react_entry,
             source_mapper,
+            dynamic_imports,
         };
         for (role, supplied) in
             ROLES
