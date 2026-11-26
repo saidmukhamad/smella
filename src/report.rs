@@ -130,18 +130,13 @@ fn is_test_support_file(path: &str, is_test_root: bool) -> bool {
         || TEST_SETUP_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
-fn classification(lanes: &[Option<Visit>; 8]) -> Option<&'static str> {
-    let used = |role: Role| {
-        lanes[role as usize * 2..role as usize * 2 + 2]
-            .iter()
-            .any(Option::is_some)
-    };
-    match (
-        used(Role::Runtime),
-        used(Role::Test),
-        used(Role::Tooling),
-        used(Role::Public),
-    ) {
+#[inline]
+fn classification(mask: u8) -> Option<&'static str> {
+    let runtime = (mask & 0b0000_0011) != 0;
+    let test = (mask & 0b0000_1100) != 0;
+    let tooling = (mask & 0b0011_0000) != 0;
+    let public = (mask & 0b1100_0000) != 0;
+    match (runtime, test, tooling, public) {
         (false, false, false, false) => Some("unused-export"),
         (false, true, false, false) => Some("test-only-export"),
         (false, false, true, false) => Some("tooling-only-export"),
@@ -294,8 +289,7 @@ impl Report {
                 &graph.paths[file],
                 roles[file] & (1 << Role::Test as usize) != 0,
             );
-            let kind =
-                (!reach.visited[file].iter().any(Option::is_some)).then_some("unreferenced-module");
+            let kind = (!reach.any(file)).then_some("unreferenced-module");
             subjects.push(Subject {
                 file,
                 surface: file,
@@ -307,7 +301,7 @@ impl Report {
                 let kind = if entry_exports_used[file] {
                     None
                 } else {
-                    match classification(&reach.visited[e.binding]) {
+                    match classification(reach.mask(e.binding)) {
                         Some("test-only-export") if test_support => None,
                         other => other,
                     }
@@ -323,7 +317,7 @@ impl Report {
             private[file].sort_by(|&a, &b| graph.nodes[a].name.cmp(&graph.nodes[b].name));
             for &binding in &private[file] {
                 let test_only = !test_support
-                    && classification(&reach.visited[binding]) == Some("test-only-export");
+                    && classification(reach.mask(binding)) == Some("test-only-export");
                 subjects.push(Subject {
                     file,
                     surface: binding,
@@ -335,62 +329,78 @@ impl Report {
         }
         // Apply per-symbol suppressions (config + JSDoc) and detect stale suppressions.
         let mut config_supp_used = vec![false; project.suppressions.len()];
-        let mut config_supp_map: std::collections::HashMap<(String, String), usize> =
-            std::collections::HashMap::new();
+        let mut config_supp_map: rustc_hash::FxHashMap<(String, String), usize> =
+            rustc_hash::FxHashMap::default();
         for (idx, rule) in project.suppressions.iter().enumerate() {
             let file_norm = rule.file.trim().trim_start_matches("./").replace('\\', "/");
             config_supp_map.insert((file_norm, rule.symbol.trim().to_owned()), idx);
         }
         let mut inline_supp_used = vec![false; inline_suppressions.len()];
-        let mut inline_supp_map: std::collections::HashMap<(Id, String), usize> =
-            std::collections::HashMap::new();
+        let mut inline_supp_map: rustc_hash::FxHashMap<(Id, String), usize> =
+            rustc_hash::FxHashMap::default();
         for (idx, s) in inline_suppressions.iter().enumerate() {
             inline_supp_map.insert((s.file, s.symbol.clone()), idx);
         }
         let mut suppressed = Vec::new();
-        for subj in &mut subjects {
-            if subj.form == Form::Module {
-                continue;
-            }
-            let Some(kind) = subj.kind else {
-                continue;
-            };
-            let file_path = &graph.paths[subj.file];
-            let sym_name = &graph.nodes[subj.surface].name;
-            let ws_id = project
-                .workspace_for_file
-                .get(subj.file)
-                .copied()
-                .unwrap_or(0);
-            let workspace = project
-                .workspace_infos
-                .get(ws_id)
-                .map_or(".", |w| w.dir.as_str())
-                .to_owned();
-            if let Some(&idx) = inline_supp_map.get(&(subj.file, sym_name.clone())) {
-                inline_supp_used[idx] = true;
-                suppressed.push(SuppressedFinding {
-                    workspace,
-                    file: file_path.clone(),
-                    symbol: sym_name.clone(),
-                    kind,
-                    reason: inline_suppressions[idx].reason.clone(),
-                    source: "jsdoc",
-                    location: graph.nodes[subj.surface].loc,
-                });
-                subj.kind = None;
-            } else if let Some(&idx) = config_supp_map.get(&(file_path.clone(), sym_name.clone())) {
-                config_supp_used[idx] = true;
-                suppressed.push(SuppressedFinding {
-                    workspace,
-                    file: file_path.clone(),
-                    symbol: sym_name.clone(),
-                    kind,
-                    reason: project.suppressions[idx].reason.trim().to_owned(),
-                    source: "config",
-                    location: graph.nodes[subj.surface].loc,
-                });
-                subj.kind = None;
+        if !inline_supp_map.is_empty() || !config_supp_map.is_empty() {
+            for subj in &mut subjects {
+                if subj.form == Form::Module {
+                    continue;
+                }
+                let Some(kind) = subj.kind else {
+                    continue;
+                };
+                let sym_name = &graph.nodes[subj.surface].name;
+                if !inline_supp_map.is_empty()
+                    && let Some(&idx) = inline_supp_map.get(&(subj.file, sym_name.clone()))
+                {
+                    let ws_id = project
+                        .workspace_for_file
+                        .get(subj.file)
+                        .copied()
+                        .unwrap_or(0);
+                    let workspace = project
+                        .workspace_infos
+                        .get(ws_id)
+                        .map_or(".", |w| w.dir.as_str())
+                        .to_owned();
+                    inline_supp_used[idx] = true;
+                    suppressed.push(SuppressedFinding {
+                        workspace,
+                        file: graph.paths[subj.file].clone(),
+                        symbol: sym_name.clone(),
+                        kind,
+                        reason: inline_suppressions[idx].reason.clone(),
+                        source: "jsdoc",
+                        location: graph.nodes[subj.surface].loc,
+                    });
+                    subj.kind = None;
+                } else if !config_supp_map.is_empty()
+                    && let Some(&idx) =
+                        config_supp_map.get(&(graph.paths[subj.file].clone(), sym_name.clone()))
+                {
+                    let ws_id = project
+                        .workspace_for_file
+                        .get(subj.file)
+                        .copied()
+                        .unwrap_or(0);
+                    let workspace = project
+                        .workspace_infos
+                        .get(ws_id)
+                        .map_or(".", |w| w.dir.as_str())
+                        .to_owned();
+                    config_supp_used[idx] = true;
+                    suppressed.push(SuppressedFinding {
+                        workspace,
+                        file: graph.paths[subj.file].clone(),
+                        symbol: sym_name.clone(),
+                        kind,
+                        reason: project.suppressions[idx].reason.trim().to_owned(),
+                        source: "config",
+                        location: graph.nodes[subj.surface].loc,
+                    });
+                    subj.kind = None;
+                }
             }
         }
         for (rule, used) in project.suppressions.iter().zip(config_supp_used) {
@@ -432,9 +442,7 @@ impl Report {
         });
         // Queries need the predecessor forest and source labels. Drop build-time
         // adjacency lists and module tables before handing the snapshot to JS.
-        for node in &mut graph.nodes {
-            node.edges = Vec::new();
-        }
+        graph.clear_edges();
         graph.modules = Vec::new();
         graph.gaps = Vec::new();
         if profile {
@@ -507,11 +515,20 @@ impl Report {
         })
     }
     fn record(&self, index: usize, s: &Subject) -> Record<'_> {
-        let visits = &self.reach.visited[s.binding];
-        let contexts = |lanes: &[Option<Visit>; 8], phase: usize| {
-            Contexts((0usize..3).fold(0, |mask, role| {
-                mask | (u8::from(lanes[2 * role + phase].is_some()) << role)
-            }))
+        let binding_mask = self.reach.mask(s.binding);
+        let file_mask = self.reach.mask(s.file);
+        let contexts = |mask: u8, phase: u8| {
+            let mut out = 0u8;
+            if (mask & (1u8 << phase)) != 0 {
+                out |= 1;
+            }
+            if (mask & (1u8 << (2 + phase))) != 0 {
+                out |= 2;
+            }
+            if (mask & (1u8 << (4 + phase))) != 0 {
+                out |= 4;
+            }
+            Contexts(out)
         };
         let node = &self.graph.nodes[s.surface];
         let ws_id = self.workspace_for_file.get(s.file).copied().unwrap_or(0);
@@ -529,11 +546,11 @@ impl Report {
                 value: if s.form == Form::Module {
                     Contexts(0)
                 } else {
-                    contexts(visits, 0)
+                    contexts(binding_mask, 0)
                 },
-                types: contexts(visits, 1),
-                contract: visits[6..].iter().any(Option::is_some),
-                evaluation: contexts(&self.reach.visited[s.file], 0),
+                types: contexts(binding_mask, 1),
+                contract: (binding_mask & 0b1100_0000) != 0,
+                evaluation: contexts(file_mask, 0),
             },
         }
     }
@@ -555,7 +572,7 @@ impl Report {
     fn witness(&self, mut id: Id, mut lane: usize) -> Value {
         let mut path = vec![];
         loop {
-            let visit = self.reach.visited[id][lane].unwrap();
+            let visit = self.reach.visit(id, lane).unwrap();
             let via = match visit {
                 Visit::Root => None,
                 Visit::From {
@@ -612,7 +629,7 @@ impl Report {
         for role in ROLES {
             for phase in 0..2 {
                 let lane = (role as usize) * 2 + phase;
-                if self.reach.visited[s.binding][lane].is_some() {
+                if self.reach.has(s.binding, lane) {
                     let fact = if role == Role::Public {
                         "contract"
                     } else if phase == 1 {
@@ -627,7 +644,7 @@ impl Report {
                 }
             }
             let lane = (role as usize) * 2;
-            if s.form != Form::Module && self.reach.visited[s.file][lane].is_some() {
+            if s.form != Form::Module && self.reach.has(s.file, lane) {
                 witnesses.push(
                     json!({"role":role,"fact":"evaluation","path":self.witness(s.file,lane)}),
                 );
@@ -645,7 +662,7 @@ impl Report {
             Some("unreferenced-module") => "No evaluation, type, or public-contract path from the effective roots.",
             Some("test-only-export" | "test-only-binding") => "Only test roots have known retaining references.",
             Some("tooling-only-export") => "Only tooling roots have known retaining references.",
-            None if self.reach.visited[s.binding].iter().all(Option::is_none) => "No effective root reaches this binding.",
+            None if !self.reach.any(s.binding) => "No effective root reaches this binding.",
             _ => "The effective roots retain this subject."
         }.into();
         Ok(result)

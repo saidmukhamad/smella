@@ -1,7 +1,8 @@
 //! Reverse reachability for questions about a single binding. Keep only states
 //! reached by tests or by a concrete read in an unrooted workspace consumer.
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
+use rustc_hash::FxHashMap;
 use serde_json::{Value, json};
 
 use crate::graph::{Gap, Graph, Id, Loc, Reach, Role};
@@ -17,15 +18,17 @@ pub struct Evidence {
     offsets: Vec<usize>,
     incoming: Vec<Step>,
     test_files: Vec<bool>,
-    reads: HashMap<usize, Vec<Step>>,
+    reads: FxHashMap<usize, Vec<Step>>,
     uncertain: Vec<bool>,
     gap_id: Option<String>,
 }
 
+#[inline]
 fn state(node: Id, phase: usize) -> usize {
     node * 2 + phase
 }
 
+#[inline]
 fn transitions(graph: &Graph, source: usize, mut visit: impl FnMut(usize, Loc)) {
     let id = source / 2;
     let phase = source % 2;
@@ -36,7 +39,7 @@ fn transitions(graph: &Graph, source: usize, mut visit: impl FnMut(usize, Loc)) 
         }
         visit(state(node.file, 1), node.loc);
     }
-    for edge in &node.edges {
+    for edge in graph.edges(id) {
         visit(
             state(edge.target, phase | usize::from(edge.type_only)),
             edge.loc,
@@ -47,29 +50,57 @@ fn transitions(graph: &Graph, source: usize, mut visit: impl FnMut(usize, Loc)) 
 // Follow forwarding edges so that a local barrel in front of a workspace
 // boundary has the same meaning as a direct cross-package import.
 fn crossing_imports(graph: &Graph, workspace: &[usize]) -> Vec<bool> {
-    let mut crossing = vec![false; graph.nodes.len()];
-    let mut incoming = vec![Vec::new(); graph.nodes.len()];
-    let mut queue = VecDeque::new();
+    let n = graph.nodes.len();
+    let mut crossing = vec![false; n];
+    let mut queue: Vec<u32> = Vec::new();
+    let mut in_offsets = vec![0u32; n + 1];
     for (id, node) in graph.nodes.iter().enumerate() {
         if !matches!(node.kind, "import" | "export" | "re-export") {
             continue;
         }
-        for edge in &node.edges {
-            if workspace[node.file] != workspace[graph.nodes[edge.target].file] {
+        let ws = workspace[node.file];
+        for edge in graph.edges(id) {
+            if ws != workspace[graph.nodes[edge.target].file] {
                 if !crossing[id] {
                     crossing[id] = true;
-                    queue.push_back(id);
+                    queue.push(id as u32);
                 }
             } else {
-                incoming[edge.target].push(id);
+                in_offsets[edge.target + 1] += 1;
             }
         }
     }
-    while let Some(target) = queue.pop_front() {
-        for &id in &incoming[target] {
+    if queue.is_empty() {
+        return crossing;
+    }
+    for i in 1..=n {
+        in_offsets[i] += in_offsets[i - 1];
+    }
+    let mut cursor = in_offsets[..n].to_vec();
+    let mut incoming = vec![0u32; in_offsets[n] as usize];
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if !matches!(node.kind, "import" | "export" | "re-export") {
+            continue;
+        }
+        let ws = workspace[node.file];
+        for edge in graph.edges(id) {
+            if ws == workspace[graph.nodes[edge.target].file] {
+                let slot = cursor[edge.target] as usize;
+                incoming[slot] = id as u32;
+                cursor[edge.target] += 1;
+            }
+        }
+    }
+    let mut head = 0;
+    while head < queue.len() {
+        let target = queue[head] as usize;
+        head += 1;
+        let range = in_offsets[target] as usize..in_offsets[target + 1] as usize;
+        for &id_u32 in &incoming[range] {
+            let id = id_u32 as usize;
             if !crossing[id] {
                 crossing[id] = true;
-                queue.push_back(id);
+                queue.push(id as u32);
             }
         }
     }
@@ -96,8 +127,8 @@ impl WorkspacePaths {
         &mut self,
         graph: &Graph,
         start: usize,
-        next: &HashMap<usize, Option<Step>>,
-        known: &mut HashMap<usize, usize>,
+        next: &FxHashMap<usize, Option<Step>>,
+        known: &mut FxHashMap<usize, usize>,
     ) -> usize {
         let mut missing = Vec::new();
         let mut current = start;
@@ -131,12 +162,12 @@ impl Evidence {
         if workspace.iter().any(|&id| id != 0) {
             let crossing = crossing_imports(graph, workspace);
             for (id, node) in graph.nodes.iter().enumerate() {
-                if reach.visited[node.file].iter().any(Option::is_some)
+                if reach.any(node.file)
                     || !matches!(node.kind, "binding" | "module" | "declaration" | "export")
                 {
                     continue;
                 }
-                for edge in &node.edges {
+                for edge in graph.edges(id) {
                     let target_node = &graph.nodes[edge.target];
                     let imports_binding = target_node.kind == "import" && crossing[edge.target];
                     let loads_module = target_node.kind == "module"
@@ -211,7 +242,7 @@ impl Evidence {
         let states = possible.len();
         let each_edge = |emit: &mut dyn FnMut(usize, usize, Loc)| {
             for (s, &unknown) in possible.iter().enumerate() {
-                if unknown || reach.visited[s / 2][Role::Test as usize * 2 + s % 2].is_some() {
+                if unknown || reach.has(s / 2, Role::Test as usize * 2 + s % 2) {
                     transitions(graph, s, |target, loc| emit(s, target, loc));
                 }
             }
@@ -260,9 +291,10 @@ impl Evidence {
             } else {
                 "value"
             };
-            let mut known = HashMap::new();
+            let mut known = FxHashMap::default();
             let start = state(binding, phase);
-            let mut next = HashMap::from([(start, None)]);
+            let mut next = FxHashMap::default();
+            next.insert(start, None);
             let mut queue = VecDeque::from([start]);
             while let Some(s) = queue.pop_front() {
                 if s % 2 == 0 && self.test_files.get(s / 2) == Some(&true) {

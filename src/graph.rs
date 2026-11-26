@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 pub type Id = usize;
@@ -102,23 +103,38 @@ pub struct Graph {
     pub modules: Vec<Module>,
     pub gaps: Vec<PendingGap>,
     pub links: Vec<Link>,
+    edge_offsets: Vec<u32>,
+    csr_edges: Vec<Edge>,
 }
 
 impl Graph {
     pub fn new(paths: Vec<String>) -> Self {
+        let n = paths.len();
         let mut g = Self {
             paths,
-            nodes: vec![],
-            modules: vec![],
+            nodes: Vec::with_capacity(n),
+            modules: Vec::with_capacity(n),
             gaps: vec![],
             links: vec![],
+            edge_offsets: Vec::new(),
+            csr_edges: Vec::new(),
         };
         // Module vertex IDs coincide with file IDs.
-        for f in 0..g.paths.len() {
+        for f in 0..n {
             g.node(f, "module", "", Loc::default());
             g.modules.push(Module::default());
         }
         g
+    }
+    #[inline]
+    pub fn edges(&self, id: Id) -> &[Edge] {
+        let start = self.edge_offsets[id] as usize;
+        let end = self.edge_offsets[id + 1] as usize;
+        &self.csr_edges[start..end]
+    }
+    pub fn clear_edges(&mut self) {
+        self.edge_offsets = Vec::new();
+        self.csr_edges = Vec::new();
     }
     pub fn node(&mut self, file: Id, kind: &'static str, name: &str, loc: Loc) -> Id {
         self.nodes.push(Node {
@@ -186,10 +202,15 @@ impl Graph {
         // Propagate names backwards across star edges, once per (file, name).
         // A named export always overrides a star; cycles cannot introduce new names.
         let mut reverse = vec![vec![]; self.paths.len()];
-        let mut queue = VecDeque::new();
         for (file, module) in self.modules.iter().enumerate() {
             for star in &module.stars {
                 reverse[star.target].push((file, star.type_only, star.loc));
+            }
+        }
+        let mut queue = VecDeque::new();
+        for (file, module) in self.modules.iter().enumerate() {
+            if reverse[file].is_empty() {
+                continue;
             }
             for name in module.exports.keys().filter(|n| n.as_str() != "default") {
                 queue.push_back((file, name.clone()));
@@ -214,49 +235,81 @@ impl Graph {
                         explicit: false,
                     },
                 );
-                queue.push_back((file, name.clone()));
+                if !reverse[file].is_empty() {
+                    queue.push_back((file, name.clone()));
+                }
             }
         }
         // Resolve identity through named forwards and star diamonds. A star name
         // with two distinct declarations is absent from the ESM namespace.
         let links = std::mem::take(&mut self.links);
-        let mut forwarded = BTreeSet::new();
+        let node_count = self.nodes.len();
+        let mut forwarded = vec![false; node_count];
         for (from, file, name, type_only, loc) in &links {
             if self.nodes[*from].kind == "re-export" {
-                forwarded.insert(*from);
+                forwarded[*from] = true;
                 if let Some(target) = self.modules[*file].exports.get(name) {
                     self.edge(*from, target.surface, *type_only, *loc);
                 }
             }
         }
-        let mut origins = vec![Vec::new(); self.nodes.len()];
-        let mut dependents = vec![Vec::new(); self.nodes.len()];
-        let mut queue = VecDeque::new();
+        // Inline 2-origin storage + CSR reverse dependents avoid 2*N small Vec allocations.
+        let mut origins: Vec<([Id; 2], u8)> = vec![([0, 0], 0); node_count];
+        let mut dep_offsets = vec![0u32; node_count + 1];
+        let mut origin_queue: Vec<(Id, Id)> = Vec::new();
         for module in &self.modules {
             for export in module.exports.values() {
                 let id = export.surface;
-                if export.explicit && !forwarded.contains(&id) {
-                    origins[id].push(export.binding);
-                    queue.push_back((id, export.binding));
+                if export.explicit && !forwarded[id] {
+                    origins[id] = ([export.binding, 0], 1);
+                    origin_queue.push((id, export.binding));
                 } else {
                     for edge in &self.nodes[id].edges {
-                        dependents[edge.target].push(id);
+                        dep_offsets[edge.target + 1] += 1;
                     }
                 }
             }
         }
-        while let Some((id, origin)) = queue.pop_front() {
-            for &next in &dependents[id] {
-                if origins[next].len() < 2 && !origins[next].contains(&origin) {
-                    origins[next].push(origin);
-                    queue.push_back((next, origin));
+        for i in 1..=node_count {
+            dep_offsets[i] += dep_offsets[i - 1];
+        }
+        let mut dep_cursor = dep_offsets[..node_count].to_vec();
+        let mut dependents = vec![0u32; dep_offsets[node_count] as usize];
+        for module in &self.modules {
+            for export in module.exports.values() {
+                let id = export.surface;
+                if !(export.explicit && !forwarded[id]) {
+                    for edge in &self.nodes[id].edges {
+                        let slot = dep_cursor[edge.target] as usize;
+                        dependents[slot] = id as u32;
+                        dep_cursor[edge.target] += 1;
+                    }
+                }
+            }
+        }
+        let mut head = 0;
+        while head < origin_queue.len() {
+            let (id, origin) = origin_queue[head];
+            head += 1;
+            let range = dep_offsets[id] as usize..dep_offsets[id + 1] as usize;
+            for &next_u32 in &dependents[range] {
+                let next = next_u32 as usize;
+                let (pair, len) = &mut origins[next];
+                if *len == 0 {
+                    pair[0] = origin;
+                    *len = 1;
+                    origin_queue.push((next, origin));
+                } else if *len == 1 && pair[0] != origin {
+                    pair[1] = origin;
+                    *len = 2;
+                    origin_queue.push((next, origin));
                 }
             }
         }
         for module in &mut self.modules {
             module
                 .exports
-                .retain(|_, export| export.explicit || origins[export.surface].len() == 1);
+                .retain(|_, export| export.explicit || origins[export.surface].1 == 1);
         }
         for (from, file, name, type_only, loc) in links {
             if name == "**" {
@@ -285,8 +338,8 @@ impl Graph {
                 continue;
             }
             let target = self.modules[file].exports.get(&name);
-            if let Some(target) = target.filter(|e| origins[e.surface].len() == 1) {
-                if !forwarded.contains(&from) {
+            if let Some(target) = target.filter(|e| origins[e.surface].1 == 1) {
+                if !forwarded[from] {
                     self.edge(from, target.surface, type_only, loc);
                 }
             } else if self.modules[file].cjs_opaque_default
@@ -294,7 +347,7 @@ impl Graph {
             {
                 self.edge(from, default_target.surface, type_only, loc);
             } else {
-                if forwarded.contains(&from) {
+                if forwarded[from] {
                     self.nodes[from].edges.clear();
                 }
                 let from_file = self.nodes[from].file;
@@ -314,10 +367,24 @@ impl Graph {
                 );
             }
         }
+        // Freeze adjacency into a flat CSR for cache-friendly BFS/DFS and O(1) drop.
+        let total_edges: usize = self.nodes.iter().map(|n| n.edges.len()).sum();
+        let mut edge_offsets = Vec::with_capacity(self.nodes.len() + 1);
+        let mut csr_edges = Vec::with_capacity(total_edges);
+        edge_offsets.push(0);
         for node in &mut self.nodes {
-            node.edges
-                .sort_by_key(|e| (e.loc.start, e.target, e.type_only));
+            let start = csr_edges.len();
+            csr_edges.extend_from_slice(&node.edges);
+            let end = csr_edges.len();
+            if end - start > 1 {
+                csr_edges[start..end]
+                    .sort_unstable_by_key(|e| (e.loc.start, e.target, e.type_only));
+            }
+            edge_offsets.push(end as u32);
+            node.edges = Vec::new();
         }
+        self.edge_offsets = edge_offsets;
+        self.csr_edges = csr_edges;
     }
 }
 
@@ -327,71 +394,149 @@ pub enum Visit {
     From { node: Id, lane: usize, loc: Loc },
 }
 
+#[derive(Clone, Copy)]
+struct CompactVisit {
+    /// `u32::MAX` = unvisited, `u32::MAX - 1` = Root, otherwise `(node << 3) | lane`.
+    packed: u32,
+    loc: Loc,
+}
+
+impl CompactVisit {
+    const UNVISITED: u32 = u32::MAX;
+    const ROOT: u32 = u32::MAX - 1;
+
+    #[inline]
+    const fn unvisited() -> Self {
+        Self {
+            packed: Self::UNVISITED,
+            loc: Loc { start: 0, end: 0 },
+        }
+    }
+    #[inline]
+    const fn root() -> Self {
+        Self {
+            packed: Self::ROOT,
+            loc: Loc { start: 0, end: 0 },
+        }
+    }
+    #[inline]
+    const fn from_edge(node: Id, lane: u8, loc: Loc) -> Self {
+        Self {
+            packed: ((node as u32) << 3) | (lane as u32),
+            loc,
+        }
+    }
+    #[inline]
+    fn decode(self) -> Option<Visit> {
+        match self.packed {
+            Self::UNVISITED => None,
+            Self::ROOT => Some(Visit::Root),
+            p => Some(Visit::From {
+                node: (p >> 3) as Id,
+                lane: (p & 7) as usize,
+                loc: self.loc,
+            }),
+        }
+    }
+}
+
 pub struct Reach {
-    pub visited: Vec<[Option<Visit>; 8]>,
+    /// One byte per node: bit `lane` is set iff `(node, lane)` was reached.
+    pub masks: Vec<u8>,
+    parents: Vec<CompactVisit>,
 }
 
 impl Reach {
+    #[inline]
+    pub fn mask(&self, node: Id) -> u8 {
+        self.masks[node]
+    }
+    #[inline]
+    pub fn has(&self, node: Id, lane: usize) -> bool {
+        (self.masks[node] & (1u8 << lane)) != 0
+    }
+    #[inline]
+    pub fn any(&self, node: Id) -> bool {
+        self.masks[node] != 0
+    }
+    #[inline]
+    pub fn visit(&self, node: Id, lane: usize) -> Option<Visit> {
+        if !self.has(node, lane) {
+            return None;
+        }
+        self.parents[node * 8 + lane].decode()
+    }
+
     pub fn compute(g: &Graph, roots: &[Root]) -> Self {
-        let mut visited = vec![[None; 8]; g.nodes.len()];
-        let mut queue = VecDeque::new();
+        let n = g.nodes.len();
+        let file_count = g.paths.len();
+        let mut masks = vec![0u8; n];
+        let mut parents = vec![CompactVisit::unvisited(); n * 8];
+        let mut queue: Vec<(u32, u8)> = Vec::with_capacity(n.min(65536));
+
         for root in roots {
             let file = g.paths.binary_search(&root.file).unwrap();
-            let lane = root.role as usize * 2;
-            visited[file][lane] = Some(Visit::Root);
-            queue.push_back((file, lane));
+            let lane = (root.role as u8) * 2;
+            let bit = 1u8 << lane;
+            if (masks[file] & bit) == 0 {
+                masks[file] |= bit;
+                parents[file * 8 + lane as usize] = CompactVisit::root();
+                queue.push((file as u32, lane));
+            }
             if root.role == Role::Public || root.mode == RootEntryMode::AllExports {
                 for export in g.modules[file].exports.values() {
                     let surface = export.surface;
-                    if visited[surface][lane].is_none() {
-                        visited[surface][lane] = Some(Visit::From {
-                            node: file,
-                            lane,
-                            loc: g.nodes[surface].loc,
-                        });
-                        queue.push_back((surface, lane));
+                    if (masks[surface] & bit) == 0 {
+                        masks[surface] |= bit;
+                        parents[surface * 8 + lane as usize] =
+                            CompactVisit::from_edge(file, lane, g.nodes[surface].loc);
+                        queue.push((surface as u32, lane));
                     }
                 }
             } else if root.mode == RootEntryMode::DefaultExport
                 && let Some(export) = g.modules[file].exports.get("default")
             {
                 let surface = export.surface;
-                if visited[surface][lane].is_none() {
-                    visited[surface][lane] = Some(Visit::From {
-                        node: file,
-                        lane,
-                        loc: g.nodes[surface].loc,
-                    });
-                    queue.push_back((surface, lane));
+                if (masks[surface] & bit) == 0 {
+                    masks[surface] |= bit;
+                    parents[surface * 8 + lane as usize] =
+                        CompactVisit::from_edge(file, lane, g.nodes[surface].loc);
+                    queue.push((surface as u32, lane));
                 }
             }
         }
-        while let Some((from, lane)) = queue.pop_front() {
+
+        let mut head = 0;
+        while head < queue.len() {
+            let (from_u32, lane) = queue[head];
+            head += 1;
+            let from = from_u32 as usize;
             // Type retention of a module never activates its initializers.
-            if lane % 2 == 1 && from < g.paths.len() {
-                continue;
+            if (lane & 1) == 1 {
+                if from < file_count {
+                    continue;
+                }
+                let file = g.nodes[from].file;
+                let bit = 1u8 << lane;
+                if (masks[file] & bit) == 0 {
+                    masks[file] |= bit;
+                    parents[file * 8 + lane as usize] =
+                        CompactVisit::from_edge(from, lane, g.nodes[from].loc);
+                }
             }
-            let file = g.nodes[from].file;
-            if lane % 2 == 1 && visited[file][lane].is_none() {
-                visited[file][lane] = Some(Visit::From {
-                    node: from,
-                    lane,
-                    loc: g.nodes[from].loc,
-                });
-            }
-            for edge in &g.nodes[from].edges {
-                let next = lane | usize::from(edge.type_only);
-                if visited[edge.target][next].is_none() {
-                    visited[edge.target][next] = Some(Visit::From {
-                        node: from,
-                        lane,
-                        loc: edge.loc,
-                    });
-                    queue.push_back((edge.target, next));
+            for edge in g.edges(from) {
+                let next = lane | u8::from(edge.type_only);
+                let bit = 1u8 << next;
+                let target = edge.target;
+                if (masks[target] & bit) == 0 {
+                    masks[target] |= bit;
+                    parents[target * 8 + next as usize] =
+                        CompactVisit::from_edge(from, lane, edge.loc);
+                    queue.push((target as u32, next));
                 }
             }
         }
-        Self { visited }
+        Self { masks, parents }
     }
 
     pub fn gaps(
@@ -401,34 +546,31 @@ impl Reach {
         roles: &[u8],
         multi_workspace: bool,
     ) -> Vec<Gap> {
-        let active = |guard: Option<Id>| {
-            guard.is_none_or(|n| self.visited[n].iter().any(Option::is_some) || uncertain(n))
-        };
+        let active = |guard: Option<Id>| guard.is_none_or(|n| self.any(n) || uncertain(n));
         let node_test_only = |n: Id| {
-            !uncertain(n)
-                && self.visited[n][0..2].iter().all(Option::is_none)
-                && self.visited[n][4..8].iter().all(Option::is_none)
-                && self.visited[n][2..4].iter().any(Option::is_some)
+            let m = self.masks[n];
+            !uncertain(n) && (m & 0b1111_0011) == 0 && (m & 0b0000_1100) != 0
         };
         let node_test_or_tooling_only = |n: Id| {
-            !uncertain(n)
-                && self.visited[n][0..2].iter().all(Option::is_none)
-                && self.visited[n][6..8].iter().all(Option::is_none)
-                && self.visited[n][2..6].iter().any(Option::is_some)
+            let m = self.masks[n];
+            !uncertain(n) && (m & 0b1100_0011) == 0 && (m & 0b0011_1100) != 0
         };
-        let mut records = vec![];
+        let mut records = Vec::with_capacity(graph.gaps.len());
         // Escaped namespace values can retain implementations beyond the target file.
         // Follow their possible dependencies without recording any positive usage.
-        let mut closures = BTreeMap::new();
+        let mut closures: FxHashMap<(Id, bool, bool), Option<Vec<String>>> = FxHashMap::default();
+        let mut seen_stamp = vec![0u32; graph.nodes.len()];
+        let mut file_stamp = vec![0u32; graph.paths.len()];
+        let mut stamp = 0u32;
+        let mut stack: Vec<Id> = Vec::new();
+        let mut touched_files: Vec<usize> = Vec::new();
+
         for pending in &graph.gaps {
             if !active(pending.guard) {
                 continue;
             }
             let mut record = pending.record.clone();
-            if pending
-                .guard
-                .is_some_and(|n| self.visited[n].iter().all(Option::is_none))
-            {
+            if pending.guard.is_some_and(|n| !self.any(n)) {
                 record.message =
                     format!("If the unrooted workspace caller runs: {}", record.message);
             }
@@ -473,45 +615,52 @@ impl Reach {
                 }
             }
             if let Some(target) = pending.target_file {
-                let guard_runtime = pending.guard.is_none_or(|n| {
-                    uncertain(n)
-                        || self.visited[n][0..2].iter().any(Option::is_some)
-                        || self.visited[n][6..8].iter().any(Option::is_some)
-                });
+                let guard_runtime = pending
+                    .guard
+                    .is_none_or(|n| uncertain(n) || (self.masks[n] & 0b1100_0011) != 0);
                 let guard_tooling = pending
                     .guard
-                    .is_some_and(|n| self.visited[n][4..6].iter().any(Option::is_some));
-                let already_covered = |n: Id| {
-                    let v = &self.visited[n];
-                    let has_runtime = v[0].is_some() || v[6].is_some();
-                    if guard_runtime {
-                        has_runtime
-                    } else if guard_tooling {
-                        has_runtime || v[4].is_some()
-                    } else {
-                        // Test-only caller: already covered if reached by runtime, public, or test.
-                        has_runtime || v[2].is_some()
-                    }
+                    .is_some_and(|n| (self.masks[n] & 0b0011_0000) != 0);
+                let cover_mask: u8 = if guard_runtime {
+                    0b0100_0001
+                } else if guard_tooling {
+                    0b0101_0001
+                } else {
+                    0b0100_0101
                 };
                 record.affected_files = closures
                     .entry((target, guard_runtime, guard_tooling))
                     .or_insert_with(|| {
-                        let mut stack = Vec::new();
-                        if !already_covered(target) {
+                        stamp = stamp.wrapping_add(1);
+                        if stamp == 0 {
+                            seen_stamp.fill(0);
+                            file_stamp.fill(0);
+                            stamp = 1;
+                        }
+                        stack.clear();
+                        touched_files.clear();
+                        if (self.masks[target] & cover_mask) == 0 {
                             stack.push(target);
                         }
                         for e in graph.modules[target].exports.values() {
-                            if !already_covered(e.surface) && !already_covered(e.binding) {
+                            if (self.masks[e.surface] & cover_mask) == 0
+                                && (self.masks[e.binding] & cover_mask) == 0
+                            {
                                 stack.push(e.surface);
                             }
                         }
-                        let mut seen = BTreeSet::new();
-                        let mut files = BTreeSet::new();
                         while let Some(n) = stack.pop() {
-                            if seen.insert(n) {
-                                files.insert(graph.paths[graph.nodes[n].file].clone());
-                                for edge in &graph.nodes[n].edges {
-                                    if !already_covered(edge.target) {
+                            if seen_stamp[n] != stamp {
+                                seen_stamp[n] = stamp;
+                                let f = graph.nodes[n].file;
+                                if file_stamp[f] != stamp {
+                                    file_stamp[f] = stamp;
+                                    touched_files.push(f);
+                                }
+                                for edge in graph.edges(n) {
+                                    if (self.masks[edge.target] & cover_mask) == 0
+                                        && seen_stamp[edge.target] != stamp
+                                    {
                                         stack.push(edge.target);
                                     }
                                 }
@@ -522,12 +671,18 @@ impl Reach {
                                 gap.record.affected_files.is_none()
                                     && gap.target_file.is_none()
                                     && matches!(gap.record.code, "computed-import" | "bundler-glob")
-                                    && gap.guard.is_some_and(|n| seen.contains(&n))
+                                    && gap.guard.is_some_and(|n| seen_stamp[n] == stamp)
                             })
                         {
                             None
                         } else {
-                            Some(files.into_iter().collect())
+                            touched_files.sort_unstable();
+                            Some(
+                                touched_files
+                                    .iter()
+                                    .map(|&f| graph.paths[f].clone())
+                                    .collect(),
+                            )
                         }
                     })
                     .clone();

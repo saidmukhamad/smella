@@ -479,8 +479,7 @@ pub fn analyze_dependencies(
                         && !m.dependencies.contains(&r.package)
                         && !m.peer_dependencies.contains(&r.package)
                         && !m.optional_dependencies.contains(&r.package)
-                        && (reach.visited[r.file][0].is_some()
-                            || reach.visited[r.file][6].is_some())
+                        && (reach.has(r.file, 0) || reach.has(r.file, 6))
                         && seen_dev_runtime.insert((r.file, r.package.clone()))
                     {
                         findings.push(DependencyFinding {
