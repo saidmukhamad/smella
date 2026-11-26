@@ -18,27 +18,33 @@
     "README.md",
     "docs/nx-react.md"
   ],
+  "packageManager": "bun@1.4.0",
   "engines": {
+    "bun": ">=1.2",
     "node": ">=22"
   },
   "optionalDependencies": {
     "smella-linux-x64-gnu": "0.1.0"
   },
   "scripts": {
-    "build:native": "node scripts/build.mjs --release",
+    "build:native": "bun scripts/build.mjs --release",
     "build:ts": "tsdown",
-    "build": "node scripts/build.mjs --release && tsdown",
+    "build": "bun scripts/build.mjs --release && tsdown",
     "typecheck": "tsc --noEmit",
     "fmt": "cargo fmt",
     "fmt:check": "cargo fmt --check",
     "lint": "cargo clippy --all-targets -- -D warnings",
-    "check": "npm run fmt:check && npm run lint && npm run typecheck && npm test",
-    "test": "node scripts/build.mjs && tsdown && node --test test/*.test.mjs",
-    "bench": "npm run build && node scripts/bench.mjs",
-    "bench:record": "npm run build && node scripts/track-bench.mjs --record --check",
-    "verify:corpus": "npm run build && node scripts/verify-corpus.mjs",
-    "bench:check": "npm run build && node scripts/track-bench.mjs --check",
-    "bench:plot": "node scripts/plot-bench.mjs"
+    "smella": "bun dist/cli.mjs --check --dependencies",
+    "check": "bun run fmt:check && bun run lint && bun run typecheck && bun run test && bun run smella",
+    "test": "bun scripts/build.mjs && tsdown && bun test test/*.test.mjs",
+    "bench": "bun run build && bun scripts/bench.mjs",
+    "bench:workspace": "bun run build && bun scripts/bench-workspace.mjs",
+    "bench:nx-react": "bun run build && bun scripts/bench-nx-react.mjs",
+    "bench:record": "bun run build && bun scripts/track-bench.mjs --record --check",
+    "verify:corpus": "bun run build && bun scripts/verify-corpus.mjs",
+    "compare:test-usage": "bun run build && bun scripts/compare-test-usage.mjs",
+    "bench:check": "bun run build && bun scripts/track-bench.mjs --check",
+    "bench:plot": "bun scripts/plot-bench.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.11",

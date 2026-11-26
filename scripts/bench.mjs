@@ -52,9 +52,10 @@ async function bench() {
     const cold = [], resident = [], startup = [], rss = [], knipTimes = [];
     const knip = process.env.KNIP_BIN && resolve(process.env.KNIP_BIN);
     const script = fileURLToPath(import.meta.url);
+    const evalArgs = process.versions.bun ? ['-e'] : ['--input-type=module', '-e'];
     for (let i = 0; i < samples; i++) {
       if (knip && i % 2 === 0) compareKnip();
-      startup.push(run(process.execPath,['--input-type=module','-e',`await import(${JSON.stringify(new URL('../dist/index.mjs',import.meta.url).href)})`],root).ms);
+      startup.push(run(process.execPath,[...evalArgs,`await import(${JSON.stringify(new URL('../dist/index.mjs',import.meta.url).href)})`],root).ms);
       const { ms, output } = run(process.execPath,[script,'--once',root],root);
       cold.push(ms);
       const snapshot = JSON.parse(output);
@@ -74,6 +75,7 @@ async function bench() {
     for (let i = 0; i < samples; i++) resident.push(await once(root));
     const repo = fileURLToPath(new URL('..',import.meta.url));
     console.log(JSON.stringify({
+      ...(process.versions.bun ? { bun: process.versions.bun } : {}),
       node:process.version, rust:run('rustc',['--version'],repo).output, cpu:cpus()[0].model, os:release(),
       revision:run('git',['rev-parse','--short','HEAD'],repo).output,
       files: count + 1, findings: count, samples,

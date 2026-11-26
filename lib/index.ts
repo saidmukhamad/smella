@@ -119,7 +119,7 @@ function load(): NativeBinding {
   } catch (cause) {
     throw new AnalysisError(
       'NATIVE_LOAD',
-      'Could not load the smella native package. In a checkout, run npm run build.',
+      'Could not load the smella native package. In a checkout, run bun run build.',
       cause,
     );
   }

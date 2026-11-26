@@ -11,7 +11,7 @@ const files = await readdir(folder).catch(error => {
 });
 const entries = await Promise.all(files.filter(f=>f.endsWith('.json')).sort().map(async f=>
   JSON.parse(await readFile(new URL(f,folder),'utf8'))));
-if (!entries.length) throw new Error('Run npm run bench:record to create the first local benchmark.');
+if (!entries.length) throw new Error('Run bun run bench:record to create the first local benchmark.');
 const latest = entries.at(-1).machine;
 const comparable = entries.filter(e=>['cpu','arch','platform','os','node','rust'].every(k=>e.machine[k]===latest[k]));
 const data = [
