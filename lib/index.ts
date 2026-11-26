@@ -113,9 +113,9 @@ export class AnalysisError extends Error {
 function load(): NativeBinding {
   try {
     if (metaUrl && !metaUrl.includes('/$bunfs/')) {
-      const parentAddon = fileURLToPath(new URL('../smella.node', metaUrl));
+      const parentAddon = fileURLToPath(new URL('../smella.node', import.meta.url));
       if (existsSync(parentAddon)) return nativeRequire(parentAddon) as NativeBinding;
-      const siblingAddon = fileURLToPath(new URL('./smella.node', metaUrl));
+      const siblingAddon = fileURLToPath(new URL('./smella.node', import.meta.url));
       if (existsSync(siblingAddon)) return nativeRequire(siblingAddon) as NativeBinding;
     }
     const dir = dirname(process.execPath);

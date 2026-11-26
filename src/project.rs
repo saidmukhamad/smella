@@ -219,17 +219,39 @@ impl Project {
         let excluded_dirs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let excluded_dirs_cb = Arc::clone(&excluded_dirs);
         let root_cb = root.clone();
-        let subdir_count = fs::read_dir(&root)
+        // `ignore::WalkParallel` spawns fresh OS threads per call (~1.5 ms overhead),
+        // so only engage it when a quick 2-level directory probe finds a large tree.
+        let use_parallel_walk = fs::read_dir(&root)
             .map(|rd| {
-                rd.filter_map(Result::ok)
-                    .filter(|e| {
-                        e.file_type().is_ok_and(|ft| ft.is_dir())
-                            && !SKIP.contains(&e.file_name().to_string_lossy().as_ref())
-                    })
-                    .take(4)
-                    .count()
+                let mut dir_count = 0usize;
+                for entry in rd.filter_map(Result::ok) {
+                    if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                        continue;
+                    }
+                    let name = entry.file_name();
+                    if SKIP.contains(&name.to_string_lossy().as_ref()) {
+                        continue;
+                    }
+                    dir_count += 1;
+                    if dir_count >= 16 {
+                        return true;
+                    }
+                    if let Ok(sub) = fs::read_dir(entry.path()) {
+                        for child in sub.filter_map(Result::ok) {
+                            if child.file_type().is_ok_and(|ft| ft.is_dir())
+                                && !SKIP.contains(&child.file_name().to_string_lossy().as_ref())
+                            {
+                                dir_count += 1;
+                                if dir_count >= 16 {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
             })
-            .unwrap_or(0);
+            .unwrap_or(false);
         let mut builder = WalkBuilder::new(&root);
         builder
             .hidden(false)
@@ -266,7 +288,7 @@ impl Project {
                 }
                 true
             });
-        if subdir_count >= 2 {
+        if use_parallel_walk {
             let walk_threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
             builder.threads(walk_threads);
             #[derive(Default)]
