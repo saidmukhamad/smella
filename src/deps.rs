@@ -345,6 +345,75 @@ fn mangle_to_types(pkg: &str) -> Option<String> {
     }
 }
 
+const BUNDLER_BINS: &[&str] = &[
+    "vite", "webpack", "tsdown", "tsup", "esbuild", "rollup", "rspack", "rsbuild", "parcel",
+    "next", "nuxt", "astro",
+];
+
+fn is_bundler_config_name(name: &str) -> bool {
+    let stems = [
+        "vite.config.",
+        "webpack.config.",
+        "tsdown.config.",
+        "tsup.config.",
+        "rollup.config.",
+        "esbuild.config.",
+        "rspack.config.",
+        "rsbuild.config.",
+        "next.config.",
+        "nuxt.config.",
+        "astro.config.",
+        "svelte.config.",
+    ];
+    stems.iter().any(|p| name.starts_with(p))
+        || (name.starts_with("vite.") && name.contains(".config."))
+        || (name.starts_with("webpack.") && name.contains(".config."))
+        || matches!(
+            name,
+            "webpack.common.js"
+                | "webpack.common.cjs"
+                | "webpack.common.mjs"
+                | "webpack.common.ts"
+                | "webpack.dev.js"
+                | "webpack.dev.cjs"
+                | "webpack.dev.mjs"
+                | "webpack.dev.ts"
+                | "webpack.prod.js"
+                | "webpack.prod.cjs"
+                | "webpack.prod.mjs"
+                | "webpack.prod.ts"
+                | "webpack.base.js"
+                | "webpack.base.cjs"
+                | "webpack.base.mjs"
+                | "webpack.base.ts"
+        )
+}
+
+fn is_bundled_workspace(project: &Project, m: &WorkspaceManifest) -> bool {
+    for (file_id, path) in project.graph.paths.iter().enumerate() {
+        if project.workspace_for_file.get(file_id).copied() != Some(m.ws_id) {
+            continue;
+        }
+        if let Some(name) = Path::new(path).file_name().and_then(|s| s.to_str())
+            && is_bundler_config_name(name)
+        {
+            return true;
+        }
+    }
+    let mut bins = Vec::new();
+    for script_cmd in m.scripts.values() {
+        bins.clear();
+        extract_script_binaries(script_cmd, &mut bins);
+        if bins.iter().any(|b| BUNDLER_BINS.contains(&b.as_str())) {
+            return true;
+        }
+        if script_cmd.contains("bun build") {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn analyze_dependencies(
     project: &Project,
     reach: &Reach,
@@ -421,6 +490,7 @@ pub fn analyze_dependencies(
         }
 
         // Check imported packages in this workspace's files.
+        let bundled = is_bundled_workspace(project, m);
         let mut seen_unlisted: BTreeSet<(Id, String)> = BTreeSet::new();
         let mut seen_dev_runtime: BTreeSet<(Id, String)> = BTreeSet::new();
         if let Some(refs) = refs_by_ws.get(&m.ws_id) {
@@ -441,8 +511,9 @@ pub fn analyze_dependencies(
                     {
                         used_deps.insert(tp);
                     }
-                    // Check devDependency imported as runtime value from a runtime/public file.
-                    if !r.type_only
+                    // Check devDependency imported as runtime value from a non-bundled runtime/public file.
+                    if !bundled
+                        && !r.type_only
                         && m.dev_dependencies.contains(&r.package)
                         && !m.dependencies.contains(&r.package)
                         && !m.peer_dependencies.contains(&r.package)

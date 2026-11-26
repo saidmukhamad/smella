@@ -1444,3 +1444,32 @@ test('declaration namespace import aliases, export assignments, and global or he
   assert.deepEqual(subject(r, 'src/modal.tsx', 'default').usage.value, ['runtime']);
   assert.deepEqual(r.findings(), []);
 });
+
+test('bundled workspaces allow runtime imports from devDependencies while non-bundled packages still flag them', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ name: 'bundle-deps', private: true, workspaces: ['packages/*'] }),
+    'node_modules/ui-kit/package.json': JSON.stringify({ name: 'ui-kit', main: 'index.js' }),
+    'node_modules/ui-kit/index.js': 'exports.Button = () => null;',
+    'node_modules/vite/package.json': JSON.stringify({ name: 'vite', bin: { vite: 'bin.js' } }),
+    'packages/web/package.json': JSON.stringify({
+      name: '@demo/web',
+      private: true,
+      scripts: { build: 'vite build' },
+      devDependencies: { 'ui-kit': '^1.0.0', vite: '^5.0.0' },
+    }),
+    'packages/web/vite.config.ts': 'export default { build: { rollupOptions: { input: "./src/main.tsx" } } };',
+    'packages/web/src/main.tsx': 'import { Button } from "ui-kit"; console.log(Button);',
+    'packages/server/package.json': JSON.stringify({
+      name: '@demo/server',
+      bin: { srv: './src/index.ts' },
+      devDependencies: { 'ui-kit': '^1.0.0' },
+    }),
+    'packages/server/src/index.ts': 'import { Button } from "ui-kit"; console.log(Button);',
+  });
+  const r = await inspect(t, root, { dependencies: true });
+  const devRuntime = r.dependencies({ kind: 'dev-dependency-in-runtime' });
+  assert.deepEqual(
+    devRuntime.map(d => [d.workspace, d.dependency]),
+    [['packages/server', 'ui-kit']],
+  );
+});
