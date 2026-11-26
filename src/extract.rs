@@ -23,7 +23,9 @@ use oxc_syntax::node::NodeId;
 use oxc_syntax::symbol::SymbolId;
 
 use crate::deps::{PackageRef, extract_dep_package};
-use crate::graph::{Edge, Export, Gap, GapScope, Graph, Id, Link, Loc, Module, Node, PendingGap};
+use crate::graph::{
+    Edge, Export, Gap, GapScope, Graph, Id, Link, Loc, Module, Node, PendingGap, RawEdge,
+};
 use crate::project::{Project, StaleConfigItem};
 
 #[derive(Clone, Debug)]
@@ -48,13 +50,13 @@ impl Owner {
 }
 
 /// File IDs occupy the prefix shared by all workers. Binding IDs are local to
-/// a summary until it is appended in file order.
+/// a summary until it is relocated and moved into the graph in file order.
 pub struct FileSummary {
     file: Id,
     base: usize,
     path: String,
     nodes: Vec<Node>,
-    evaluation: Vec<Edge>,
+    edges: Vec<RawEdge>,
     module: Module,
     links: Vec<Link>,
     gaps: Vec<PendingGap>,
@@ -73,21 +75,12 @@ impl FileSummary {
             kind,
             name: name.into(),
             loc,
-            edges: vec![],
         });
         id
     }
+    #[inline]
     fn edge(&mut self, from: Id, target: Id, type_only: bool, loc: Loc) {
-        let edges = if from == self.file {
-            &mut self.evaluation
-        } else {
-            &mut self.nodes[from - self.base].edges
-        };
-        edges.push(Edge {
-            target,
-            type_only,
-            loc,
-        });
+        self.edges.push(RawEdge::new(from, target, type_only, loc));
     }
     fn gap(
         &mut self,
@@ -177,29 +170,50 @@ impl FileSummary {
         self.links.push((access, to, prop.into(), type_only, loc));
     }
 
-    pub fn append(mut self, graph: &mut Graph) {
-        let offset = graph.nodes.len() - self.base;
-        let relocate = |id: Id| if id >= self.base { id + offset } else { id };
-        for edges in
-            std::iter::once(&mut self.evaluation).chain(self.nodes.iter_mut().map(|n| &mut n.edges))
-        {
-            for edge in edges {
-                edge.target = relocate(edge.target);
-            }
+    #[inline]
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+    #[inline]
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+    #[inline]
+    pub fn link_count(&self) -> usize {
+        self.links.len()
+    }
+    #[inline]
+    pub fn gap_count(&self) -> usize {
+        self.gaps.len()
+    }
+
+    pub fn relocate(&mut self, offset: usize) {
+        if offset == 0 {
+            return;
+        }
+        let base = self.base;
+        let base_u32 = base as u32;
+        let offset_u32 = offset as u32;
+        let reloc = |id: Id| if id >= base { id + offset } else { id };
+        for edge in &mut self.edges {
+            edge.relocate(base_u32, offset_u32);
         }
         for export in self.module.exports.values_mut() {
-            export.binding = relocate(export.binding);
-            export.surface = relocate(export.surface);
+            export.binding = reloc(export.binding);
+            export.surface = reloc(export.surface);
         }
         for (from, ..) in &mut self.links {
-            *from = relocate(*from);
+            *from = reloc(*from);
         }
         for gap in &mut self.gaps {
-            gap.guard = gap.guard.map(relocate);
+            gap.guard = gap.guard.map(reloc);
         }
-        graph.nodes[self.file].edges = self.evaluation;
+    }
+
+    pub fn move_into(mut self, graph: &mut Graph) {
         graph.modules[self.file] = self.module;
         graph.nodes.append(&mut self.nodes);
+        graph.pending_edges.append(&mut self.edges);
         graph.links.append(&mut self.links);
         graph.gaps.append(&mut self.gaps);
     }
@@ -1280,7 +1294,7 @@ pub fn summarize(
         path: project.graph.paths[file].clone(),
         base: project.graph.paths.len(),
         nodes: vec![],
-        evaluation: vec![],
+        edges: vec![],
         module: Module::default(),
         links: vec![],
         gaps: vec![],

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 
@@ -101,12 +102,78 @@ pub struct Edge {
     pub loc: Loc, // reference span in the source vertex's file
 }
 
+/// 16-byte edge entry accumulated during extraction and linking before CSR freeze.
+#[derive(Clone, Copy)]
+pub struct RawEdge {
+    from: u32,
+    target_and_flag: u32,
+    pub loc: Loc,
+}
+
+impl RawEdge {
+    const TYPE_ONLY_BIT: u32 = 1 << 31;
+
+    #[inline]
+    pub fn new(from: Id, target: Id, type_only: bool, loc: Loc) -> Self {
+        debug_assert!(from < (1 << 31) && target < (1 << 31));
+        Self {
+            from: from as u32,
+            target_and_flag: (target as u32) | if type_only { Self::TYPE_ONLY_BIT } else { 0 },
+            loc,
+        }
+    }
+    #[inline]
+    pub fn source(self) -> Id {
+        self.from as Id
+    }
+    #[inline]
+    pub fn target(self) -> Id {
+        (self.target_and_flag & !Self::TYPE_ONLY_BIT) as Id
+    }
+    #[inline]
+    pub fn relocate(&mut self, base: u32, offset: u32) {
+        if self.from >= base {
+            self.from += offset;
+        }
+        let target = self.target_and_flag & !Self::TYPE_ONLY_BIT;
+        if target >= base {
+            self.target_and_flag = (target + offset) | (self.target_and_flag & Self::TYPE_ONLY_BIT);
+        }
+    }
+    #[inline]
+    fn into_compact(self) -> CompactEdge {
+        CompactEdge {
+            target_and_flag: self.target_and_flag,
+            loc: self.loc,
+        }
+    }
+}
+
+/// 12-byte frozen CSR edge for cache-dense BFS/DFS traversal.
+#[derive(Clone, Copy, Default)]
+pub struct CompactEdge {
+    target_and_flag: u32,
+    pub loc: Loc,
+}
+
+impl CompactEdge {
+    const TYPE_ONLY_BIT: u32 = 1 << 31;
+
+    #[inline]
+    pub fn target(self) -> Id {
+        (self.target_and_flag & !Self::TYPE_ONLY_BIT) as Id
+    }
+    #[inline]
+    pub fn type_only(self) -> bool {
+        (self.target_and_flag & Self::TYPE_ONLY_BIT) != 0
+    }
+}
+
 pub struct Node {
     pub file: Id,
     pub kind: &'static str,
     pub name: String,
     pub loc: Loc,
-    pub edges: Vec<Edge>,
 }
 
 #[derive(Clone, Copy)]
@@ -135,8 +202,9 @@ pub struct Graph {
     pub modules: Vec<Module>,
     pub gaps: Vec<PendingGap>,
     pub links: Vec<Link>,
+    pub pending_edges: Vec<RawEdge>,
     edge_offsets: Vec<u32>,
-    csr_edges: Vec<Edge>,
+    csr_edges: Vec<CompactEdge>,
 }
 
 impl Graph {
@@ -148,6 +216,7 @@ impl Graph {
             modules: Vec::with_capacity(n),
             gaps: vec![],
             links: vec![],
+            pending_edges: Vec::new(),
             edge_offsets: Vec::new(),
             csr_edges: Vec::new(),
         };
@@ -159,12 +228,13 @@ impl Graph {
         g
     }
     #[inline]
-    pub fn edges(&self, id: Id) -> &[Edge] {
+    pub fn edges(&self, id: Id) -> &[CompactEdge] {
         let start = self.edge_offsets[id] as usize;
         let end = self.edge_offsets[id + 1] as usize;
         &self.csr_edges[start..end]
     }
     pub fn clear_edges(&mut self) {
+        self.pending_edges = Vec::new();
         self.edge_offsets = Vec::new();
         self.csr_edges = Vec::new();
     }
@@ -174,16 +244,13 @@ impl Graph {
             kind,
             name: name.into(),
             loc,
-            edges: vec![],
         });
         self.nodes.len() - 1
     }
+    #[inline]
     pub fn edge(&mut self, from: Id, target: Id, type_only: bool, loc: Loc) {
-        self.nodes[from].edges.push(Edge {
-            target,
-            type_only,
-            loc,
-        });
+        self.pending_edges
+            .push(RawEdge::new(from, target, type_only, loc));
     }
     pub fn gap(
         &mut self,
@@ -295,7 +362,7 @@ impl Graph {
         }
         // Inline 2-origin storage + CSR reverse dependents avoid 2*N small Vec allocations.
         let mut origins: Vec<([Id; 2], u8)> = vec![([0, 0], 0); node_count];
-        let mut dep_offsets = vec![0u32; node_count + 1];
+        let mut needs_origin = vec![false; node_count];
         let mut origin_queue: Vec<(Id, Id)> = Vec::new();
         for module in &self.modules {
             for export in module.exports.values() {
@@ -304,61 +371,68 @@ impl Graph {
                     origins[id] = ([export.binding, 0], 1);
                     origin_queue.push((id, export.binding));
                 } else {
-                    for edge in &self.nodes[id].edges {
-                        dep_offsets[edge.target + 1] += 1;
+                    needs_origin[id] = true;
+                }
+            }
+        }
+        let mut dep_offsets = vec![0u32; node_count + 1];
+        let mut dep_total = 0usize;
+        for edge in &self.pending_edges {
+            let from = edge.source();
+            if from < node_count && needs_origin[from] {
+                dep_offsets[edge.target() + 1] += 1;
+                dep_total += 1;
+            }
+        }
+        if dep_total > 0 {
+            for i in 1..=node_count {
+                dep_offsets[i] += dep_offsets[i - 1];
+            }
+            let mut dep_cursor = dep_offsets[..node_count].to_vec();
+            let mut dependents = vec![0u32; dep_total];
+            for edge in &self.pending_edges {
+                let from = edge.source();
+                if from < node_count && needs_origin[from] {
+                    let target = edge.target();
+                    let slot = dep_cursor[target] as usize;
+                    dependents[slot] = from as u32;
+                    dep_cursor[target] += 1;
+                }
+            }
+            let mut head = 0;
+            while head < origin_queue.len() {
+                let (id, origin) = origin_queue[head];
+                head += 1;
+                let range = dep_offsets[id] as usize..dep_offsets[id + 1] as usize;
+                for &next_u32 in &dependents[range] {
+                    let next = next_u32 as usize;
+                    let (pair, len) = &mut origins[next];
+                    if *len == 0 {
+                        pair[0] = origin;
+                        *len = 1;
+                        origin_queue.push((next, origin));
+                    } else if *len == 1 && pair[0] != origin {
+                        pair[1] = origin;
+                        *len = 2;
+                        origin_queue.push((next, origin));
                     }
                 }
             }
         }
-        for i in 1..=node_count {
-            dep_offsets[i] += dep_offsets[i - 1];
-        }
-        let mut dep_cursor = dep_offsets[..node_count].to_vec();
-        let mut dependents = vec![0u32; dep_offsets[node_count] as usize];
-        for module in &self.modules {
-            for export in module.exports.values() {
-                let id = export.surface;
-                if !(export.explicit && !forwarded[id]) {
-                    for edge in &self.nodes[id].edges {
-                        let slot = dep_cursor[edge.target] as usize;
-                        dependents[slot] = id as u32;
-                        dep_cursor[edge.target] += 1;
-                    }
-                }
-            }
-        }
-        let mut head = 0;
-        while head < origin_queue.len() {
-            let (id, origin) = origin_queue[head];
-            head += 1;
-            let range = dep_offsets[id] as usize..dep_offsets[id + 1] as usize;
-            for &next_u32 in &dependents[range] {
-                let next = next_u32 as usize;
-                let (pair, len) = &mut origins[next];
-                if *len == 0 {
-                    pair[0] = origin;
-                    *len = 1;
-                    origin_queue.push((next, origin));
-                } else if *len == 1 && pair[0] != origin {
-                    pair[1] = origin;
-                    *len = 2;
-                    origin_queue.push((next, origin));
-                }
-            }
-        }
+        drop(needs_origin);
+        drop(dep_offsets);
+        drop(origin_queue);
         for module in &mut self.modules {
             module
                 .exports
                 .retain(|_, export| export.explicit || origins[export.surface].1 == 1);
         }
+        let mut cleared: Option<Vec<bool>> = None;
         for (from, file, name, type_only, loc) in links {
             if name == "**" {
                 for export in self.modules[file].exports.values() {
-                    self.nodes[from].edges.push(Edge {
-                        target: export.surface,
-                        type_only,
-                        loc,
-                    });
+                    self.pending_edges
+                        .push(RawEdge::new(from, export.surface, type_only, loc));
                 }
                 continue;
             }
@@ -388,7 +462,7 @@ impl Graph {
                 self.edge(from, default_target.surface, type_only, loc);
             } else {
                 if forwarded[from] {
-                    self.nodes[from].edges.clear();
+                    cleared.get_or_insert_with(|| vec![false; self.nodes.len()])[from] = true;
                 }
                 let from_file = self.nodes[from].file;
                 let mut affected = vec![file as u32];
@@ -407,21 +481,82 @@ impl Graph {
                 );
             }
         }
-        // Freeze adjacency into a flat CSR for cache-friendly BFS/DFS and O(1) drop.
-        let total_edges: usize = self.nodes.iter().map(|n| n.edges.len()).sum();
-        let mut edge_offsets = Vec::with_capacity(self.nodes.len() + 1);
-        let mut csr_edges = Vec::with_capacity(total_edges);
-        edge_offsets.push(0);
-        for node in &mut self.nodes {
-            let start = csr_edges.len();
-            csr_edges.extend_from_slice(&node.edges);
-            let end = csr_edges.len();
-            if end - start > 1 {
-                csr_edges[start..end]
-                    .sort_unstable_by_key(|e| (e.loc.start, e.target, e.type_only));
+        drop(origins);
+        drop(forwarded);
+        // Freeze pending edges into a flat 12-byte CSR for cache-dense BFS/DFS and O(1) drop.
+        let pending = std::mem::take(&mut self.pending_edges);
+        let n = self.nodes.len();
+        let mut edge_offsets = vec![0u32; n + 1];
+        if let Some(cleared) = cleared.as_deref() {
+            for edge in &pending {
+                let from = edge.source();
+                if !cleared[from] {
+                    edge_offsets[from + 1] += 1;
+                }
             }
-            edge_offsets.push(end as u32);
-            node.edges = Vec::new();
+        } else {
+            for edge in &pending {
+                edge_offsets[edge.source() + 1] += 1;
+            }
+        }
+        for i in 1..=n {
+            edge_offsets[i] += edge_offsets[i - 1];
+        }
+        let total_edges = edge_offsets[n] as usize;
+        let mut cursor = edge_offsets[..n].to_vec();
+        let mut csr_edges = vec![CompactEdge::default(); total_edges];
+        if let Some(cleared) = cleared.as_deref() {
+            for edge in pending {
+                let from = edge.source();
+                if !cleared[from] {
+                    let slot = cursor[from] as usize;
+                    csr_edges[slot] = edge.into_compact();
+                    cursor[from] += 1;
+                }
+            }
+        } else {
+            for edge in pending {
+                let from = edge.source();
+                let slot = cursor[from] as usize;
+                csr_edges[slot] = edge.into_compact();
+                cursor[from] += 1;
+            }
+        }
+        drop(cursor);
+        let sort_range = |offsets: &[u32], base_edge: usize, slice: &mut [CompactEdge]| {
+            for w in offsets.windows(2) {
+                let start = w[0] as usize - base_edge;
+                let end = w[1] as usize - base_edge;
+                if end - start > 1 {
+                    slice[start..end]
+                        .sort_unstable_by_key(|e| (e.loc.start, e.target(), e.type_only()));
+                }
+            }
+        };
+        if total_edges >= 100_000
+            && let Some(pool) = crate::io::pool()
+        {
+            let chunk_nodes = (n / 64).max(1024);
+            let mut chunks: Vec<(&[u32], usize, &mut [CompactEdge])> = Vec::new();
+            let mut rest = csr_edges.as_mut_slice();
+            let mut node_start = 0usize;
+            let mut edge_base = 0usize;
+            while node_start < n {
+                let node_end = (node_start + chunk_nodes).min(n);
+                let edge_end = edge_offsets[node_end] as usize;
+                let (head, tail) = rest.split_at_mut(edge_end - edge_base);
+                chunks.push((&edge_offsets[node_start..=node_end], edge_base, head));
+                rest = tail;
+                node_start = node_end;
+                edge_base = edge_end;
+            }
+            pool.install(|| {
+                chunks.into_par_iter().for_each(|(offsets, base, slice)| {
+                    sort_range(offsets, base, slice);
+                });
+            });
+        } else {
+            sort_range(&edge_offsets, 0, &mut csr_edges);
         }
         self.edge_offsets = edge_offsets;
         self.csr_edges = csr_edges;
@@ -483,7 +618,8 @@ impl CompactVisit {
 pub struct Reach {
     /// One byte per node: bit `lane` is set iff `(node, lane)` was reached.
     pub masks: Vec<u8>,
-    parents: Vec<CompactVisit>,
+    /// Lazy per-lane parent tables: unused lanes allocate zero memory.
+    parents: [Vec<CompactVisit>; 8],
 }
 
 impl Reach {
@@ -500,19 +636,41 @@ impl Reach {
         self.masks[node] != 0
     }
     #[inline]
+    pub fn lane_used(&self, lane: usize) -> bool {
+        !self.parents[lane].is_empty()
+    }
+    #[inline]
     pub fn visit(&self, node: Id, lane: usize) -> Option<Visit> {
         if !self.has(node, lane) {
             return None;
         }
-        self.parents[node * 8 + lane].decode()
+        self.parents[lane]
+            .get(node)
+            .copied()
+            .and_then(CompactVisit::decode)
     }
 
     pub fn compute(g: &Graph, roots: &[Root]) -> Self {
         let n = g.nodes.len();
         let file_count = g.paths.len();
         let mut masks = vec![0u8; n];
-        let mut parents = vec![CompactVisit::unvisited(); n * 8];
+        let mut parents: [Vec<CompactVisit>; 8] = std::array::from_fn(|_| Vec::new());
         let mut queue: Vec<(u32, u8)> = Vec::with_capacity(n.min(65536));
+
+        #[inline]
+        fn record_parent(
+            parents: &mut [Vec<CompactVisit>; 8],
+            n: usize,
+            node: usize,
+            lane: u8,
+            visit: CompactVisit,
+        ) {
+            let slot = &mut parents[lane as usize];
+            if slot.is_empty() {
+                slot.resize(n, CompactVisit::unvisited());
+            }
+            slot[node] = visit;
+        }
 
         for root in roots {
             let file = g.paths.binary_search(&root.file).unwrap();
@@ -520,7 +678,7 @@ impl Reach {
             let bit = 1u8 << lane;
             if (masks[file] & bit) == 0 {
                 masks[file] |= bit;
-                parents[file * 8 + lane as usize] = CompactVisit::root();
+                record_parent(&mut parents, n, file, lane, CompactVisit::root());
                 queue.push((file as u32, lane));
             }
             if root.role == Role::Public || root.mode == RootEntryMode::AllExports {
@@ -528,8 +686,13 @@ impl Reach {
                     let surface = export.surface;
                     if (masks[surface] & bit) == 0 {
                         masks[surface] |= bit;
-                        parents[surface * 8 + lane as usize] =
-                            CompactVisit::from_edge(file, lane, g.nodes[surface].loc);
+                        record_parent(
+                            &mut parents,
+                            n,
+                            surface,
+                            lane,
+                            CompactVisit::from_edge(file, lane, g.nodes[surface].loc),
+                        );
                         queue.push((surface as u32, lane));
                     }
                 }
@@ -539,8 +702,13 @@ impl Reach {
                 let surface = export.surface;
                 if (masks[surface] & bit) == 0 {
                     masks[surface] |= bit;
-                    parents[surface * 8 + lane as usize] =
-                        CompactVisit::from_edge(file, lane, g.nodes[surface].loc);
+                    record_parent(
+                        &mut parents,
+                        n,
+                        surface,
+                        lane,
+                        CompactVisit::from_edge(file, lane, g.nodes[surface].loc),
+                    );
                     queue.push((surface as u32, lane));
                 }
             }
@@ -560,18 +728,28 @@ impl Reach {
                 let bit = 1u8 << lane;
                 if (masks[file] & bit) == 0 {
                     masks[file] |= bit;
-                    parents[file * 8 + lane as usize] =
-                        CompactVisit::from_edge(from, lane, g.nodes[from].loc);
+                    record_parent(
+                        &mut parents,
+                        n,
+                        file,
+                        lane,
+                        CompactVisit::from_edge(from, lane, g.nodes[from].loc),
+                    );
                 }
             }
             for edge in g.edges(from) {
-                let next = lane | u8::from(edge.type_only);
+                let next = lane | u8::from(edge.type_only());
                 let bit = 1u8 << next;
-                let target = edge.target;
+                let target = edge.target();
                 if (masks[target] & bit) == 0 {
                     masks[target] |= bit;
-                    parents[target * 8 + next as usize] =
-                        CompactVisit::from_edge(from, lane, edge.loc);
+                    record_parent(
+                        &mut parents,
+                        n,
+                        target,
+                        next,
+                        CompactVisit::from_edge(from, lane, edge.loc),
+                    );
                     queue.push((target as u32, next));
                 }
             }
@@ -697,10 +875,11 @@ impl Reach {
                                     touched_files.push(f as u32);
                                 }
                                 for edge in graph.edges(n) {
-                                    if (self.masks[edge.target] & cover_mask) == 0
-                                        && seen_stamp[edge.target] != stamp
+                                    let target = edge.target();
+                                    if (self.masks[target] & cover_mask) == 0
+                                        && seen_stamp[target] != stamp
                                     {
-                                        stack.push(edge.target);
+                                        stack.push(target);
                                     }
                                 }
                             }

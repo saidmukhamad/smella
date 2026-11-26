@@ -38,10 +38,33 @@ struct Subject {
     kind: Option<&'static str>,
 }
 
+struct SubjectId(usize);
+
+impl Serialize for SubjectId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut buf = [0u8; 24];
+        let mut n = self.0;
+        let mut pos = buf.len();
+        loop {
+            pos -= 1;
+            buf[pos] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        pos -= 1;
+        buf[pos] = b's';
+        // SAFETY: buf[pos..] contains only ASCII 's' and '0'..='9'.
+        let s = std::str::from_utf8(&buf[pos..]).expect("ASCII subject id");
+        serializer.serialize_str(s)
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Record<'a> {
-    id: String,
+    id: SubjectId,
     kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_gap: Option<&'a str>,
@@ -125,9 +148,14 @@ fn is_test_support_file(path: &str, is_test_root: bool) -> bool {
     if parts.any(|dir| TEST_SUPPORT_DIRS.contains(&dir)) {
         return true;
     }
-    let lower = file_name.to_ascii_lowercase();
-    TEST_SUPPORT_MARKERS.iter().any(|m| lower.contains(m))
-        || TEST_SETUP_PREFIXES.iter().any(|p| lower.starts_with(p))
+    if file_name.bytes().any(|b| b.is_ascii_uppercase()) {
+        let lower = file_name.to_ascii_lowercase();
+        TEST_SUPPORT_MARKERS.iter().any(|m| lower.contains(m))
+            || TEST_SETUP_PREFIXES.iter().any(|p| lower.starts_with(p))
+    } else {
+        TEST_SUPPORT_MARKERS.iter().any(|m| file_name.contains(m))
+            || TEST_SETUP_PREFIXES.iter().any(|p| file_name.starts_with(p))
+    }
 }
 
 #[inline]
@@ -184,7 +212,7 @@ impl Report {
                 buf,
             )
         };
-        let summaries: Vec<_> = if file_count >= 32
+        let mut summaries: Vec<_> = if file_count >= 32
             && let Some(pool) = crate::io::pool()
         {
             pool.install(|| {
@@ -206,7 +234,39 @@ impl Report {
             .iter()
             .enumerate()
             .any(|(file, summary)| roles[file] != 0 && summary.parsed);
-        let mut package_refs = Vec::new();
+        let mut node_offsets = Vec::with_capacity(file_count);
+        let mut extra_nodes = 0usize;
+        let mut total_edges = 0usize;
+        let mut total_links = 0usize;
+        let mut total_gaps = 0usize;
+        let mut total_pkg_refs = 0usize;
+        for summary in &summaries {
+            node_offsets.push(extra_nodes);
+            extra_nodes += summary.node_count();
+            total_edges += summary.edge_count();
+            total_links += summary.link_count();
+            total_gaps += summary.gap_count();
+            total_pkg_refs += summary.package_refs.len();
+        }
+        if extra_nodes >= 10_000
+            && let Some(pool) = crate::io::pool()
+        {
+            pool.install(|| {
+                summaries
+                    .par_iter_mut()
+                    .zip(node_offsets.par_iter())
+                    .for_each(|(summary, &offset)| summary.relocate(offset));
+            });
+        } else {
+            for (summary, &offset) in summaries.iter_mut().zip(&node_offsets) {
+                summary.relocate(offset);
+            }
+        }
+        project.graph.nodes.reserve_exact(extra_nodes);
+        project.graph.pending_edges.reserve_exact(total_edges);
+        project.graph.links.reserve_exact(total_links);
+        project.graph.gaps.reserve_exact(total_gaps);
+        let mut package_refs = Vec::with_capacity(total_pkg_refs);
         let mut inline_suppressions = Vec::new();
         let mut stale_config = std::mem::take(&mut project.stale_config);
         let mut dynamic_import_files_used = std::collections::BTreeSet::new();
@@ -217,7 +277,7 @@ impl Report {
             package_refs.append(&mut summary.package_refs);
             inline_suppressions.append(&mut summary.inline_suppressions);
             stale_config.append(&mut summary.invalid_suppressions);
-            summary.append(&mut project.graph);
+            summary.move_into(&mut project.graph);
         }
         for file_key in project.dynamic_imports.keys() {
             if !dynamic_import_files_used.contains(file_key) {
@@ -278,16 +338,35 @@ impl Report {
         gaps.append(&mut workspace_gaps);
         let t_gaps = std::time::Instant::now();
         let mut exported = vec![false; graph.nodes.len()];
-        for e in graph.modules.iter().flat_map(|m| m.exports.values()) {
-            exported[e.binding] = true;
-        }
-        let mut private = vec![vec![]; file_count];
-        for (id, n) in graph.nodes.iter().enumerate() {
-            if n.kind == "binding" && !exported[id] {
-                private[n.file].push(id);
+        let mut export_count = 0usize;
+        for m in &graph.modules {
+            export_count += m.exports.len();
+            for e in m.exports.values() {
+                exported[e.binding] = true;
             }
         }
-        let mut subjects = vec![];
+        let mut private_offsets = vec![0u32; file_count + 1];
+        for (id, n) in graph.nodes.iter().enumerate() {
+            if n.kind == "binding" && !exported[id] {
+                private_offsets[n.file + 1] += 1;
+            }
+        }
+        for i in 1..=file_count {
+            private_offsets[i] += private_offsets[i - 1];
+        }
+        let private_count = private_offsets[file_count] as usize;
+        let mut private_cursor = private_offsets[..file_count].to_vec();
+        let mut private_ids = vec![0u32; private_count];
+        for (id, n) in graph.nodes.iter().enumerate() {
+            if n.kind == "binding" && !exported[id] {
+                let slot = private_cursor[n.file] as usize;
+                private_ids[slot] = id as u32;
+                private_cursor[n.file] += 1;
+            }
+        }
+        drop(exported);
+        drop(private_cursor);
+        let mut subjects = Vec::with_capacity(file_count + export_count + private_count);
         for (file, module) in graph.modules.iter().enumerate() {
             let test_support = is_test_support_file(
                 &graph.paths[file],
@@ -318,8 +397,17 @@ impl Report {
                     kind,
                 });
             }
-            private[file].sort_by(|&a, &b| graph.nodes[a].name.cmp(&graph.nodes[b].name));
-            for &binding in &private[file] {
+            let p_start = private_offsets[file] as usize;
+            let p_end = private_offsets[file + 1] as usize;
+            if p_end - p_start > 1 {
+                private_ids[p_start..p_end].sort_by(|&a, &b| {
+                    graph.nodes[a as usize]
+                        .name
+                        .cmp(&graph.nodes[b as usize].name)
+                });
+            }
+            for &binding_u32 in &private_ids[p_start..p_end] {
+                let binding = binding_u32 as usize;
                 let test_only = !test_support
                     && classification(reach.mask(binding)) == Some("test-only-export");
                 subjects.push(Subject {
@@ -447,7 +535,12 @@ impl Report {
         // Queries need the predecessor forest and source labels. Drop build-time
         // adjacency lists and module tables before handing the snapshot to JS.
         graph.clear_edges();
-        graph.modules = Vec::new();
+        let modules = std::mem::take(&mut graph.modules);
+        if modules.len() >= 1024
+            && let Some(pool) = crate::io::pool()
+        {
+            pool.install(|| modules.into_par_iter().for_each(drop));
+        }
         graph.gaps = Vec::new();
         if profile {
             let t_end = std::time::Instant::now();
@@ -538,7 +631,7 @@ impl Report {
         let ws_id = self.workspace_for_file.get(s.file).copied().unwrap_or(0);
         let workspace = self.workspaces.get(ws_id).map_or(".", |w| w.dir.as_str());
         Record {
-            id: format!("s{index}"),
+            id: SubjectId(index),
             workspace_gap: self.evidence.gap_for(s.binding),
             kind: s.kind,
             workspace,
@@ -560,13 +653,18 @@ impl Report {
     }
 
     pub fn findings(&self, kind: Option<&str>) -> Result<String, serde_json::Error> {
+        let count = self
+            .subjects
+            .iter()
+            .filter(|s| s.kind.is_some() && (kind.is_none() || s.kind == kind))
+            .count();
         let records = self
             .subjects
             .iter()
             .enumerate()
             .filter(|(_, s)| s.kind.is_some() && (kind.is_none() || s.kind == kind))
             .map(|(i, s)| self.record(i, s));
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(count.saturating_mul(220).max(256));
         serde_json::Serializer::new(&mut output).collect_seq(records)?;
         Ok(String::from_utf8(output).expect("JSON is UTF-8"))
     }
