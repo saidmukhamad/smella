@@ -1175,3 +1175,56 @@ test('findings carry owning workspace attribution and filter cleanly by workspac
   assert.equal(rows[0].workspace, 'packages/core');
   assert.equal(rows[0].exportName, 'deadCore');
 });
+
+test('dependency analysis detects unused, unlisted, unlisted-binary and dev-dependency-in-runtime per workspace', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({
+      name: 'mono',
+      workspaces: ['packages/*'],
+      devDependencies: { typescript: '^5.0.0' },
+    }),
+    'node_modules/used-lib/package.json': JSON.stringify({ name: 'used-lib', main: 'index.js' }),
+    'node_modules/used-lib/index.js': 'exports.ok = 1;',
+    'node_modules/dev-only-lib/package.json': JSON.stringify({ name: 'dev-only-lib', main: 'index.js' }),
+    'node_modules/dev-only-lib/index.js': 'exports.helper = 1;',
+    'node_modules/unlisted-lib/package.json': JSON.stringify({ name: 'unlisted-lib', main: 'index.js' }),
+    'node_modules/unlisted-lib/index.js': 'exports.x = 1;',
+    'node_modules/test-util/package.json': JSON.stringify({ name: 'test-util', main: 'index.js' }),
+    'node_modules/test-util/index.js': 'exports.check = 1;',
+    'packages/svc/package.json': JSON.stringify({
+      name: '@org/svc',
+      bin: { svc: './src/server.ts' },
+      dependencies: { 'used-lib': '^1.0.0', 'unused-pkg': '^1.0.0' },
+      devDependencies: {
+        '@types/used-lib': '^1.0.0',
+        'dev-only-lib': '^1.0.0',
+        'test-util': '^1.0.0',
+      },
+      scripts: {
+        typecheck: 'tsc --noEmit',
+        lint: 'mystery-linter src/',
+      },
+    }),
+    'packages/svc/src/server.ts': [
+      'import { ok } from "used-lib";',
+      'import { helper } from "dev-only-lib";',
+      'import { x } from "unlisted-lib";',
+      'console.log(ok, helper, x);',
+    ].join('\n'),
+    'packages/svc/src/server.test.ts': 'import { check } from "test-util"; check();',
+  });
+
+  const r = await inspect(t, root, { dependencies: true, publicEntries: [] });
+  const deps = r.dependencies({ workspace: 'packages/svc' });
+  assert.deepEqual(
+    deps.map(d => `${d.kind}:${d.dependency ?? d.binary}:${d.manifest}:${d.file}`),
+    [
+      'unlisted-binary:mystery-linter:packages/svc/package.json:packages/svc/package.json',
+      'unused-dependency:unused-pkg:packages/svc/package.json:packages/svc/package.json',
+      'dev-dependency-in-runtime:dev-only-lib:packages/svc/package.json:packages/svc/src/server.ts',
+      'unlisted-dependency:unlisted-lib:packages/svc/package.json:packages/svc/src/server.ts',
+    ],
+  );
+  // Root typescript devDependency was consumed by child workspace's `tsc --noEmit` script.
+  assert.deepEqual(r.dependencies({ workspace: '.' }), []);
+});

@@ -19,6 +19,7 @@ use oxc_syntax::module_record::{ExportExportName, ExportImportName, ImportImport
 use oxc_syntax::node::NodeId;
 use oxc_syntax::symbol::SymbolId;
 
+use crate::deps::{PackageRef, extract_dep_package};
 use crate::graph::{Edge, Export, Gap, Graph, Id, Link, Loc, Module, Node, PendingGap};
 use crate::project::Project;
 
@@ -46,6 +47,7 @@ pub struct FileSummary {
     module: Module,
     links: Vec<Link>,
     gaps: Vec<PendingGap>,
+    pub package_refs: Vec<PackageRef>,
     pub parsed: bool,
 }
 
@@ -106,6 +108,21 @@ impl FileSummary {
             target_file,
         });
     }
+    fn record_pkg_ref(&mut self, project: &Project, spec: &str, type_only: bool, span: Span) {
+        if let Some(package) = extract_dep_package(spec)
+            && project
+                .source_mapper
+                .matches_tsconfig_path(Path::new(&self.path), spec)
+                .is_empty()
+        {
+            self.package_refs.push(PackageRef {
+                file: self.file,
+                package,
+                type_only,
+                loc: span.into(),
+            });
+        }
+    }
     fn target_with_mode(
         &mut self,
         project: &Project,
@@ -115,6 +132,7 @@ impl FileSummary {
         type_only: bool,
         cjs: bool,
     ) -> Option<Id> {
+        self.record_pkg_ref(project, spec, type_only, span);
         match project.resolve_with_mode(self.file, spec, type_only, cjs) {
             Ok(target) => target,
             Err(message) => {
@@ -1081,6 +1099,7 @@ pub fn summarize(
         module: Module::default(),
         links: vec![],
         gaps: vec![],
+        package_refs: vec![],
         parsed: false,
     };
     summary.parsed = extract(project, &mut summary, arena, entry_file);
@@ -1856,6 +1875,7 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                             let mut first_err = None;
                             let mut any_external = false;
                             for (spec, spec_span) in &specs {
+                                out.record_pkg_ref(project, spec, false, *spec_span);
                                 match project.resolve_with_mode(file, spec, false, true) {
                                     Ok(Some(to)) if !targets.contains(&to) => targets.push(to),
                                     Ok(Some(_)) => {}

@@ -1,6 +1,21 @@
 export type Context = 'runtime' | 'test' | 'tooling';
 export type Role = Context | 'public';
 export type FindingKind = 'unused-export' | 'test-only-export' | 'test-only-binding' | 'tooling-only-export' | 'unreferenced-module';
+export type DependencyFindingKind = 'unused-dependency' | 'unlisted-dependency' | 'unlisted-binary' | 'dev-dependency-in-runtime';
+export interface DependencyFinding {
+  id: string;
+  kind: DependencyFindingKind;
+  workspace: string;
+  file: string;
+  manifest: string;
+  dependency?: string;
+  dependencyGroup?: 'dependencies' | 'devDependencies';
+  binary?: string;
+  script?: string;
+  location?: Location;
+  status: 'complete';
+  diff?: DiffStatus;
+}
 export interface Config {
   include?: readonly string[];
   exclude?: readonly string[];
@@ -47,11 +62,12 @@ export interface Report {
   readonly workspaces: readonly WorkspaceInfo[];
   readonly coverage: Coverage;
   readonly diff?: DiffSummary;
-  findings(filter?: { kind?: FindingKind; diff?: DiffStatus; workspace?: string | readonly string[] }): Finding[];
+  dependencies(filter?: { kind?: DependencyFindingKind; diff?: DiffStatus; workspace?: string | readonly string[] }): DependencyFinding[];
+  findings(filter?: { kind?: FindingKind | DependencyFindingKind; diff?: DiffStatus; workspace?: string | readonly string[] }): (Finding | DependencyFinding)[];
   explain(subject: Subject): Explanation;
   dispose(): void;
 }
 export class AnalysisError extends Error {
   readonly code: 'NATIVE_LOAD' | 'ANALYSIS_FAILED' | 'REPORT_DISPOSED' | 'UNKNOWN_SUBJECT';
 }
-export function analyze(options?: Config & { root?: string; base?: string }): Promise<Report>;
+export function analyze(options?: Config & { root?: string; base?: string; dependencies?: boolean }): Promise<Report>;

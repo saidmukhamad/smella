@@ -5,7 +5,7 @@ use serde::Serialize;
 pub type Id = usize;
 pub type Link = (Id, Id, String, bool, Loc);
 
-#[derive(Clone, Copy, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct Loc {
     pub start: u32,
     pub end: u32,

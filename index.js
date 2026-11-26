@@ -255,6 +255,10 @@ function findingKey(record, fileOverride) {
   return `${record.kind}|${fileOverride ?? record.file}|${record.exportName ?? ''}|${record.bindingName ?? ''}`;
 }
 
+function depFindingKey(record, fileOverride) {
+  return `${record.kind}|${fileOverride ?? record.file}|${record.manifest ?? ''}|${record.dependency ?? ''}|${record.binary ?? ''}|${record.script ?? ''}`;
+}
+
 function linkNodeModules(srcDir, dstDir, depth = 0) {
   if (depth > 3 || !existsSync(srcDir) || !existsSync(dstDir)) return;
   let entries;
@@ -362,7 +366,7 @@ async function extractGitArchive(topLevel, base, relPrefix, destDir) {
   });
 }
 
-export async function analyze({ root = process.cwd(), base, ...options } = {}) {
+export async function analyze({ root = process.cwd(), base, dependencies = false, ...options } = {}) {
   native ??= load();
   const rootDir = resolve(root);
   const optionsJson = JSON.stringify(options);
@@ -375,6 +379,7 @@ export async function analyze({ root = process.cwd(), base, ...options } = {}) {
     try {
       const headPromise = native.analyzeNative(rootDir, optionsJson);
       let baseKeys = new Set();
+      let baseDepKeys = new Set();
       if (tmpDir) {
         await extractGitArchive(gitInfo.topLevel, base, gitInfo.relPrefix, tmpDir);
         const baseRoot = gitInfo.relPrefix ? join(tmpDir, gitInfo.relPrefix) : tmpDir;
@@ -384,6 +389,9 @@ export async function analyze({ root = process.cwd(), base, ...options } = {}) {
           baseSnapshot = await native.analyzeNative(baseRoot, optionsJson);
           for (const f of JSON.parse(baseSnapshot.findings(undefined))) {
             baseKeys.add(findingKey(f));
+          }
+          for (const d of JSON.parse(baseSnapshot.dependencies())) {
+            baseDepKeys.add(depFindingKey(d));
           }
         } finally {
           baseSnapshot?.dispose();
@@ -399,8 +407,17 @@ export async function analyze({ root = process.cwd(), base, ...options } = {}) {
         if (baseKeys.has(findingKey(f, baseFile))) preExisting++;
         else introduced++;
       }
+      if (dependencies) {
+        for (const d of JSON.parse(snapshot.dependencies())) {
+          if (!gitInfo.changedFiles.has(d.file) && !gitInfo.changedFiles.has(d.manifest)) continue;
+          const baseFile = gitInfo.renameMap.get(d.file) ?? d.file;
+          if (baseDepKeys.has(depFindingKey(d, baseFile))) preExisting++;
+          else introduced++;
+        }
+      }
       diffContext = {
         baseKeys,
+        baseDepKeys,
         changedFiles: gitInfo.changedFiles,
         renameMap: gitInfo.renameMap,
         summary: Object.freeze({
@@ -453,12 +470,38 @@ export async function analyze({ root = process.cwd(), base, ...options } = {}) {
     }
     return allowed;
   }
+  function classifyDepDiff(record) {
+    if (!diffContext) return record;
+    const baseFile = diffContext.renameMap.get(record.file) ?? record.file;
+    record.diff = diffContext.baseDepKeys.has(depFindingKey(record, baseFile)) ? 'pre-existing' : 'introduced';
+    return record;
+  }
+  function filterDeps({ kind, diff, workspace } = {}) {
+    let records = JSON.parse(live().dependencies());
+    const allowedWs = normalizeWorkspaceFilter(workspace);
+    if (allowedWs) records = records.filter(r => allowedWs.has(r.workspace));
+    if (kind) records = records.filter(r => r.kind === kind);
+    if (diffContext) {
+      records = records
+        .filter(r => diffContext.changedFiles.has(r.file) || diffContext.changedFiles.has(r.manifest))
+        .map(classifyDepDiff);
+      if (diff) records = records.filter(r => r.diff === diff);
+    }
+    return records;
+  }
   return Object.freeze({
     get roots() { live(); return metadata.roots; },
     get workspaces() { live(); return metadata.workspaces; },
     get coverage() { live(); return metadata.coverage; },
     get diff() { live(); return diffContext?.summary; },
+    dependencies(filter = {}) {
+      return filterDeps(filter);
+    },
     findings({ kind, diff, workspace } = {}) {
+      const DEP_KINDS = new Set(['unused-dependency', 'unlisted-dependency', 'unlisted-binary', 'dev-dependency-in-runtime']);
+      if (kind && DEP_KINDS.has(kind)) {
+        return filterDeps({ kind, diff, workspace });
+      }
       let records = JSON.parse(live().findings(kind)).map(withGaps);
       const allowedWs = normalizeWorkspaceFilter(workspace);
       if (allowedWs) {
@@ -467,6 +510,9 @@ export async function analyze({ root = process.cwd(), base, ...options } = {}) {
       if (diffContext) {
         records = records.filter(r => diffContext.changedFiles.has(r.file)).map(classifyDiff);
         if (diff) records = records.filter(r => r.diff === diff);
+      }
+      if (dependencies && !kind) {
+        records = records.concat(filterDeps({ diff, workspace }));
       }
       return records;
     },

@@ -1,3 +1,4 @@
+mod deps;
 mod discover;
 mod evidence;
 mod extract;
@@ -37,6 +38,12 @@ impl Snapshot {
     pub fn findings(&self, kind: Option<String>) -> Result<String> {
         self.live()?
             .findings(kind.as_deref())
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+    #[napi]
+    pub fn dependencies(&self) -> Result<String> {
+        self.live()?
+            .dependencies()
             .map_err(|e| Error::from_reason(e.to_string()))
     }
     #[napi]

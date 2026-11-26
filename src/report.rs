@@ -6,6 +6,7 @@ use crate::evidence::Evidence;
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
+use crate::deps::{DependencyFinding, analyze_dependencies};
 use crate::extract::summarize;
 use crate::graph::{Gap, Graph, Id, ROLES, Reach, Role, Root, Visit};
 use crate::project::{Config, Project, WorkspaceInfo};
@@ -87,6 +88,7 @@ pub struct Report {
     gaps: Vec<Gap>,
     workspaces: Vec<WorkspaceInfo>,
     workspace_for_file: Vec<usize>,
+    dependencies: Vec<DependencyFinding>,
     reach: Reach,
     subjects: Vec<Subject>,
     evidence: Evidence,
@@ -141,7 +143,9 @@ impl Report {
             .iter()
             .enumerate()
             .any(|(file, summary)| roles[file] != 0 && summary.parsed);
-        for summary in summaries {
+        let mut package_refs = Vec::new();
+        for mut summary in summaries {
+            package_refs.append(&mut summary.package_refs);
             summary.append(&mut project.graph);
         }
         if !usable {
@@ -162,9 +166,10 @@ impl Report {
             ));
         }
         let multi_workspace = project.is_multi_workspace();
+        project.graph.link();
+        let reach = Reach::compute(&project.graph, &project.roots);
+        let dependencies = analyze_dependencies(&project, &reach, &package_refs);
         let mut graph = project.graph;
-        graph.link();
-        let reach = Reach::compute(&graph, &project.roots);
         let mut workspace_gaps = Vec::new();
         let evidence = Evidence::build(
             &graph,
@@ -243,6 +248,7 @@ impl Report {
             gaps,
             workspaces: project.workspace_infos,
             workspace_for_file: project.workspace_for_file,
+            dependencies,
             subjects,
             evidence,
         })
@@ -318,6 +324,9 @@ impl Report {
         let mut output = Vec::new();
         serde_json::Serializer::new(&mut output).collect_seq(records)?;
         Ok(String::from_utf8(output).expect("JSON is UTF-8"))
+    }
+    pub fn dependencies(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&self.dependencies)
     }
     fn witness(&self, mut id: Id, mut lane: usize) -> Value {
         let mut path = vec![];

@@ -15,13 +15,24 @@ Options:
   --base <ref>        Git ref to diff against (only findings in changed files,
                       marked "introduced" or "pre-existing")
   --diff <status>     Filter diff findings: introduced | pre-existing (requires --base)
+  --dependencies      Include dependency findings (unused-dependency,
+                      unlisted-dependency, unlisted-binary, dev-dependency-in-runtime)
   --kind <kind>       Filter finding kind (repeatable or comma-separated):
                         unused-export, test-only-export, test-only-binding,
-                        tooling-only-export, unreferenced-module
+                        tooling-only-export, unreferenced-module,
+                        unused-dependency, unlisted-dependency,
+                        unlisted-binary, dev-dependency-in-runtime
   --include-gap-ids   Include full gapIds array on each NDJSON line (omitted by default)
   --summary           Print summary counts to stderr
   -h, --help          Show this help message
 `;
+
+const DEP_KINDS = new Set([
+  'unused-dependency',
+  'unlisted-dependency',
+  'unlisted-binary',
+  'dev-dependency-in-runtime',
+]);
 
 const VALID_KINDS = new Set([
   'unused-export',
@@ -29,6 +40,7 @@ const VALID_KINDS = new Set([
   'test-only-binding',
   'tooling-only-export',
   'unreferenced-module',
+  ...DEP_KINDS,
 ]);
 
 const VALID_DIFF = new Set(['introduced', 'pre-existing']);
@@ -72,6 +84,7 @@ async function main() {
         base: { type: 'string' },
         diff: { type: 'string' },
         kind: { type: 'string', multiple: true },
+        dependencies: { type: 'boolean', default: false },
         'include-gap-ids': { type: 'boolean', default: false },
         summary: { type: 'boolean', default: false },
         help: { type: 'boolean', short: 'h', default: false },
@@ -121,10 +134,12 @@ async function main() {
     }
   }
 
+  const includeDeps = Boolean(values.dependencies) || [...kinds].some(k => DEP_KINDS.has(k));
   const entryOpts = parseEntrySpecs(values.entries);
   const options = {
     ...(values.root ? { root: values.root } : {}),
     ...(values.base ? { base: values.base } : {}),
+    ...(includeDeps ? { dependencies: true } : {}),
     ...entryOpts,
   };
 
@@ -144,21 +159,23 @@ async function main() {
     const includeGapIds = Boolean(values['include-gap-ids']);
     // Stream newline-delimited JSON one finding per line to avoid V8 max string limits on large repos.
     for (const f of findings) {
-      const record = {
-        id: f.id,
-        kind: f.kind,
-        ...(f.diff !== undefined ? { diff: f.diff } : {}),
-        workspace: f.workspace,
-        file: f.file,
-        exportName: f.exportName,
-        ...(f.bindingName !== undefined ? { bindingName: f.bindingName } : {}),
-        location: f.location,
-        usage: f.usage,
-        status: f.status,
-        gapCount: f.gapIds.length,
-        primaryGaps: f.primaryGaps,
-        ...(includeGapIds ? { gapIds: f.gapIds } : {}),
-      };
+      const record = DEP_KINDS.has(f.kind)
+        ? f
+        : {
+            id: f.id,
+            kind: f.kind,
+            ...(f.diff !== undefined ? { diff: f.diff } : {}),
+            workspace: f.workspace,
+            file: f.file,
+            exportName: f.exportName,
+            ...(f.bindingName !== undefined ? { bindingName: f.bindingName } : {}),
+            location: f.location,
+            usage: f.usage,
+            status: f.status,
+            gapCount: f.gapIds.length,
+            primaryGaps: f.primaryGaps,
+            ...(includeGapIds ? { gapIds: f.gapIds } : {}),
+          };
       if (!process.stdout.write(`${JSON.stringify(record)}\n`)) {
         await new Promise(resolve => process.stdout.once('drain', resolve));
       }

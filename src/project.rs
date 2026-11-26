@@ -10,6 +10,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use crate::deps::{
+    WorkspaceManifest, manifest_bins, manifest_dep_set, manifest_path_for, manifest_scripts,
+};
 use crate::graph::{Graph, Id, ROLES, Role, Root, RootEntryMode};
 use crate::source_map::{
     SourceMapper, is_non_code_export, normalize_rel, resolve_exports_targets, to_slash,
@@ -107,6 +110,7 @@ pub struct Project {
     pub workspace_for_file: Vec<usize>,
     workspace_dirs: Vec<PathBuf>,
     pub workspace_infos: Vec<WorkspaceInfo>,
+    pub manifests: Vec<WorkspaceManifest>,
     pub react_entry: Option<Id>,
     pub source_mapper: SourceMapper,
     pub dynamic_imports: BTreeMap<String, Vec<String>>,
@@ -456,6 +460,29 @@ impl Project {
                 }
             })
             .collect();
+        let mut manifests_data = Vec::new();
+        for (dir, pkg) in &packages {
+            if !pkg.is_object() {
+                continue;
+            }
+            let ws_id = directories.get(dir).copied().unwrap_or(0);
+            let s = to_slash(dir);
+            let ws_dir = if s.is_empty() { ".".into() } else { s };
+            manifests_data.push(WorkspaceManifest {
+                ws_id,
+                ws_dir,
+                rel_dir: dir.clone(),
+                manifest_path: manifest_path_for(dir),
+                name: pkg["name"].as_str().map(str::to_owned),
+                dependencies: manifest_dep_set(pkg, "dependencies"),
+                dev_dependencies: manifest_dep_set(pkg, "devDependencies"),
+                peer_dependencies: manifest_dep_set(pkg, "peerDependencies"),
+                optional_dependencies: manifest_dep_set(pkg, "optionalDependencies"),
+                scripts: manifest_scripts(pkg),
+                bins: manifest_bins(pkg),
+                config_deps: BTreeSet::new(),
+            });
+        }
         let mut project = Self {
             root,
             graph: Graph::new(paths),
@@ -467,6 +494,7 @@ impl Project {
             workspace_for_file,
             workspace_dirs,
             workspace_infos,
+            manifests: manifests_data,
             react_entry,
             source_mapper,
             dynamic_imports,
