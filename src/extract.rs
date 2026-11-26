@@ -317,6 +317,64 @@ fn is_require_ident(
         .then_some(id.span)
 }
 
+fn extract_path_join_call(
+    call: &oxc_ast::ast::CallExpression<'_>,
+    scoping: &Scoping,
+    file_ext: &str,
+    file_ext_symbols: &HashSet<SymbolId>,
+) -> Option<(String, Span)> {
+    let is_path_fn = match call.callee.get_inner_expression() {
+        Expression::StaticMemberExpression(m) => {
+            matches!(m.property.name.as_str(), "join" | "resolve")
+        }
+        Expression::Identifier(id) => matches!(id.name.as_str(), "join" | "resolve"),
+        _ => false,
+    };
+    if !is_path_fn || call.arguments.len() < 2 {
+        return None;
+    }
+    let first_is_dirname = call
+        .arguments
+        .first()
+        .and_then(|a| a.as_expression())
+        .is_some_and(|e| match e.get_inner_expression() {
+            Expression::Identifier(id) => matches!(id.name.as_str(), "__dirname" | "ROOT" | "dir"),
+            other if is_meta_prop(other, "dirname") => true,
+            Expression::CallExpression(c) => {
+                let is_dirname = match c.callee.get_inner_expression() {
+                    Expression::Identifier(id) => id.name == "dirname",
+                    Expression::StaticMemberExpression(m) => m.property.name == "dirname",
+                    _ => false,
+                };
+                is_dirname
+                    && c.arguments
+                        .first()
+                        .and_then(|a| a.as_expression())
+                        .is_some_and(|a| {
+                            matches!(a.get_inner_expression(), Expression::Identifier(id) if id.name == "__filename")
+                        })
+            }
+            _ => false,
+        });
+    if !first_is_dirname {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for arg in call.arguments.iter().skip(1) {
+        let (s, _) = arg
+            .as_expression()
+            .and_then(|e| static_string_with_ext(e, scoping, file_ext, file_ext_symbols))?;
+        parts.push(s.trim_start_matches("./").trim_end_matches('/').to_owned());
+    }
+    let joined = parts.join("/");
+    let spec = if joined.starts_with('.') || joined.starts_with('/') {
+        joined
+    } else {
+        format!("./{joined}")
+    };
+    Some((spec, call.span))
+}
+
 fn extract_static_path_expr(
     expr: &Expression<'_>,
     scoping: &Scoping,
@@ -384,52 +442,7 @@ fn extract_static_path_expr(
                     .and_then(|a| a.as_expression())
                     .and_then(|e| static_string_with_ext(e, scoping, file_ext, file_ext_symbols));
             }
-            let is_path_fn = match call.callee.get_inner_expression() {
-                Expression::StaticMemberExpression(m) => {
-                    matches!(m.property.name.as_str(), "join" | "resolve")
-                }
-                Expression::Identifier(id) => matches!(id.name.as_str(), "join" | "resolve"),
-                _ => false,
-            };
-            if is_path_fn && call.arguments.len() >= 2 {
-                let first_is_dirname = call
-                    .arguments
-                    .first()
-                    .and_then(|a| a.as_expression())
-                    .is_some_and(|e| match e.get_inner_expression() {
-                        Expression::Identifier(id) => matches!(id.name.as_str(), "__dirname" | "ROOT" | "dir"),
-                        other if is_meta_prop(other, "dirname") => true,
-                        Expression::CallExpression(c) => {
-                            let is_dirname = match c.callee.get_inner_expression() {
-                                Expression::Identifier(id) => id.name == "dirname",
-                                Expression::StaticMemberExpression(m) => m.property.name == "dirname",
-                                _ => false,
-                            };
-                            is_dirname
-                                && c.arguments.first().and_then(|a| a.as_expression()).is_some_and(|a| {
-                                    matches!(a.get_inner_expression(), Expression::Identifier(id) if id.name == "__filename")
-                                })
-                        }
-                        _ => false,
-                    });
-                if first_is_dirname {
-                    let mut parts = Vec::new();
-                    for arg in call.arguments.iter().skip(1) {
-                        let (s, _) = arg.as_expression().and_then(|e| {
-                            static_string_with_ext(e, scoping, file_ext, file_ext_symbols)
-                        })?;
-                        parts.push(s.trim_start_matches("./").trim_end_matches('/').to_owned());
-                    }
-                    let joined = parts.join("/");
-                    let spec = if joined.starts_with('.') || joined.starts_with('/') {
-                        joined
-                    } else {
-                        format!("./{joined}")
-                    };
-                    return Some((spec, call.span));
-                }
-            }
-            None
+            extract_path_join_call(call, scoping, file_ext, file_ext_symbols)
         }
         _ => None,
     }
@@ -1993,6 +2006,21 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                             }
                         }
                     }
+                    Expression::Identifier(id)
+                        if matches!(id.name.as_str(), "resolve" | "join") =>
+                    {
+                        if let Some((spec, _)) =
+                            extract_path_join_call(call, scoping, &file_ext, &file_ext_symbols)
+                            && let Ok(Some(to)) =
+                                project.resolve_with_mode(file, &spec, false, true)
+                            && to != file
+                        {
+                            for from in owner.sources(file) {
+                                out.edge(from, to, false, loc);
+                                out.link_member(from, to, "*", "**", false, loc);
+                            }
+                        }
+                    }
                     Expression::Identifier(_)
                         if let Some(req_span) =
                             is_require_ident(scoping, &require_symbols, &call.callee) =>
@@ -2202,14 +2230,49 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                                 .and_then(static_string_expr)
                             {
                                 for from in owner.sources(file) {
-                                    let _ = out.target_with_mode(
+                                    if let Some(to) = out.target_with_mode(
                                         project,
                                         spec,
                                         spec_span,
                                         Some(from),
                                         false,
                                         true,
-                                    );
+                                    ) {
+                                        out.edge(from, to, false, loc);
+                                        out.link_member(from, to, "*", "**", false, loc);
+                                    }
+                                }
+                            }
+                        }
+                        "resolve"
+                            if matches!(m.object.get_inner_expression(), Expression::MetaProperty(mp)
+                                if mp.meta.name == "import" && mp.property.name == "meta") =>
+                        {
+                            if let Some((spec, _)) = call
+                                .arguments
+                                .first()
+                                .and_then(|a| a.as_expression())
+                                .and_then(static_string_expr)
+                                && let Ok(Some(to)) =
+                                    project.resolve_with_mode(file, spec, false, false)
+                                && to != file
+                            {
+                                for from in owner.sources(file) {
+                                    out.edge(from, to, false, loc);
+                                    out.link_member(from, to, "*", "**", false, loc);
+                                }
+                            }
+                        }
+                        "resolve" | "join" => {
+                            if let Some((spec, _)) =
+                                extract_path_join_call(call, scoping, &file_ext, &file_ext_symbols)
+                                && let Ok(Some(to)) =
+                                    project.resolve_with_mode(file, &spec, false, true)
+                                && to != file
+                            {
+                                for from in owner.sources(file) {
+                                    out.edge(from, to, false, loc);
+                                    out.link_member(from, to, "*", "**", false, loc);
                                 }
                             }
                         }

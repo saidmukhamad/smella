@@ -437,15 +437,39 @@ fn prop_key_name<'a>(key: &'a PropertyKey<'a>) -> Option<&'a str> {
     }
 }
 
-fn extract_config_path(expr: &Expression<'_>) -> Option<String> {
+fn extract_config_path_with_locals(
+    expr: &Expression<'_>,
+    locals: &std::collections::HashMap<String, String>,
+) -> Option<String> {
     let inner = expr.get_inner_expression();
     if let Some(s) = static_str(inner) {
         let trimmed = s.trim();
         return (!trimmed.is_empty()).then(|| trimmed.to_owned());
     }
+    if let Expression::Identifier(id) = inner {
+        return locals.get(id.name.as_str()).cloned();
+    }
+    if let Expression::NewExpression(ne) = inner
+        && matches!(ne.callee.get_inner_expression(), Expression::Identifier(id) if id.name == "URL")
+        && ne.arguments.len() >= 2
+        && let Some(first) = ne
+            .arguments
+            .first()
+            .and_then(|a| a.as_expression())
+            .and_then(static_str)
+    {
+        return Some(first.trim().to_owned());
+    }
     let Expression::CallExpression(call) = inner else {
         return None;
     };
+    if matches!(
+        call.callee.get_inner_expression(),
+        Expression::Identifier(id) if id.name == "fileURLToPath"
+    ) && let Some(arg) = call.arguments.first().and_then(|a| a.as_expression())
+    {
+        return extract_config_path_with_locals(arg, locals);
+    }
     let is_join_or_resolve = match call.callee.get_inner_expression() {
         Expression::Identifier(id) => matches!(id.name.as_str(), "resolve" | "join"),
         Expression::StaticMemberExpression(m) => {
@@ -456,79 +480,187 @@ fn extract_config_path(expr: &Expression<'_>) -> Option<String> {
     if !is_join_or_resolve || call.arguments.len() < 2 {
         return None;
     }
-    let first_ok = call
+    let first_expr = call
         .arguments
-        .first()
-        .and_then(|a| a.as_expression())
-        .is_some_and(|e| match e.get_inner_expression() {
-            Expression::Identifier(id) => {
+        .first()?
+        .as_expression()?
+        .get_inner_expression();
+    let mut parts = Vec::new();
+    let first_ok = match first_expr {
+        Expression::Identifier(id) => {
+            if let Some(base) = locals.get(id.name.as_str()) {
+                if !base.is_empty() && base != "." {
+                    parts.push(
+                        base.trim_start_matches("./")
+                            .trim_end_matches('/')
+                            .to_owned(),
+                    );
+                }
+                true
+            } else {
                 matches!(id.name.as_str(), "__dirname" | "ROOT" | "root" | "dir")
             }
-            Expression::StaticMemberExpression(m) => m.property.name == "dirname",
+        }
+        Expression::StaticMemberExpression(m) => m.property.name == "dirname",
+        Expression::CallExpression(c) => match c.callee.get_inner_expression() {
+            Expression::StaticMemberExpression(m) => {
+                m.property.name == "cwd"
+                    && matches!(m.object.get_inner_expression(), Expression::Identifier(id) if id.name == "process")
+            }
             _ => false,
-        });
+        },
+        _ => false,
+    };
     if !first_ok {
         return None;
     }
-    let mut parts = Vec::new();
     for arg in call.arguments.iter().skip(1) {
         let s = arg.as_expression().and_then(static_str)?;
-        parts.push(s.trim_start_matches("./").trim_end_matches('/'));
+        let cleaned = s.trim_start_matches("./").trim_end_matches('/');
+        if !cleaned.is_empty() {
+            parts.push(cleaned.to_owned());
+        }
     }
-    Some(parts.join("/"))
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-fn collect_paths_from_expr(expr: &Expression<'_>, out: &mut Vec<String>) {
+fn collect_paths_from_expr(
+    expr: &Expression<'_>,
+    locals: &std::collections::HashMap<String, String>,
+    out: &mut Vec<String>,
+) {
     match expr.get_inner_expression() {
         Expression::ArrayExpression(arr) => {
             for elem in &arr.elements {
                 if let Some(e) = elem.as_expression() {
-                    collect_paths_from_expr(e, out);
+                    collect_paths_from_expr(e, locals, out);
                 }
             }
         }
         Expression::ObjectExpression(obj) => {
             for prop in &obj.properties {
                 if let ObjectPropertyKind::ObjectProperty(p) = prop {
-                    collect_paths_from_expr(&p.value, out);
+                    collect_paths_from_expr(&p.value, locals, out);
                 }
             }
         }
         other => {
-            if let Some(p) = extract_config_path(other) {
+            if let Some(p) = extract_config_path_with_locals(other, locals) {
                 out.push(p);
             }
         }
     }
 }
 
-/// Inspect Vite and webpack configs statically to discover runtime entries (`input`, `entry`,
-/// `.html` `<script src>` targets, and Module Federation `exposes`).
+fn resolve_discovered_path(project: &Project, cfg_dir: &Path, raw: &str) -> Option<usize> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains(['*', '$']) {
+        return None;
+    }
+    let clean = trimmed.trim_start_matches("./");
+    let candidates = [cfg_dir.join(clean), PathBuf::from(clean)];
+    for rel in candidates {
+        if let Some(id) =
+            project
+                .source_mapper
+                .map_to_source(&project.root, &project.graph.paths, &rel)
+        {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn is_bundler_config_file(path: &str) -> bool {
+    if path.contains("/.storybook/") || path.starts_with(".storybook/") {
+        return false;
+    }
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let ext_ok = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| EXTENSIONS.contains(&e));
+    if !ext_ok {
+        return false;
+    }
+    ((name.starts_with("vite.") || name.starts_with("webpack.")) && name.contains(".config."))
+        || name.starts_with("tsdown.config.")
+        || name.starts_with("tsup.config.")
+        || name.starts_with("rollup.config.")
+        || name.starts_with("esbuild.config.")
+        || name.starts_with("rspack.config.")
+        || name.starts_with("rsbuild.config.")
+        || matches!(
+            name,
+            "webpack.common.js"
+                | "webpack.common.cjs"
+                | "webpack.common.mjs"
+                | "webpack.common.ts"
+                | "webpack.dev.js"
+                | "webpack.dev.cjs"
+                | "webpack.dev.mjs"
+                | "webpack.dev.ts"
+                | "webpack.prod.js"
+                | "webpack.prod.cjs"
+                | "webpack.prod.mjs"
+                | "webpack.prod.ts"
+                | "webpack.base.js"
+                | "webpack.base.cjs"
+                | "webpack.base.mjs"
+                | "webpack.base.ts"
+        )
+}
+
+fn is_build_script_candidate(path: &str) -> bool {
+    let has_scripts_dir = path.starts_with("scripts/")
+        || path.contains("/scripts/")
+        || path.starts_with("tools/")
+        || path.contains("/tools/");
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    has_scripts_dir
+        && (name.contains("build") || name.contains("bundle") || name.contains("esbuild"))
+}
+
+/// Inspect Vite, webpack, esbuild, tsdown, rollup configs and build scripts statically to
+/// discover runtime entries (`input`, `entry`, `entryPoints`, `.html` `<script src>`,
+/// Module Federation `exposes`, `resolve.alias`, and Vite `resolveId` targets).
 pub fn discover_bundler_entries(project: &mut Project) {
-    let config_files: Vec<String> = project
+    let config_files: Vec<(String, bool)> = project
         .graph
         .paths
         .iter()
-        .filter(|p| {
-            if p.contains("/.storybook/") || p.starts_with(".storybook/") {
-                return false;
+        .filter_map(|p| {
+            if is_bundler_config_file(p) {
+                Some((p.clone(), true))
+            } else if is_build_script_candidate(p) {
+                Some((p.clone(), false))
+            } else {
+                None
             }
-            let name = Path::new(p)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            (name.starts_with("vite.") || name.starts_with("webpack.")) && name.contains(".config.")
         })
-        .cloned()
         .collect();
 
     let mut arena = Allocator::default();
     let mut new_roots = Vec::new();
-    for cfg in config_files {
+    for (cfg, is_config) in config_files {
         let abs = project.root.join(&cfg);
         let Ok(source) = fs::read_to_string(&abs) else {
             continue;
         };
+        if !is_config
+            && !source.contains("entryPoints")
+            && !source.contains("entry")
+            && !source.contains("input")
+            && !source.contains("exposes")
+        {
+            continue;
+        }
         arena.reset();
         let parsed = Parser::new(
             &arena,
@@ -541,21 +673,57 @@ pub fn discover_bundler_entries(project: &mut Project) {
         }
         let sem = SemanticBuilder::new().build(&parsed.program).semantic;
         let nodes = sem.nodes();
+        let mut locals = std::collections::HashMap::new();
+        for node in nodes.iter() {
+            if let AstKind::VariableDeclarator(v) = node.kind()
+                && let oxc_ast::ast::BindingPatternKind::BindingIdentifier(bind) = &v.id.kind
+                && let Some(init) = v.init.as_ref()
+                && let Some(val) = extract_config_path_with_locals(init, &locals)
+            {
+                locals.insert(bind.name.to_string(), val);
+            }
+        }
         let mut exposes = Vec::new();
         let mut inputs = Vec::new();
+        let mut aliases = Vec::new();
         for node in nodes.iter() {
-            let AstKind::ObjectProperty(prop) = node.kind() else {
-                continue;
-            };
-            match prop_key_name(&prop.key) {
-                Some("exposes") => collect_paths_from_expr(&prop.value, &mut exposes),
-                Some("input") => collect_paths_from_expr(&prop.value, &mut inputs),
-                Some("entry") => {
-                    let in_remotes = nodes.ancestor_kinds(node.id()).any(|k| {
-                        matches!(k, AstKind::ObjectProperty(anc) if prop_key_name(&anc.key) == Some("remotes"))
+            match node.kind() {
+                AstKind::ObjectProperty(prop) => match prop_key_name(&prop.key) {
+                    Some("exposes") => collect_paths_from_expr(&prop.value, &locals, &mut exposes),
+                    Some("input") | Some("entryPoints") => {
+                        collect_paths_from_expr(&prop.value, &locals, &mut inputs)
+                    }
+                    Some("entry") => {
+                        let in_remotes = nodes.ancestor_kinds(node.id()).any(|k| {
+                            matches!(k, AstKind::ObjectProperty(anc) if prop_key_name(&anc.key) == Some("remotes"))
+                        });
+                        if !in_remotes {
+                            collect_paths_from_expr(&prop.value, &locals, &mut inputs);
+                        }
+                    }
+                    Some("alias") if is_config => {
+                        collect_paths_from_expr(&prop.value, &locals, &mut aliases);
+                    }
+                    Some("replacement") if is_config => {
+                        let in_alias = nodes.ancestor_kinds(node.id()).any(|k| {
+                            matches!(k, AstKind::ObjectProperty(anc) if prop_key_name(&anc.key) == Some("alias"))
+                        });
+                        if in_alias {
+                            collect_paths_from_expr(&prop.value, &locals, &mut aliases);
+                        }
+                    }
+                    _ => {}
+                },
+                AstKind::ReturnStatement(ret) if is_config => {
+                    let in_resolve_id = nodes.ancestor_kinds(node.id()).any(|k| match k {
+                        AstKind::ObjectProperty(anc) => {
+                            prop_key_name(&anc.key) == Some("resolveId")
+                        }
+                        AstKind::MethodDefinition(m) => prop_key_name(&m.key) == Some("resolveId"),
+                        _ => false,
                     });
-                    if !in_remotes {
-                        collect_paths_from_expr(&prop.value, &mut inputs);
+                    if in_resolve_id && let Some(arg) = ret.argument.as_ref() {
+                        collect_paths_from_expr(arg, &locals, &mut aliases);
                     }
                 }
                 _ => {}
@@ -563,17 +731,25 @@ pub fn discover_bundler_entries(project: &mut Project) {
         }
         let cfg_dir = Path::new(&cfg).parent().unwrap_or_else(|| Path::new(""));
         for raw in exposes {
-            let rel = cfg_dir.join(raw.trim_start_matches("./"));
-            if let Some(id) =
-                project
-                    .source_mapper
-                    .map_to_source(&project.root, &project.graph.paths, &rel)
-            {
+            if let Some(id) = resolve_discovered_path(project, cfg_dir, &raw) {
                 new_roots.push(Root {
                     file: project.graph.paths[id].clone(),
                     role: Role::Runtime,
                     origin: "discovered",
                     input: format!("{cfg}#exposes"),
+                    mode: RootEntryMode::AllExports,
+                });
+            }
+        }
+        for raw in aliases {
+            if let Some(id) = resolve_discovered_path(project, cfg_dir, &raw)
+                && project.graph.paths[id] != cfg
+            {
+                new_roots.push(Root {
+                    file: project.graph.paths[id].clone(),
+                    role: Role::Runtime,
+                    origin: "discovered",
+                    input: format!("{cfg}#alias"),
                     mode: RootEntryMode::AllExports,
                 });
             }
@@ -594,10 +770,8 @@ pub fn discover_bundler_entries(project: &mut Project) {
                         });
                     }
                 }
-            } else if let Some(id) =
-                project
-                    .source_mapper
-                    .map_to_source(&project.root, &project.graph.paths, &rel)
+            } else if let Some(id) = resolve_discovered_path(project, cfg_dir, &raw)
+                && project.graph.paths[id] != cfg
             {
                 new_roots.push(Root {
                     file: project.graph.paths[id].clone(),
@@ -609,6 +783,129 @@ pub fn discover_bundler_entries(project: &mut Project) {
             }
         }
     }
+    project.roots.extend(new_roots);
+}
+
+/// Inspect Jest configs (`jest.config.*`, `jest.*.config.*`) to discover test setup files,
+/// custom environments/transformers, and `moduleNameMapper` mock targets as test roots.
+pub fn discover_jest_config_entries(project: &mut Project) {
+    let configs: Vec<String> = project
+        .graph
+        .paths
+        .iter()
+        .filter(|p| {
+            let name = Path::new(p)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let ext_ok = Path::new(p)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| EXTENSIONS.contains(&e));
+            ext_ok && name.starts_with("jest.") && name.contains(".config.")
+        })
+        .cloned()
+        .collect();
+    if configs.is_empty() {
+        return;
+    }
+    let mut arena = Allocator::default();
+    let mut new_roots = Vec::new();
+    for cfg in configs {
+        let abs = project.root.join(&cfg);
+        let Ok(source) = fs::read_to_string(&abs) else {
+            continue;
+        };
+        arena.reset();
+        let parsed = Parser::new(
+            &arena,
+            &source,
+            SourceType::from_path(&abs).unwrap_or_default(),
+        )
+        .parse();
+        if parsed.panicked {
+            continue;
+        }
+        let sem = SemanticBuilder::new().build(&parsed.program).semantic;
+        let nodes = sem.nodes();
+        let mut locals = std::collections::HashMap::new();
+        for node in nodes.iter() {
+            if let AstKind::VariableDeclarator(v) = node.kind()
+                && let oxc_ast::ast::BindingPatternKind::BindingIdentifier(bind) = &v.id.kind
+                && let Some(init) = v.init.as_ref()
+                && let Some(val) = extract_config_path_with_locals(init, &locals)
+            {
+                locals.insert(bind.name.to_string(), val);
+            }
+        }
+        let mut targets = Vec::new();
+        for node in nodes.iter() {
+            if let AstKind::ObjectProperty(prop) = node.kind()
+                && matches!(
+                    prop_key_name(&prop.key),
+                    Some(
+                        "setupFiles"
+                            | "setupFilesAfterEnv"
+                            | "globalSetup"
+                            | "globalTeardown"
+                            | "testEnvironment"
+                            | "resolver"
+                            | "transform"
+                            | "moduleNameMapper"
+                    )
+                )
+            {
+                collect_paths_from_expr(&prop.value, &locals, &mut targets);
+            }
+        }
+        let cfg_dir = Path::new(&cfg).parent().unwrap_or_else(|| Path::new(""));
+        for raw in targets {
+            let cleaned = raw
+                .trim()
+                .trim_start_matches("<rootDir>/")
+                .trim_start_matches("<rootDir>");
+            if let Some(id) = resolve_discovered_path(project, cfg_dir, cleaned)
+                && project.graph.paths[id] != cfg
+            {
+                new_roots.push(Root {
+                    file: project.graph.paths[id].clone(),
+                    role: Role::Test,
+                    origin: "discovered",
+                    input: format!("{cfg}#jest"),
+                    mode: RootEntryMode::AllExports,
+                });
+            }
+        }
+    }
+    project.roots.extend(new_roots);
+}
+
+/// Discover served static JS files inside workspace `public/` directories (e.g. service workers).
+pub fn discover_public_static_files(project: &mut Project) {
+    let ws_prefixes: Vec<String> = project
+        .workspace_infos
+        .iter()
+        .map(|w| {
+            if w.dir == "." {
+                "public/".to_owned()
+            } else {
+                format!("{}/public/", w.dir)
+            }
+        })
+        .collect();
+    let new_roots: Vec<Root> = project
+        .graph
+        .paths
+        .iter()
+        .filter(|p| ws_prefixes.iter().any(|pref| p.starts_with(pref)))
+        .map(|file| Root {
+            file: file.clone(),
+            role: Role::Runtime,
+            origin: "discovered",
+            input: "public-static".into(),
+            mode: RootEntryMode::ModuleOnly,
+        })
+        .collect();
     project.roots.extend(new_roots);
 }
 
@@ -673,6 +970,45 @@ pub fn discover_extra_tooling_configs(project: &mut Project) {
         .filter(|r| r.role == Role::Tooling)
         .map(|r| r.file.clone())
         .collect();
+    const CONFIG_STEMS: &[&str] = &[
+        "vite.config.",
+        "vitest.config.",
+        "jest.config.",
+        "webpack.config.",
+        "rollup.config.",
+        "eslint.config.",
+        "next.config.",
+        "tailwind.config.",
+        "postcss.config.",
+        "babel.config.",
+        "prettier.config.",
+        "playwright.config.",
+        "cypress.config.",
+        "tsdown.config.",
+        "tsup.config.",
+        "esbuild.config.",
+        "rspack.config.",
+        "rsbuild.config.",
+        "nuxt.config.",
+        "astro.config.",
+        "svelte.config.",
+        "metro.config.",
+        "uno.config.",
+        "knip.config.",
+        "commitlint.config.",
+        "lint-staged.config.",
+        "stylelint.config.",
+        "drizzle.config.",
+        "prisma.config.",
+        "oxlint.config.",
+        "swc.config.",
+        "turbo.config.",
+        ".eslintrc.",
+        ".prettierrc.",
+        ".babelrc.",
+        ".lintstagedrc.",
+        ".stylelintrc.",
+    ];
     let extra: Vec<String> = project
         .graph
         .paths
@@ -690,10 +1026,13 @@ pub fn discover_extra_tooling_configs(project: &mut Project) {
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| EXTENSIONS.contains(&e));
             ext_ok
-                && ((name.starts_with("vite.") && name.contains(".config."))
-                    || (name.starts_with("vitest.") && name.contains(".config."))
-                    || (name.starts_with("webpack.") && name.contains(".config."))
-                    || name.starts_with("tsdown.config."))
+                && (CONFIG_STEMS.iter().any(|stem| name.starts_with(stem))
+                    || ((name.starts_with("vite.")
+                        || name.starts_with("vitest.")
+                        || name.starts_with("jest.")
+                        || name.starts_with("webpack."))
+                        && name.contains(".config."))
+                    || is_bundler_config_file(p))
         })
         .cloned()
         .collect();
@@ -702,7 +1041,7 @@ pub fn discover_extra_tooling_configs(project: &mut Project) {
             file,
             role: Role::Tooling,
             origin: "discovered",
-            input: "bundler-config".into(),
+            input: "tool-config".into(),
             mode: RootEntryMode::AllExports,
         });
     }

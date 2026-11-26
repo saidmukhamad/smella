@@ -654,19 +654,28 @@ impl Project {
                 ] {
                     project.select(role, p, "discovered", p, false)?;
                 }
+                crate::discover::discover_jest_config_entries(&mut project);
             } else if role == Role::Tooling {
                 if let Some(nx) = &nx {
                     nx.discover(&mut project, role)?;
                 }
                 let p =
                     "**/{vite,vitest,jest,webpack,rollup,eslint}.config.{ts,js,mjs,cjs,mts,cts}";
-                project.select(role, p, "discovered", p, false)?;
+                project.select_with_mode(
+                    role,
+                    p,
+                    "discovered",
+                    p,
+                    false,
+                    RootEntryMode::AllExports,
+                )?;
                 crate::discover::discover_extra_tooling_configs(&mut project);
                 crate::discover::discover_tooling_scripts(&mut project, &packages);
                 crate::discover::discover_storybook_stories(&mut project)?;
             } else {
                 if role == Role::Runtime {
                     crate::discover::discover_bundler_entries(&mut project);
+                    crate::discover::discover_public_static_files(&mut project);
                     crate::discover::discover_ambient_declarations(&mut project);
                 }
                 for (dir, pkg) in &packages {

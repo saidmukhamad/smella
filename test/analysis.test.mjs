@@ -1473,3 +1473,47 @@ test('bundled workspaces allow runtime imports from devDependencies while non-bu
     [['packages/server', 'ui-kit']],
   );
 });
+
+test('path strings, tool configs, build script entries, Vite/Jest config paths, and public static files are reached cleanly', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({
+      name: 'refs-demo',
+      private: true,
+      type: 'module',
+      bin: { app: './src/app.ts' },
+      scripts: { 'build:tool': 'node scripts/build-cli.cjs' },
+    }),
+    'src/app.ts': [
+      'import path from "node:path";',
+      'const preload = path.resolve(__dirname, "./preload.cjs");',
+      'const helperPath = require.resolve("./resolved-helper.cjs");',
+      'console.log(preload, helperPath);',
+    ].join('\n'),
+    'src/preload.cjs': 'console.log("preload");',
+    'src/resolved-helper.cjs': 'exports.run = () => 1;',
+    'src/mocks/disabled.ts': 'export const enabled = false;',
+    'src/mocks/style-mock.js': 'module.exports = {};',
+    'src/cli-tool.cjs': 'console.log("cli tool");',
+    'src/webpack-entry.ts': 'console.log("webpack entry");',
+    'public/mockServiceWorker.js': 'self.addEventListener("fetch", () => {});',
+    'scripts/build-cli.cjs': 'const entry = "src/cli-tool.cjs"; build({ entryPoints: [entry] });',
+    'vite.config.ts': [
+      'import path from "node:path";',
+      'export default {',
+      '  plugins: [{ name: "stub", resolveId() { return path.resolve(__dirname, "src/mocks/disabled.ts"); } }],',
+      '};',
+    ].join('\n'),
+    'webpack.common.js': 'const path = require("node:path"); module.exports = { entry: path.resolve(__dirname, "src/webpack-entry.ts") };',
+    'jest.config.js': 'module.exports = { testEnvironment: "node", moduleNameMapper: { "\\\\.css$": "<rootDir>/src/mocks/style-mock.js" } };',
+    'next.config.mjs': 'export default { reactStrictMode: true };',
+    'tailwind.config.js': 'module.exports = { content: ["./src/**/*.tsx"] };',
+  });
+  const r = await inspect(t, root);
+  assert.deepEqual(subject(r, 'src/preload.cjs').usage.evaluation, ['runtime']);
+  assert.deepEqual(subject(r, 'src/resolved-helper.cjs', 'run').usage.value, ['runtime']);
+  assert.ok(subject(r, 'src/mocks/disabled.ts', 'enabled').usage.value.includes('runtime'));
+  assert.ok(subject(r, 'src/cli-tool.cjs').usage.evaluation.includes('runtime'));
+  assert.ok(subject(r, 'src/webpack-entry.ts').usage.evaluation.includes('runtime'));
+  assert.deepEqual(subject(r, 'public/mockServiceWorker.js').usage.evaluation, ['runtime']);
+  assert.deepEqual(r.findings(), []);
+});
