@@ -149,6 +149,8 @@ pub struct Project {
 
 impl Project {
     pub fn open(root: &Path, input: Config) -> Result<Self, String> {
+        let profile = std::env::var_os("SMELLA_PROFILE").is_some();
+        let t0 = std::time::Instant::now();
         let root = fs::canonicalize(root)
             .map_err(|e| format!("Cannot open repository {}: {e}", root.display()))?;
         if !root.is_dir() {
@@ -496,6 +498,7 @@ impl Project {
         }
         excluded.extend(std::mem::take(&mut *excluded_dirs.lock().unwrap()));
         excluded.sort();
+        let t_walk = std::time::Instant::now();
         // Read and parse every package.json once in parallel.
         manifests.sort_by_key(|p| (p.components().count(), p.clone()));
         let raw_manifests = crate::io::read_bytes_batch(&manifests);
@@ -800,7 +803,15 @@ impl Project {
                 });
             }
         }
+        let t_pre_sources = std::time::Instant::now();
+        // On Linux, bulk-read all source files up front via batched io_uring rings.
+        // On other platforms, workers stream each file into a thread-local reusable buffer
+        // right before lexing to keep file bytes L1-cache-resident and overlap I/O with parsing.
+        #[cfg(target_os = "linux")]
         let sources = crate::io::read_files(&root, &paths);
+        #[cfg(not(target_os = "linux"))]
+        let sources = Vec::new();
+        let t_sources = std::time::Instant::now();
         let mut project = Self {
             root,
             graph: Graph::new(paths),
@@ -1037,6 +1048,20 @@ impl Project {
         project
             .roots
             .dedup_by(|a, b| a.file == b.file && a.role == b.role && a.input == b.input);
+        if profile {
+            let t_end = std::time::Instant::now();
+            let ms = |a: std::time::Instant, b: std::time::Instant| {
+                b.duration_since(a).as_secs_f64() * 1000.0
+            };
+            eprintln!(
+                "[profile:open] total={:.2}ms | walk={:.2}ms meta+nx={:.2}ms read_files={:.2}ms discover={:.2}ms",
+                ms(t0, t_end),
+                ms(t0, t_walk),
+                ms(t_walk, t_pre_sources),
+                ms(t_pre_sources, t_sources),
+                ms(t_sources, t_end),
+            );
+        }
         if project.roots.is_empty() {
             let detail = project
                 .graph
@@ -1092,17 +1117,8 @@ impl Project {
             None
         };
         let active_pattern = effective.as_deref().unwrap_or(pattern);
-        let glob = matcher(active_pattern)?;
         let before = self.roots.len();
-        for file in self.graph.paths.iter().filter(|f| glob.is_match(f)) {
-            self.roots.push(Root {
-                file: file.clone(),
-                role,
-                origin,
-                input: input.into(),
-                mode,
-            });
-        }
+        self.push_matching_roots(active_pattern, role, origin, input, mode)?;
         if before == self.roots.len()
             && origin == "discovered"
             && effective.is_none()
@@ -1110,16 +1126,7 @@ impl Project {
                 self.source_mapper
                     .map_pattern(&self.root, &self.graph.paths, pattern)
         {
-            let mapped_glob = matcher(&mapped)?;
-            for file in self.graph.paths.iter().filter(|f| mapped_glob.is_match(f)) {
-                self.roots.push(Root {
-                    file: file.clone(),
-                    role,
-                    origin,
-                    input: input.into(),
-                    mode,
-                });
-            }
+            self.push_matching_roots(&mapped, role, origin, input, mode)?;
         }
         if required && before == self.roots.len() {
             let message = format!(
@@ -1286,11 +1293,44 @@ impl Project {
             .unwrap_or_else(|| Path::new(""))
     }
 
-    pub fn source_text(&self, file: Id) -> Result<&str, &str> {
+    fn push_matching_roots(
+        &mut self,
+        pattern: &str,
+        role: Role,
+        origin: &'static str,
+        input: &str,
+        mode: RootEntryMode,
+    ) -> Result<(), String> {
+        let clean = pattern.trim_start_matches("./");
+        if !clean.contains(['*', '?', '[', '{']) {
+            if let Ok(idx) = self.graph.paths.binary_search_by(|p| p.as_str().cmp(clean)) {
+                self.roots.push(Root {
+                    file: self.graph.paths[idx].clone(),
+                    role,
+                    origin,
+                    input: input.into(),
+                    mode,
+                });
+            }
+            return Ok(());
+        }
+        let glob = matcher(pattern)?;
+        for file in self.graph.paths.iter().filter(|f| glob.is_match(f)) {
+            self.roots.push(Root {
+                file: file.clone(),
+                role,
+                origin,
+                input: input.into(),
+                mode,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn source_text(&self, file: Id) -> Option<Result<&str, &str>> {
         self.sources
             .get(file)
             .map(|r| r.as_deref().map_err(String::as_str))
-            .unwrap_or(Err("Source not loaded"))
     }
 
     pub fn is_multi_workspace(&self) -> bool {

@@ -175,12 +175,13 @@ impl Report {
                 entry_exports_used[file] = true;
             }
         }
-        let read = |arena: &mut Allocator, file| {
+        let read = |(arena, buf): &mut (Allocator, Vec<u8>), file| {
             summarize(
                 &project,
                 file,
                 roles[file] & !(1 << Role::Public as usize) != 0,
                 arena,
+                buf,
             )
         };
         let summaries: Vec<_> = if file_count >= 32
@@ -189,12 +190,15 @@ impl Report {
             pool.install(|| {
                 (0..file_count)
                     .into_par_iter()
-                    .map_init(Allocator::default, read)
+                    .map_init(
+                        || (Allocator::default(), Vec::with_capacity(16 * 1024)),
+                        read,
+                    )
                     .collect()
             })
         } else {
-            let mut arena = Allocator::default();
-            (0..file_count).map(|file| read(&mut arena, file)).collect()
+            let mut state = (Allocator::default(), Vec::with_capacity(16 * 1024));
+            (0..file_count).map(|file| read(&mut state, file)).collect()
         };
         project.sources = Vec::new();
         let t_extract = std::time::Instant::now();

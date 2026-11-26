@@ -1,5 +1,9 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
+
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use oxc_allocator::Allocator;
 use oxc_ast::{
@@ -1268,6 +1272,7 @@ pub fn summarize(
     file: Id,
     entry_file: bool,
     arena: &mut Allocator,
+    read_buf: &mut Vec<u8>,
 ) -> FileSummary {
     arena.reset();
     let mut summary = FileSummary {
@@ -1285,18 +1290,47 @@ pub fn summarize(
         used_dynamic_imports: false,
         parsed: false,
     };
-    summary.parsed = extract(project, &mut summary, arena, entry_file);
+    summary.parsed = extract(project, &mut summary, arena, read_buf, entry_file);
     summary
 }
 
-fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_file: bool) -> bool {
+fn extract(
+    project: &Project,
+    out: &mut FileSummary,
+    arena: &Allocator,
+    read_buf: &mut Vec<u8>,
+    entry_file: bool,
+) -> bool {
     let file = out.file;
     let path = project.root.join(&project.graph.paths[file]);
-    let source = match project.source_text(file) {
-        Ok(text) => text,
-        Err(e) => {
+    let source: &str = match project.source_text(file) {
+        Some(Ok(text)) => text,
+        Some(Err(e)) => {
             out.gap("read-error", None, e.to_owned(), None, None);
             return false;
+        }
+        None => {
+            read_buf.clear();
+            let res = File::open(&path).and_then(|mut f| {
+                if let Ok(meta) = f.metadata() {
+                    let len = meta.len() as usize;
+                    if len > read_buf.capacity() {
+                        read_buf.reserve(len - read_buf.capacity());
+                    }
+                }
+                f.read_to_end(read_buf)
+            });
+            if let Err(e) = res {
+                out.gap("read-error", None, e.to_string(), None, None);
+                return false;
+            }
+            match std::str::from_utf8(read_buf) {
+                Ok(s) => s,
+                Err(e) => {
+                    out.gap("read-error", None, e.to_string(), None, None);
+                    return false;
+                }
+            }
         }
     };
 
@@ -1338,8 +1372,8 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
     let nodes = sem.nodes();
     let scoping = sem.scoping();
     let record = parsed.module_record;
-    let mut bindings = HashMap::new();
-    let mut declarations: HashMap<NodeId, Vec<Id>> = HashMap::new();
+    let mut bindings = HashMap::default();
+    let mut declarations: HashMap<NodeId, Vec<Id>> = HashMap::default();
     for symbol in scoping
         .symbol_ids()
         .filter(|&s| scoping.symbol_scope_id(s) == scoping.root_scope_id())
@@ -1369,7 +1403,7 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
             .and_then(|s| bindings.get(&s).copied())
     };
 
-    let mut import_phases = HashMap::new();
+    let mut import_phases = HashMap::default();
     for import in &record.import_entries {
         *import_phases
             .entry(import.statement_span.start)
@@ -1408,13 +1442,13 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
         .and_then(|e| e.to_str())
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
-    let mut namespaces = HashMap::new();
-    let mut symbol_namespaces: HashMap<SymbolId, (Id, bool, bool)> = HashMap::new();
-    let mut require_symbols: HashSet<SymbolId> = HashSet::new();
-    let mut file_ext_symbols: HashSet<SymbolId> = HashSet::new();
-    let mut local_paths: HashMap<SymbolId, Vec<(String, Span)>> = HashMap::new();
-    let mut handled_cjs_idents: HashSet<u32> = HashSet::new();
-    let mut owner_overrides: HashMap<u32, Owner> = HashMap::new();
+    let mut namespaces = HashMap::default();
+    let mut symbol_namespaces: HashMap<SymbolId, (Id, bool, bool)> = HashMap::default();
+    let mut require_symbols: HashSet<SymbolId> = HashSet::default();
+    let mut file_ext_symbols: HashSet<SymbolId> = HashSet::default();
+    let mut local_paths: HashMap<SymbolId, Vec<(String, Span)>> = HashMap::default();
+    let mut handled_cjs_idents: HashSet<u32> = HashSet::default();
+    let mut owner_overrides: HashMap<u32, Owner> = HashMap::default();
     let mut react = crate::react::ReactCalls::default();
 
     for import in &record.import_entries {

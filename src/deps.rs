@@ -1,10 +1,11 @@
 //! Per-workspace package dependency analysis: unused declared dependencies,
 //! unlisted imported packages, unlisted script binaries, and devDependencies
 //! imported by runtime code.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -189,34 +190,47 @@ fn read_pkg_bins(
     repo_root: &Path,
     ws_rel: &Path,
     pkg: &str,
-    workspace_bins: &HashMap<String, Vec<String>>,
-    cache: &mut HashMap<(PathBuf, String), Vec<String>>,
+    workspace_bins: &FxHashMap<String, Vec<String>>,
+    ws_cache: &mut FxHashMap<(PathBuf, String), Vec<String>>,
+    nm_exists: &mut FxHashMap<PathBuf, bool>,
+    pkg_json_cache: &mut FxHashMap<PathBuf, Option<Vec<String>>>,
 ) -> Vec<String> {
     if let Some(wb) = workspace_bins.get(pkg) {
         return wb.clone();
     }
     let key = (ws_rel.to_owned(), pkg.to_owned());
-    if let Some(cached) = cache.get(&key) {
+    if let Some(cached) = ws_cache.get(&key) {
         return cached.clone();
     }
     let mut bins = Vec::new();
     let abs_start = repo_root.join(ws_rel);
     for anc in abs_start.ancestors() {
-        let pkg_json = anc.join("node_modules").join(pkg).join("package.json");
-        if let Ok(bytes) = fs::read(&pkg_json)
-            && let Ok(val) = serde_json::from_slice::<Value>(&bytes)
-        {
-            match &val["bin"] {
-                Value::String(_) => {
-                    let default_name = pkg.rsplit('/').next().unwrap_or(pkg);
-                    bins.push(default_name.to_owned());
+        let nm_dir = anc.join("node_modules");
+        let has_nm = *nm_exists
+            .entry(nm_dir.clone())
+            .or_insert_with(|| nm_dir.is_dir());
+        if has_nm {
+            let pkg_json = nm_dir.join(pkg).join("package.json");
+            let found = pkg_json_cache.entry(pkg_json.clone()).or_insert_with(|| {
+                let bytes = fs::read(&pkg_json).ok()?;
+                let val = serde_json::from_slice::<Value>(&bytes).ok()?;
+                let mut list = Vec::new();
+                match &val["bin"] {
+                    Value::String(_) => {
+                        let default_name = pkg.rsplit('/').next().unwrap_or(pkg);
+                        list.push(default_name.to_owned());
+                    }
+                    Value::Object(map) => {
+                        list.extend(map.keys().cloned());
+                    }
+                    _ => {}
                 }
-                Value::Object(map) => {
-                    bins.extend(map.keys().cloned());
-                }
-                _ => {}
+                Some(list)
+            });
+            if let Some(list) = found {
+                bins.extend(list.iter().cloned());
+                break;
             }
-            break;
         }
         if anc == repo_root {
             break;
@@ -231,7 +245,7 @@ fn read_pkg_bins(
         let fallback = pkg.rsplit('/').next().unwrap_or(pkg);
         bins.push(fallback.to_owned());
     }
-    cache.insert(key, bins.clone());
+    ws_cache.insert(key, bins.clone());
     bins
 }
 
@@ -350,29 +364,79 @@ const BUNDLER_BINS: &[&str] = &[
     "next", "nuxt", "astro",
 ];
 
-fn is_bundled_workspace(project: &Project, m: &WorkspaceManifest) -> bool {
-    for (file_id, path) in project.graph.paths.iter().enumerate() {
-        if project.workspace_for_file.get(file_id).copied() != Some(m.ws_id) {
-            continue;
-        }
-        if let Some(name) = Path::new(path).file_name().and_then(|s| s.to_str())
-            && is_bundler_config_name(name)
-        {
-            return true;
-        }
-    }
+fn has_bundler_script(m: &WorkspaceManifest) -> bool {
     let mut bins = Vec::new();
     for script_cmd in m.scripts.values() {
         bins.clear();
         extract_script_binaries(script_cmd, &mut bins);
-        if bins.iter().any(|b| BUNDLER_BINS.contains(&b.as_str())) {
-            return true;
-        }
-        if script_cmd.contains("bun build") {
+        if bins.iter().any(|b| BUNDLER_BINS.contains(&b.as_str()))
+            || script_cmd.contains("bun build")
+        {
             return true;
         }
     }
     false
+}
+
+/// Resolve a binary name via `node_modules/.bin/<bin>` symlink to the providing package name
+/// in a single `readlink` syscall without reading hundreds of `package.json` files.
+fn resolve_bin_via_symlink(
+    repo_root: &Path,
+    ws_rel: &Path,
+    bin: &str,
+    nm_bin_exists: &mut FxHashMap<PathBuf, bool>,
+) -> Option<String> {
+    let abs_start = repo_root.join(ws_rel);
+    for anc in abs_start.ancestors() {
+        let dot_bin = anc.join("node_modules").join(".bin");
+        let exists = *nm_bin_exists
+            .entry(dot_bin.clone())
+            .or_insert_with(|| dot_bin.is_dir());
+        if exists
+            && let Ok(target) = fs::read_link(dot_bin.join(bin))
+            && let Some(s) = target.to_str()
+        {
+            let clean = s.replace('\\', "/");
+            let rest = clean
+                .strip_prefix("../")
+                .or_else(|| clean.split_once("node_modules/").map(|(_, r)| r));
+            if let Some(r) = rest
+                && let Some(pkg) = extract_dep_package(r)
+            {
+                return Some(pkg);
+            }
+        }
+        if anc == repo_root {
+            break;
+        }
+    }
+    None
+}
+
+fn bin_matches_declared(
+    bin: &str,
+    declared: &BTreeSet<&str>,
+    workspace_bins: &FxHashMap<String, Vec<String>>,
+    out: &mut Vec<String>,
+) {
+    for &dep in declared {
+        if let Some(wb) = workspace_bins.get(dep) {
+            if wb.iter().any(|b| b == bin) {
+                out.push(dep.to_owned());
+            }
+            continue;
+        }
+        if known_bin_for_pkg(dep).contains(&bin) {
+            out.push(dep.to_owned());
+            continue;
+        }
+        if !dep.starts_with("@types/") {
+            let short = dep.rsplit('/').next().unwrap_or(dep);
+            if short == bin {
+                out.push(dep.to_owned());
+            }
+        }
+    }
 }
 
 pub fn analyze_dependencies(
@@ -380,8 +444,8 @@ pub fn analyze_dependencies(
     reach: &Reach,
     package_refs: &[PackageRef],
 ) -> Vec<DependencyFinding> {
-    let mut workspace_bins: HashMap<String, Vec<String>> = HashMap::new();
-    let mut by_ws_id: HashMap<usize, &WorkspaceManifest> = HashMap::new();
+    let mut workspace_bins: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    let mut by_ws_id: FxHashMap<usize, &WorkspaceManifest> = FxHashMap::default();
     for m in &project.manifests {
         by_ws_id.insert(m.ws_id, m);
         if let Some(name) = &m.name {
@@ -389,39 +453,49 @@ pub fn analyze_dependencies(
         }
     }
     let root_manifest = by_ws_id.get(&0).copied();
+    let root_declared: BTreeSet<&str> = root_manifest
+        .map(|rm| {
+            rm.dependencies
+                .iter()
+                .chain(&rm.dev_dependencies)
+                .chain(&rm.peer_dependencies)
+                .chain(&rm.optional_dependencies)
+                .map(String::as_str)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Single pass over files to mark workspaces containing a bundler config.
+    let mut bundled_by_config = vec![false; project.workspace_infos.len()];
+    for (file_id, path) in project.graph.paths.iter().enumerate() {
+        let ws_id = project
+            .workspace_for_file
+            .get(file_id)
+            .copied()
+            .unwrap_or(0);
+        if !bundled_by_config.get(ws_id).copied().unwrap_or(false)
+            && let Some(name) = Path::new(path).file_name().and_then(|s| s.to_str())
+            && is_bundler_config_name(name)
+            && ws_id < bundled_by_config.len()
+        {
+            bundled_by_config[ws_id] = true;
+        }
+    }
 
     // Group imported package refs by owning workspace.
-    let mut refs_by_ws: HashMap<usize, Vec<&PackageRef>> = HashMap::new();
+    let mut refs_by_ws: FxHashMap<usize, Vec<&PackageRef>> = FxHashMap::default();
     for r in package_refs {
         let ws_id = project.workspace_for_file.get(r.file).copied().unwrap_or(0);
         refs_by_ws.entry(ws_id).or_default().push(r);
     }
 
-    let mut bin_cache = HashMap::new();
+    let mut bin_cache = FxHashMap::default();
+    let mut nm_exists = FxHashMap::default();
+    let mut nm_bin_exists = FxHashMap::default();
+    let mut pkg_json_cache = FxHashMap::default();
+    let mut root_bin_map_full: Option<FxHashMap<String, Vec<String>>> = None;
     let mut root_used_deps: BTreeSet<String> = BTreeSet::new();
     let mut findings = Vec::new();
-
-    // Precompute root binary -> providing package map for monorepo hoisted dev tools.
-    let mut root_bin_map: HashMap<String, Vec<String>> = HashMap::new();
-    if let Some(rm) = root_manifest {
-        for dep in rm
-            .dependencies
-            .iter()
-            .chain(&rm.dev_dependencies)
-            .chain(&rm.peer_dependencies)
-            .chain(&rm.optional_dependencies)
-        {
-            for bin in read_pkg_bins(
-                &project.root,
-                &rm.rel_dir,
-                dep,
-                &workspace_bins,
-                &mut bin_cache,
-            ) {
-                root_bin_map.entry(bin).or_default().push(dep.clone());
-            }
-        }
-    }
 
     for m in &project.manifests {
         let mut used_deps: BTreeSet<String> = m.config_deps.clone();
@@ -436,22 +510,9 @@ pub fn analyze_dependencies(
             declared_all.insert(d.as_str());
         }
 
-        // Build binary -> providing package map for this workspace.
-        let mut ws_bin_map: HashMap<String, Vec<String>> = HashMap::new();
-        for dep in &declared_all {
-            for bin in read_pkg_bins(
-                &project.root,
-                &m.rel_dir,
-                dep,
-                &workspace_bins,
-                &mut bin_cache,
-            ) {
-                ws_bin_map.entry(bin).or_default().push((*dep).to_owned());
-            }
-        }
-
         // Check imported packages in this workspace's files.
-        let bundled = is_bundled_workspace(project, m);
+        let bundled =
+            bundled_by_config.get(m.ws_id).copied().unwrap_or(false) || has_bundler_script(m);
         let mut seen_unlisted: BTreeSet<(Id, String)> = BTreeSet::new();
         let mut seen_dev_runtime: BTreeSet<(Id, String)> = BTreeSet::new();
         if let Some(refs) = refs_by_ws.get(&m.ws_id) {
@@ -514,8 +575,11 @@ pub fn analyze_dependencies(
             }
         }
 
-        // Check binaries invoked in package.json#scripts.
+        // Check binaries invoked in package.json#scripts lazily (avoiding disk reads for packages
+        // whose binaries are never invoked).
         let mut seen_unlisted_bins: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut ws_bin_map_full: Option<FxHashMap<String, Vec<String>>> = None;
+        let mut fast_matches = Vec::new();
         for (script_name, script_cmd) in &m.scripts {
             let mut bins = Vec::new();
             extract_script_binaries(script_cmd, &mut bins);
@@ -523,17 +587,91 @@ pub fn analyze_dependencies(
                 if m.bins.contains(&bin) {
                     continue;
                 }
-                if let Some(providers) = ws_bin_map.get(&bin) {
+                // 1. Fast zero-I/O check against workspace declared deps.
+                fast_matches.clear();
+                bin_matches_declared(&bin, &declared_all, &workspace_bins, &mut fast_matches);
+                if !fast_matches.is_empty() {
+                    for p in &fast_matches {
+                        used_deps.insert(p.clone());
+                    }
+                    continue;
+                }
+                // 2. Single-syscall `.bin/<bin>` symlink probe.
+                if let Some(pkg) =
+                    resolve_bin_via_symlink(&project.root, &m.rel_dir, &bin, &mut nm_bin_exists)
+                {
+                    if declared_all.contains(pkg.as_str()) {
+                        used_deps.insert(pkg);
+                        continue;
+                    }
+                    if m.ws_id != 0 && root_declared.contains(pkg.as_str()) {
+                        root_used_deps.insert(pkg);
+                        continue;
+                    }
+                }
+                // 3. Fast zero-I/O check against hoisted root declared deps.
+                if m.ws_id != 0 {
+                    fast_matches.clear();
+                    bin_matches_declared(&bin, &root_declared, &workspace_bins, &mut fast_matches);
+                    if !fast_matches.is_empty() {
+                        for p in &fast_matches {
+                            root_used_deps.insert(p.clone());
+                        }
+                        continue;
+                    }
+                }
+                // 4. Slow fallback: inspect declared package.json `bin` maps (e.g. non-symlinked fixtures).
+                let ws_map = ws_bin_map_full.get_or_insert_with(|| {
+                    let mut map: FxHashMap<String, Vec<String>> = FxHashMap::default();
+                    for dep in &declared_all {
+                        for b in read_pkg_bins(
+                            &project.root,
+                            &m.rel_dir,
+                            dep,
+                            &workspace_bins,
+                            &mut bin_cache,
+                            &mut nm_exists,
+                            &mut pkg_json_cache,
+                        ) {
+                            map.entry(b).or_default().push((*dep).to_owned());
+                        }
+                    }
+                    map
+                });
+                if let Some(providers) = ws_map.get(&bin) {
                     for p in providers {
                         used_deps.insert(p.clone());
                     }
-                } else if m.ws_id != 0
-                    && let Some(providers) = root_bin_map.get(&bin)
+                    continue;
+                }
+                if m.ws_id != 0
+                    && let Some(rm) = root_manifest
                 {
-                    for p in providers {
-                        root_used_deps.insert(p.clone());
+                    let rmap = root_bin_map_full.get_or_insert_with(|| {
+                        let mut map: FxHashMap<String, Vec<String>> = FxHashMap::default();
+                        for dep in &root_declared {
+                            for b in read_pkg_bins(
+                                &project.root,
+                                &rm.rel_dir,
+                                dep,
+                                &workspace_bins,
+                                &mut bin_cache,
+                                &mut nm_exists,
+                                &mut pkg_json_cache,
+                            ) {
+                                map.entry(b).or_default().push((*dep).to_owned());
+                            }
+                        }
+                        map
+                    });
+                    if let Some(providers) = rmap.get(&bin) {
+                        for p in providers {
+                            root_used_deps.insert(p.clone());
+                        }
+                        continue;
                     }
-                } else if seen_unlisted_bins.insert((script_name.clone(), bin.clone())) {
+                }
+                if seen_unlisted_bins.insert((script_name.clone(), bin.clone())) {
                     findings.push(DependencyFinding {
                         id: String::new(),
                         kind: "unlisted-binary",

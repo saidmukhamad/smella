@@ -1,6 +1,7 @@
 //! Static discovery of runtime and tooling entries from package.json scripts,
 //! Vite/webpack configs (including Module Federation exposes), and Storybook configs.
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use oxc_allocator::Allocator;
@@ -672,6 +673,21 @@ fn is_build_script_candidate(path: &str) -> bool {
         && (name.contains("build") || name.contains("bundle") || name.contains("esbuild"))
 }
 
+fn read_project_source<'a>(
+    project: &'a Project,
+    id: usize,
+    rel: &str,
+    scratch: &'a mut String,
+) -> Option<&'a str> {
+    if let Some(res) = project.source_text(id) {
+        return res.ok();
+    }
+    scratch.clear();
+    let abs = project.root.join(rel);
+    *scratch = fs::read_to_string(&abs).ok()?;
+    Some(scratch.as_str())
+}
+
 /// Inspect Vite, webpack, esbuild, tsdown, rollup configs and build scripts statically to
 /// discover runtime entries (`input`, `entry`, `entryPoints`, `.html` `<script src>`,
 /// Module Federation `exposes`, `resolve.alias`, and Vite `resolveId` targets).
@@ -693,9 +709,10 @@ pub fn discover_bundler_entries(project: &mut Project) {
         .collect();
 
     let mut arena = Allocator::default();
+    let mut scratch = String::new();
     let mut new_roots = Vec::new();
     for (id, cfg, is_config) in config_files {
-        let Ok(source) = project.source_text(id) else {
+        let Some(source) = read_project_source(project, id, &cfg, &mut scratch) else {
             continue;
         };
         if !is_config
@@ -857,9 +874,10 @@ pub fn discover_jest_config_entries(project: &mut Project) {
         return;
     }
     let mut arena = Allocator::default();
+    let mut scratch = String::new();
     let mut new_roots = Vec::new();
     for (id, cfg) in configs {
-        let Ok(source) = project.source_text(id) else {
+        let Some(source) = read_project_source(project, id, &cfg, &mut scratch) else {
             continue;
         };
         let abs = project.root.join(&cfg);
@@ -971,9 +989,10 @@ pub fn discover_ambient_declarations(project: &mut Project) {
         return;
     }
     let mut arena = Allocator::default();
+    let mut scratch = String::new();
     let mut ambient = Vec::new();
     for (id, file) in candidates {
-        let Ok(source) = project.source_text(id) else {
+        let Some(source) = read_project_source(project, id, &file, &mut scratch) else {
             continue;
         };
         if !source.contains("declare ") {
@@ -1061,6 +1080,7 @@ pub fn discover_storybook_stories(project: &mut Project) -> Result<(), String> {
         .collect();
 
     let mut arena = Allocator::default();
+    let mut scratch = String::new();
     let mut story_globs = Vec::new();
     let mut configs = Vec::new();
 
@@ -1075,7 +1095,7 @@ pub fn discover_storybook_stories(project: &mut Project) -> Result<(), String> {
                 configs.push(preview);
             }
         }
-        let Ok(source) = project.source_text(id) else {
+        let Some(source) = read_project_source(project, id, &main_file, &mut scratch) else {
             continue;
         };
         let abs = project.root.join(&main_file);

@@ -1,5 +1,5 @@
 //! React wrapper semantics are selected by the imported lexical binding.
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use oxc_ast::ast::{
     BindingPatternKind, CallExpression, Expression, FunctionBody, IdentifierReference,

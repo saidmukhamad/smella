@@ -25,6 +25,7 @@ pub fn pool() -> Option<&'static rayon::ThreadPool> {
 }
 
 /// Read all `rel_paths` under `root` into UTF-8 strings in index order.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn read_files(root: &Path, rel_paths: &[String]) -> Vec<Result<String, String>> {
     if rel_paths.is_empty() {
         return Vec::new();
