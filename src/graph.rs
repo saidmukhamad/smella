@@ -169,11 +169,45 @@ impl CompactEdge {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NodeKind {
+    Module,
+    Binding,
+    Import,
+    Export,
+    ReExport,
+    Declaration,
+}
+
+impl NodeKind {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Module => "module",
+            Self::Binding => "binding",
+            Self::Import => "import",
+            Self::Export => "export",
+            Self::ReExport => "re-export",
+            Self::Declaration => "declaration",
+        }
+    }
+}
+
+/// 24-byte graph vertex; `name_off..name_off+name_len` slices `Graph.names`.
 pub struct Node {
-    pub file: Id,
-    pub kind: &'static str,
-    pub name: String,
+    pub file: u32,
     pub loc: Loc,
+    pub name_off: u32,
+    pub name_len: u32,
+    pub kind: NodeKind,
+}
+
+impl Node {
+    #[inline]
+    pub fn file_id(&self) -> Id {
+        self.file as Id
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -199,6 +233,8 @@ pub struct PendingGap {
 pub struct Graph {
     pub paths: Vec<String>,
     pub nodes: Vec<Node>,
+    /// Contiguous UTF-8 pool holding all node names (zero per-node String allocs).
+    pub names: String,
     pub modules: Vec<Module>,
     pub gaps: Vec<PendingGap>,
     pub links: Vec<Link>,
@@ -213,6 +249,7 @@ impl Graph {
         let mut g = Self {
             paths,
             nodes: Vec::with_capacity(n),
+            names: String::new(),
             modules: Vec::with_capacity(n),
             gaps: vec![],
             links: vec![],
@@ -222,10 +259,20 @@ impl Graph {
         };
         // Module vertex IDs coincide with file IDs.
         for f in 0..n {
-            g.node(f, "module", "", Loc::default());
+            g.node(f, NodeKind::Module, "", Loc::default());
             g.modules.push(Module::default());
         }
         g
+    }
+    #[inline]
+    pub fn node_name(&self, id: Id) -> &str {
+        let n = &self.nodes[id];
+        if n.name_len == 0 {
+            ""
+        } else {
+            let start = n.name_off as usize;
+            &self.names[start..start + n.name_len as usize]
+        }
     }
     #[inline]
     pub fn edges(&self, id: Id) -> &[CompactEdge] {
@@ -238,12 +285,20 @@ impl Graph {
         self.edge_offsets = Vec::new();
         self.csr_edges = Vec::new();
     }
-    pub fn node(&mut self, file: Id, kind: &'static str, name: &str, loc: Loc) -> Id {
+    pub fn node(&mut self, file: Id, kind: NodeKind, name: &str, loc: Loc) -> Id {
+        let (name_off, name_len) = if name.is_empty() {
+            (0u32, 0u32)
+        } else {
+            let off = self.names.len() as u32;
+            self.names.push_str(name);
+            (off, name.len() as u32)
+        };
         self.nodes.push(Node {
-            file,
-            kind,
-            name: name.into(),
+            file: file as u32,
             loc,
+            name_off,
+            name_len,
+            kind,
         });
         self.nodes.len() - 1
     }
@@ -301,7 +356,7 @@ impl Graph {
     pub fn step(&self, id: Id, via: Option<(Id, Loc)>) -> serde_json::Value {
         let node = &self.nodes[id];
         serde_json::json!({
-            "file": self.paths[node.file], "kind": node.kind, "name": node.name, "location": node.loc,
+            "file": self.paths[node.file_id()], "kind": node.kind.as_str(), "name": self.node_name(id), "location": node.loc,
             "via": via.map(|(file,loc)| serde_json::json!({"file": self.paths[file], "location": loc}))
         })
     }
@@ -332,7 +387,7 @@ impl Graph {
                     }
                     continue;
                 }
-                let surface = self.node(file, "re-export", &name, loc);
+                let surface = self.node(file, NodeKind::ReExport, &name, loc);
                 self.edge(surface, source_node, type_only, loc);
                 self.modules[file].exports.insert(
                     name.clone(),
@@ -353,7 +408,7 @@ impl Graph {
         let node_count = self.nodes.len();
         let mut forwarded = vec![false; node_count];
         for (from, file, name, type_only, loc) in &links {
-            if self.nodes[*from].kind == "re-export" {
+            if self.nodes[*from].kind == NodeKind::ReExport {
                 forwarded[*from] = true;
                 if let Some(target) = self.modules[*file].exports.get(name) {
                     self.edge(*from, target.surface, *type_only, *loc);
@@ -442,7 +497,7 @@ impl Graph {
                 } else {
                     self.gap(
                         "namespace-escape",
-                        Some(self.nodes[from].file),
+                        Some(self.nodes[from].file_id()),
                         Some(loc),
                         format!("The properties read from {} are unknown.", self.paths[file]),
                         Some(from),
@@ -464,7 +519,7 @@ impl Graph {
                 if forwarded[from] {
                     cleared.get_or_insert_with(|| vec![false; self.nodes.len()])[from] = true;
                 }
-                let from_file = self.nodes[from].file;
+                let from_file = self.nodes[from].file_id();
                 let mut affected = vec![file as u32];
                 if from_file != file {
                     affected.push(from_file as u32);
@@ -724,7 +779,7 @@ impl Reach {
                 if from < file_count {
                     continue;
                 }
-                let file = g.nodes[from].file;
+                let file = g.nodes[from].file_id();
                 let bit = 1u8 << lane;
                 if (masks[file] & bit) == 0 {
                     masks[file] |= bit;
@@ -869,7 +924,7 @@ impl Reach {
                         while let Some(n) = stack.pop() {
                             if seen_stamp[n] != stamp {
                                 seen_stamp[n] = stamp;
-                                let f = graph.nodes[n].file;
+                                let f = graph.nodes[n].file_id();
                                 if file_stamp[f] != stamp {
                                     file_stamp[f] = stamp;
                                     touched_files.push(f as u32);

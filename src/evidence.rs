@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use rustc_hash::FxHashMap;
 use serde_json::{Value, json};
 
-use crate::graph::{Gap, GapScope, Graph, Id, Loc, Reach, Role};
+use crate::graph::{Gap, GapScope, Graph, Id, Loc, NodeKind, Reach, Role};
 
 #[derive(Clone, Copy, Default)]
 struct Step {
@@ -34,10 +34,10 @@ fn transitions(graph: &Graph, source: usize, mut visit: impl FnMut(usize, Loc)) 
     let phase = source % 2;
     let node = &graph.nodes[id];
     if phase == 1 {
-        if node.file == id {
+        if node.file_id() == id {
             return;
         }
-        visit(state(node.file, 1), node.loc);
+        visit(state(node.file_id(), 1), node.loc);
     }
     for edge in graph.edges(id) {
         visit(
@@ -55,13 +55,16 @@ fn crossing_imports(graph: &Graph, workspace: &[usize]) -> Vec<bool> {
     let mut queue: Vec<u32> = Vec::new();
     let mut in_offsets = vec![0u32; n + 1];
     for (id, node) in graph.nodes.iter().enumerate() {
-        if !matches!(node.kind, "import" | "export" | "re-export") {
+        if !matches!(
+            node.kind,
+            NodeKind::Import | NodeKind::Export | NodeKind::ReExport
+        ) {
             continue;
         }
-        let ws = workspace[node.file];
+        let ws = workspace[node.file_id()];
         for edge in graph.edges(id) {
             let target = edge.target();
-            if ws != workspace[graph.nodes[target].file] {
+            if ws != workspace[graph.nodes[target].file_id()] {
                 if !crossing[id] {
                     crossing[id] = true;
                     queue.push(id as u32);
@@ -80,13 +83,16 @@ fn crossing_imports(graph: &Graph, workspace: &[usize]) -> Vec<bool> {
     let mut cursor = in_offsets[..n].to_vec();
     let mut incoming = vec![0u32; in_offsets[n] as usize];
     for (id, node) in graph.nodes.iter().enumerate() {
-        if !matches!(node.kind, "import" | "export" | "re-export") {
+        if !matches!(
+            node.kind,
+            NodeKind::Import | NodeKind::Export | NodeKind::ReExport
+        ) {
             continue;
         }
-        let ws = workspace[node.file];
+        let ws = workspace[node.file_id()];
         for edge in graph.edges(id) {
             let target = edge.target();
-            if ws == workspace[graph.nodes[target].file] {
+            if ws == workspace[graph.nodes[target].file_id()] {
                 let slot = cursor[target] as usize;
                 incoming[slot] = id as u32;
                 cursor[target] += 1;
@@ -119,7 +125,7 @@ impl WorkspacePaths {
         let node = &graph.nodes[id];
         let index = self.0.len();
         self.0.push(json!({
-            "file": graph.paths[node.file], "kind": node.kind, "name": node.name, "location": node.loc,
+            "file": graph.paths[node.file_id()], "kind": node.kind.as_str(), "name": graph.node_name(id), "location": node.loc,
             "next": tail.map(|(next, _)| next), "edge": tail.map(|(_, loc)| loc),
         }));
         index
@@ -165,17 +171,24 @@ impl Evidence {
         if workspace.iter().any(|&id| id != 0) {
             let crossing = crossing_imports(graph, workspace);
             for (id, node) in graph.nodes.iter().enumerate() {
-                if reach.any(node.file)
-                    || !matches!(node.kind, "binding" | "module" | "declaration" | "export")
+                if reach.any(node.file_id())
+                    || !matches!(
+                        node.kind,
+                        NodeKind::Binding
+                            | NodeKind::Module
+                            | NodeKind::Declaration
+                            | NodeKind::Export
+                    )
                 {
                     continue;
                 }
                 for edge in graph.edges(id) {
                     let edge_target = edge.target();
                     let target_node = &graph.nodes[edge_target];
-                    let imports_binding = target_node.kind == "import" && crossing[edge_target];
-                    let loads_module = target_node.kind == "module"
-                        && workspace[node.file] != workspace[target_node.file];
+                    let imports_binding =
+                        target_node.kind == NodeKind::Import && crossing[edge_target];
+                    let loads_module = target_node.kind == NodeKind::Module
+                        && workspace[node.file_id()] != workspace[target_node.file_id()];
                     if !imports_binding && !loads_module {
                         continue;
                     }
@@ -184,7 +197,7 @@ impl Evidence {
                         state: state(id, 0) as u32,
                         loc: edge.loc,
                     });
-                    location.get_or_insert((node.file, edge.loc));
+                    location.get_or_insert((node.file_id(), edge.loc));
                     if possible.is_empty() {
                         possible.resize(states, false);
                     }
@@ -198,7 +211,7 @@ impl Evidence {
         if let Some((file, loc)) = location {
             let mut affected = vec![false; graph.paths.len()];
             while let Some(s) = queue.pop_front() {
-                affected[graph.nodes[s / 2].file] = true;
+                affected[graph.nodes[s / 2].file_id()] = true;
                 transitions(graph, s, |t, _| {
                     if !possible[t] {
                         possible[t] = true;
@@ -331,12 +344,12 @@ impl Evidence {
                     for read in reads {
                         let owner_id = read.state as usize / 2;
                         let owner = &graph.nodes[owner_id];
-                        let key = (owner.file, read.loc.start, read.loc.end, phase);
+                        let key = (owner.file_id(), read.loc.start, read.loc.end, phase);
                         sources.entry(key).or_insert_with(|| {
                             let suffix = paths.intern(graph, s, &next, &mut known);
                             let first = paths.push(graph, owner_id, Some((suffix, read.loc)));
                             json!({
-                                "file": graph.paths[owner.file], "location": read.loc,
+                                "file": graph.paths[owner.file_id()], "location": read.loc,
                                 "fact": fact, "first": first
                             })
                         });

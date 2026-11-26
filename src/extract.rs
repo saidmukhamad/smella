@@ -24,7 +24,7 @@ use oxc_syntax::symbol::SymbolId;
 
 use crate::deps::{PackageRef, extract_dep_package};
 use crate::graph::{
-    Edge, Export, Gap, GapScope, Graph, Id, Link, Loc, Module, Node, PendingGap, RawEdge,
+    Edge, Export, Gap, GapScope, Graph, Id, Link, Loc, Module, Node, NodeKind, PendingGap, RawEdge,
 };
 use crate::project::{Project, StaleConfigItem};
 
@@ -54,8 +54,8 @@ impl Owner {
 pub struct FileSummary {
     file: Id,
     base: usize,
-    path: String,
     nodes: Vec<Node>,
+    names: String,
     edges: Vec<RawEdge>,
     module: Module,
     links: Vec<Link>,
@@ -68,13 +68,21 @@ pub struct FileSummary {
 }
 
 impl FileSummary {
-    fn node(&mut self, kind: &'static str, name: &str, loc: Loc) -> Id {
+    fn node(&mut self, kind: NodeKind, name: &str, loc: Loc) -> Id {
         let id = self.base + self.nodes.len();
+        let (name_off, name_len) = if name.is_empty() {
+            (0u32, 0u32)
+        } else {
+            let off = self.names.len() as u32;
+            self.names.push_str(name);
+            (off, name.len() as u32)
+        };
         self.nodes.push(Node {
-            file: self.file,
-            kind,
-            name: name.into(),
+            file: self.file as u32,
             loc,
+            name_off,
+            name_len,
+            kind,
         });
         id
     }
@@ -104,7 +112,7 @@ impl FileSummary {
         self.gaps.push(PendingGap {
             record: Gap {
                 code,
-                file: Some(self.path.clone()),
+                file: None,
                 location: loc,
                 message,
                 scope,
@@ -119,7 +127,7 @@ impl FileSummary {
         if let Some(package) = extract_dep_package(spec)
             && project
                 .source_mapper
-                .matches_tsconfig_path(Path::new(&self.path), spec)
+                .matches_tsconfig_path(Path::new(&project.graph.paths[self.file]), spec)
                 .is_empty()
         {
             self.package_refs.push(PackageRef {
@@ -165,7 +173,7 @@ impl FileSummary {
         type_only: bool,
         loc: Loc,
     ) {
-        let access = self.node("import", label, loc);
+        let access = self.node(NodeKind::Import, label, loc);
         self.edge(from, access, type_only, loc);
         self.links.push((access, to, prop.into(), type_only, loc));
     }
@@ -173,6 +181,10 @@ impl FileSummary {
     #[inline]
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+    #[inline]
+    pub fn name_bytes(&self) -> usize {
+        self.names.len()
     }
     #[inline]
     pub fn edge_count(&self) -> usize {
@@ -187,14 +199,22 @@ impl FileSummary {
         self.gaps.len()
     }
 
-    pub fn relocate(&mut self, offset: usize) {
-        if offset == 0 {
+    pub fn relocate(&mut self, node_offset: usize, name_offset: usize) {
+        if name_offset > 0 {
+            let name_off_u32 = name_offset as u32;
+            for node in &mut self.nodes {
+                if node.name_len > 0 {
+                    node.name_off += name_off_u32;
+                }
+            }
+        }
+        if node_offset == 0 {
             return;
         }
         let base = self.base;
         let base_u32 = base as u32;
-        let offset_u32 = offset as u32;
-        let reloc = |id: Id| if id >= base { id + offset } else { id };
+        let offset_u32 = node_offset as u32;
+        let reloc = |id: Id| if id >= base { id + node_offset } else { id };
         for edge in &mut self.edges {
             edge.relocate(base_u32, offset_u32);
         }
@@ -213,9 +233,18 @@ impl FileSummary {
     pub fn move_into(mut self, graph: &mut Graph) {
         graph.modules[self.file] = self.module;
         graph.nodes.append(&mut self.nodes);
+        if !self.names.is_empty() {
+            graph.names.push_str(&self.names);
+        }
         graph.pending_edges.append(&mut self.edges);
         graph.links.append(&mut self.links);
-        graph.gaps.append(&mut self.gaps);
+        if !self.gaps.is_empty() {
+            let file_path = &graph.paths[self.file];
+            for g in &mut self.gaps {
+                g.record.file = Some(file_path.clone());
+            }
+            graph.gaps.append(&mut self.gaps);
+        }
     }
 }
 
@@ -844,6 +873,7 @@ fn statement_symbol_names(stmt: &oxc_ast::ast::Statement<'_>) -> Vec<String> {
 
 fn extract_inline_suppressions(
     source: &str,
+    file_path: &str,
     program: &oxc_ast::ast::Program<'_>,
     out: &mut FileSummary,
 ) {
@@ -870,9 +900,9 @@ fn extract_inline_suppressions(
         if reason.is_empty() {
             out.invalid_suppressions.push(StaleConfigItem {
                 kind: "invalid-suppression",
-                source: out.path.clone(),
+                source: file_path.to_owned(),
                 pattern: None,
-                file: Some(out.path.clone()),
+                file: Some(file_path.to_owned()),
                 symbol: None,
                 location: Some(loc),
                 message: "@smella-ignore requires a non-empty reason.".into(),
@@ -904,9 +934,9 @@ fn extract_inline_suppressions(
         if attached_names.is_empty() {
             out.invalid_suppressions.push(StaleConfigItem {
                 kind: "invalid-suppression",
-                source: out.path.clone(),
+                source: file_path.to_owned(),
                 pattern: None,
-                file: Some(out.path.clone()),
+                file: Some(file_path.to_owned()),
                 symbol: None,
                 location: Some(loc),
                 message: "@smella-ignore must precede a specific export or binding declaration (file-level ignores are not supported).".into(),
@@ -940,7 +970,7 @@ fn register_cjs_export(
     bindings: &HashMap<SymbolId, Id>,
     owner_overrides: &mut HashMap<u32, Owner>,
 ) -> Id {
-    let surface = out.node("export", name, loc);
+    let surface = out.node(NodeKind::Export, name, loc);
     let inner = rhs.get_inner_expression();
     let binding = if let Expression::Identifier(id) = inner
         && let Some(rid) = id.reference_id.get()
@@ -1009,7 +1039,7 @@ fn register_cjs_object_exports(
         }
     }
     if register_default {
-        let default_surface = out.node("export", "default", loc);
+        let default_surface = out.node(NodeKind::Export, "default", loc);
         for s in surfaces {
             out.edge(default_surface, s, false, loc);
         }
@@ -1291,9 +1321,9 @@ pub fn summarize(
     arena.reset();
     let mut summary = FileSummary {
         file,
-        path: project.graph.paths[file].clone(),
         base: project.graph.paths.len(),
         nodes: vec![],
+        names: String::new(),
         edges: vec![],
         module: Module::default(),
         links: vec![],
@@ -1385,7 +1415,7 @@ fn extract(
     if parsed.panicked {
         return false;
     }
-    extract_inline_suppressions(source, &parsed.program, out);
+    extract_inline_suppressions(source, &project.graph.paths[file], &parsed.program, out);
     let sem = built.semantic;
     let nodes = sem.nodes();
     let scoping = sem.scoping();
@@ -1399,9 +1429,9 @@ fn extract(
         let flags = scoping.symbol_flags(symbol);
         let id = out.node(
             if flags.is_import() || flags.is_type_import() {
-                "import"
+                NodeKind::Import
             } else {
-                "binding"
+                NodeKind::Binding
             },
             scoping.symbol_name(symbol),
             scoping.symbol_span(symbol).into(),
@@ -1534,9 +1564,9 @@ fn extract(
         let loc = export.export_name.span().unwrap_or(export.span).into();
         let surface = out.node(
             if export.module_request.is_some() {
-                "re-export"
+                NodeKind::ReExport
             } else {
-                "export"
+                NodeKind::Export
             },
             name,
             loc,
@@ -1615,7 +1645,7 @@ fn extract(
     // Companion declaration files (`.d.ts`/`.d.mts`/`.d.cts`) augment their sibling JS module's type surface.
     if let Some(js_base) = [".js", ".mjs", ".cjs"]
         .iter()
-        .find_map(|ext| out.path.strip_suffix(ext))
+        .find_map(|ext| project.graph.paths[file].strip_suffix(ext))
     {
         for dts in ["d.ts", "d.mts", "d.cts"] {
             if let Ok(companion) = project
@@ -1686,7 +1716,7 @@ fn extract(
             let id = if ids.len() == 1 {
                 ids[0]
             } else {
-                let group = out.node("declaration", "", node.span().into());
+                let group = out.node(NodeKind::Declaration, "", node.span().into());
                 for &id in ids {
                     out.edge(id, group, false, node.span().into());
                 }
@@ -1992,7 +2022,7 @@ fn extract(
                     let scope = if ident.name == "require" && !project.is_multi_workspace() {
                         GapScope::Global
                     } else if ident.name == "require" {
-                        let dir = Path::new(&out.path)
+                        let dir = Path::new(&project.graph.paths[file])
                             .parent()
                             .unwrap_or_else(|| Path::new(""));
                         let (s, e) = project.files_in_dir_range(dir);

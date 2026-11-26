@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::deps::{DependencyFinding, analyze_dependencies};
 use crate::extract::summarize;
-use crate::graph::{Gap, Graph, Id, Loc, ROLES, Reach, Role, Root, Visit};
+use crate::graph::{Gap, Graph, Id, Loc, NodeKind, ROLES, Reach, Role, Root, Visit};
 use crate::project::{Config, Project, StaleConfigItem, WorkspaceInfo};
 
 #[derive(Clone, Serialize)]
@@ -235,14 +235,18 @@ impl Report {
             .enumerate()
             .any(|(file, summary)| roles[file] != 0 && summary.parsed);
         let mut node_offsets = Vec::with_capacity(file_count);
+        let mut name_offsets = Vec::with_capacity(file_count);
         let mut extra_nodes = 0usize;
+        let mut total_name_bytes = project.graph.names.len();
         let mut total_edges = 0usize;
         let mut total_links = 0usize;
         let mut total_gaps = 0usize;
         let mut total_pkg_refs = 0usize;
         for summary in &summaries {
             node_offsets.push(extra_nodes);
+            name_offsets.push(total_name_bytes);
             extra_nodes += summary.node_count();
+            total_name_bytes += summary.name_bytes();
             total_edges += summary.edge_count();
             total_links += summary.link_count();
             total_gaps += summary.gap_count();
@@ -254,15 +258,24 @@ impl Report {
             pool.install(|| {
                 summaries
                     .par_iter_mut()
-                    .zip(node_offsets.par_iter())
-                    .for_each(|(summary, &offset)| summary.relocate(offset));
+                    .zip(node_offsets.par_iter().zip(name_offsets.par_iter()))
+                    .for_each(|(summary, (&node_off, &name_off))| {
+                        summary.relocate(node_off, name_off)
+                    });
             });
         } else {
-            for (summary, &offset) in summaries.iter_mut().zip(&node_offsets) {
-                summary.relocate(offset);
+            for (summary, (&node_off, &name_off)) in summaries
+                .iter_mut()
+                .zip(node_offsets.iter().zip(&name_offsets))
+            {
+                summary.relocate(node_off, name_off);
             }
         }
         project.graph.nodes.reserve_exact(extra_nodes);
+        project
+            .graph
+            .names
+            .reserve_exact(total_name_bytes - project.graph.names.len());
         project.graph.pending_edges.reserve_exact(total_edges);
         project.graph.links.reserve_exact(total_links);
         project.graph.gaps.reserve_exact(total_gaps);
@@ -347,8 +360,8 @@ impl Report {
         }
         let mut private_offsets = vec![0u32; file_count + 1];
         for (id, n) in graph.nodes.iter().enumerate() {
-            if n.kind == "binding" && !exported[id] {
-                private_offsets[n.file + 1] += 1;
+            if n.kind == NodeKind::Binding && !exported[id] {
+                private_offsets[n.file_id() + 1] += 1;
             }
         }
         for i in 1..=file_count {
@@ -358,10 +371,11 @@ impl Report {
         let mut private_cursor = private_offsets[..file_count].to_vec();
         let mut private_ids = vec![0u32; private_count];
         for (id, n) in graph.nodes.iter().enumerate() {
-            if n.kind == "binding" && !exported[id] {
-                let slot = private_cursor[n.file] as usize;
+            if n.kind == NodeKind::Binding && !exported[id] {
+                let f = n.file_id();
+                let slot = private_cursor[f] as usize;
                 private_ids[slot] = id as u32;
-                private_cursor[n.file] += 1;
+                private_cursor[f] += 1;
             }
         }
         drop(exported);
@@ -400,11 +414,8 @@ impl Report {
             let p_start = private_offsets[file] as usize;
             let p_end = private_offsets[file + 1] as usize;
             if p_end - p_start > 1 {
-                private_ids[p_start..p_end].sort_by(|&a, &b| {
-                    graph.nodes[a as usize]
-                        .name
-                        .cmp(&graph.nodes[b as usize].name)
-                });
+                private_ids[p_start..p_end]
+                    .sort_by(|&a, &b| graph.node_name(a as usize).cmp(graph.node_name(b as usize)));
             }
             for &binding_u32 in &private_ids[p_start..p_end] {
                 let binding = binding_u32 as usize;
@@ -442,9 +453,9 @@ impl Report {
                 let Some(kind) = subj.kind else {
                     continue;
                 };
-                let sym_name = &graph.nodes[subj.surface].name;
+                let sym_name = graph.node_name(subj.surface);
                 if !inline_supp_map.is_empty()
-                    && let Some(&idx) = inline_supp_map.get(&(subj.file, sym_name.clone()))
+                    && let Some(&idx) = inline_supp_map.get(&(subj.file, sym_name.to_owned()))
                 {
                     let ws_id = project
                         .workspace_for_file
@@ -460,7 +471,7 @@ impl Report {
                     suppressed.push(SuppressedFinding {
                         workspace,
                         file: graph.paths[subj.file].clone(),
-                        symbol: sym_name.clone(),
+                        symbol: sym_name.to_owned(),
                         kind,
                         reason: inline_suppressions[idx].reason.clone(),
                         source: "jsdoc",
@@ -469,7 +480,7 @@ impl Report {
                     subj.kind = None;
                 } else if !config_supp_map.is_empty()
                     && let Some(&idx) =
-                        config_supp_map.get(&(graph.paths[subj.file].clone(), sym_name.clone()))
+                        config_supp_map.get(&(graph.paths[subj.file].clone(), sym_name.to_owned()))
                 {
                     let ws_id = project
                         .workspace_for_file
@@ -485,7 +496,7 @@ impl Report {
                     suppressed.push(SuppressedFinding {
                         workspace,
                         file: graph.paths[subj.file].clone(),
-                        symbol: sym_name.clone(),
+                        symbol: sym_name.to_owned(),
                         kind,
                         reason: project.suppressions[idx].reason.trim().to_owned(),
                         source: "config",
@@ -628,6 +639,7 @@ impl Report {
             Contexts(out)
         };
         let node = &self.graph.nodes[s.surface];
+        let node_name = self.graph.node_name(s.surface);
         let ws_id = self.workspace_for_file.get(s.file).copied().unwrap_or(0);
         let workspace = self.workspaces.get(ws_id).map_or(".", |w| w.dir.as_str());
         Record {
@@ -637,8 +649,8 @@ impl Report {
             workspace,
             file: &self.graph.paths[s.file],
             location: node.loc,
-            export_name: (s.form == Form::Export).then_some(node.name.as_str()),
-            binding_name: (s.form == Form::Binding).then_some(node.name.as_str()),
+            export_name: (s.form == Form::Export).then_some(node_name),
+            binding_name: (s.form == Form::Binding).then_some(node_name),
             usage: Usage {
                 value: if s.form == Form::Module {
                     Contexts(0)
@@ -679,7 +691,7 @@ impl Report {
                 Visit::Root => None,
                 Visit::From {
                     node: from, loc, ..
-                } => Some((self.graph.nodes[from].file, loc)),
+                } => Some((self.graph.nodes[from].file_id(), loc)),
             };
             path.push(self.graph.step(id, via));
             match visit {
@@ -718,8 +730,7 @@ impl Report {
             file.and_then(|f| {
                 self.subjects
                     .binary_search_by(|s| {
-                        (s.file, s.form, self.graph.nodes[s.surface].name.as_str())
-                            .cmp(&(f, form, name))
+                        (s.file, s.form, self.graph.node_name(s.surface)).cmp(&(f, form, name))
                     })
                     .ok()
             })
