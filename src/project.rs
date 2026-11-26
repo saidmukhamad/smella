@@ -89,6 +89,13 @@ enum WorkspacePackage {
     Ambiguous,
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceInfo {
+    pub dir: String,
+    pub name: Option<String>,
+}
+
 pub struct Project {
     pub root: PathBuf,
     pub roots: Vec<Root>,
@@ -99,6 +106,7 @@ pub struct Project {
     workspaces: BTreeMap<String, WorkspacePackage>,
     pub workspace_for_file: Vec<usize>,
     workspace_dirs: Vec<PathBuf>,
+    pub workspace_infos: Vec<WorkspaceInfo>,
     pub react_entry: Option<Id>,
     pub source_mapper: SourceMapper,
     pub dynamic_imports: BTreeMap<String, Vec<String>>,
@@ -434,6 +442,20 @@ impl Project {
                 workspace_dirs[id] = dir.clone();
             }
         }
+        let mut pkg_names_by_dir: BTreeMap<PathBuf, Option<String>> = BTreeMap::new();
+        for (dir, pkg) in &packages {
+            pkg_names_by_dir.insert(dir.clone(), pkg["name"].as_str().map(str::to_owned));
+        }
+        let workspace_infos: Vec<WorkspaceInfo> = workspace_dirs
+            .iter()
+            .map(|dir| {
+                let s = to_slash(dir);
+                WorkspaceInfo {
+                    dir: if s.is_empty() { ".".into() } else { s },
+                    name: pkg_names_by_dir.get(dir).cloned().flatten(),
+                }
+            })
+            .collect();
         let mut project = Self {
             root,
             graph: Graph::new(paths),
@@ -444,6 +466,7 @@ impl Project {
             file_profile,
             workspace_for_file,
             workspace_dirs,
+            workspace_infos,
             react_entry,
             source_mapper,
             dynamic_imports,

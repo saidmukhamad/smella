@@ -437,12 +437,33 @@ export async function analyze({ root = process.cwd(), base, ...options } = {}) {
     record.diff = diffContext.baseKeys.has(findingKey(record, baseFile)) ? 'pre-existing' : 'introduced';
     return record;
   }
+  function normalizeWorkspaceFilter(workspace) {
+    if (!workspace) return null;
+    const rawList = Array.isArray(workspace) ? workspace : [workspace];
+    if (rawList.length === 0) return null;
+    const allowed = new Set();
+    const byName = new Map();
+    for (const ws of metadata.workspaces) {
+      if (ws.name) byName.set(ws.name, ws.dir);
+    }
+    for (const item of rawList) {
+      const cleaned = String(item).trim().replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
+      const dir = cleaned === '' ? '.' : (byName.get(cleaned) ?? cleaned);
+      allowed.add(dir);
+    }
+    return allowed;
+  }
   return Object.freeze({
     get roots() { live(); return metadata.roots; },
+    get workspaces() { live(); return metadata.workspaces; },
     get coverage() { live(); return metadata.coverage; },
     get diff() { live(); return diffContext?.summary; },
-    findings({ kind, diff } = {}) {
+    findings({ kind, diff, workspace } = {}) {
       let records = JSON.parse(live().findings(kind)).map(withGaps);
+      const allowedWs = normalizeWorkspaceFilter(workspace);
+      if (allowedWs) {
+        records = records.filter(r => allowedWs.has(r.workspace));
+      }
       if (diffContext) {
         records = records.filter(r => diffContext.changedFiles.has(r.file)).map(classifyDiff);
         if (diff) records = records.filter(r => r.diff === diff);

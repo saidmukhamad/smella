@@ -10,6 +10,8 @@ Options:
                         <role>:<path1>,<path2>  where role is runtime|test|tooling|public
                         <path>                  shorthand for runtime:<path>
                         <role>:                 empty list disables discovery for that role
+  --workspace <dir>   Filter findings to one or more workspaces by directory or
+                      package name (repeatable or comma-separated)
   --base <ref>        Git ref to diff against (only findings in changed files,
                       marked "introduced" or "pre-existing")
   --diff <status>     Filter diff findings: introduced | pre-existing (requires --base)
@@ -66,6 +68,7 @@ async function main() {
       options: {
         root: { type: 'string' },
         entries: { type: 'string', multiple: true },
+        workspace: { type: 'string', multiple: true },
         base: { type: 'string' },
         diff: { type: 'string' },
         kind: { type: 'string', multiple: true },
@@ -111,6 +114,13 @@ async function main() {
     }
   }
 
+  const workspaces = [];
+  for (const raw of values.workspace ?? []) {
+    for (const part of raw.split(',').map(s => s.trim()).filter(Boolean)) {
+      workspaces.push(part);
+    }
+  }
+
   const entryOpts = parseEntrySpecs(values.entries);
   const options = {
     ...(values.root ? { root: values.root } : {}),
@@ -122,7 +132,11 @@ async function main() {
   try {
     report = await analyze(options);
     const kindFilter = kinds.size === 1 ? [...kinds][0] : undefined;
-    let findings = report.findings({ kind: kindFilter, diff: values.diff });
+    let findings = report.findings({
+      kind: kindFilter,
+      diff: values.diff,
+      ...(workspaces.length > 0 ? { workspace: workspaces } : {}),
+    });
     if (kinds.size > 1) {
       findings = findings.filter(f => kinds.has(f.kind));
     }
@@ -134,6 +148,7 @@ async function main() {
         id: f.id,
         kind: f.kind,
         ...(f.diff !== undefined ? { diff: f.diff } : {}),
+        workspace: f.workspace,
         file: f.file,
         exportName: f.exportName,
         ...(f.bindingName !== undefined ? { bindingName: f.bindingName } : {}),

@@ -1144,3 +1144,34 @@ test('gaps in one monorepo workspace leave fully resolved findings in unrelated 
   assert.equal(subject(r, 'packages/noisy/src/index.ts', 'noisyUnused').status, 'conditional');
   assert.equal(subject(r, 'packages/noisy/src/broken.ts', 'present').status, 'conditional');
 });
+
+test('findings carry owning workspace attribution and filter cleanly by workspace directory or package name', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ name: 'mono-root', workspaces: ['packages/*'], bin: { app: './app.ts' } }),
+    'app.ts': 'import { shared } from "@org/core"; shared();',
+    'packages/core/package.json': JSON.stringify({ name: '@org/core', exports: { '.': './src/index.ts' } }),
+    'packages/core/src/index.ts': 'export function shared() {} export function deadCore() {}',
+    'packages/web/package.json': JSON.stringify({ name: '@org/web', exports: { '.': './src/index.ts' } }),
+    'packages/web/src/index.ts': 'export function deadWeb() {}',
+  });
+
+  const r = await inspect(t, root, { publicEntries: [] });
+  assert.ok(r.workspaces.some(w => w.dir === 'packages/core' && w.name === '@org/core'));
+  assert.ok(r.workspaces.some(w => w.dir === 'packages/web' && w.name === '@org/web'));
+  assert.equal(subject(r, 'packages/core/src/index.ts', 'deadCore').workspace, 'packages/core');
+  assert.deepEqual(
+    r.findings({ workspace: 'packages/core' }).map(f => `${f.workspace}:${f.exportName ?? '<mod>'}`),
+    ['packages/core:deadCore'],
+  );
+  assert.deepEqual(
+    r.findings({ workspace: '@org/web' }).map(f => `${f.workspace}:${f.exportName ?? '<mod>'}`),
+    ['packages/web:<mod>', 'packages/web:deadWeb'],
+  );
+  const cliOut = execFileSync(process.execPath, [
+    cliPath, '--root', root, '--entries', 'public:', '--workspace', 'packages/core',
+  ], { encoding: 'utf8' });
+  const rows = cliOut.trim().split('\n').map(l => JSON.parse(l));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].workspace, 'packages/core');
+  assert.equal(rows[0].exportName, 'deadCore');
+});

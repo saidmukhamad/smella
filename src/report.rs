@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::extract::summarize;
 use crate::graph::{Gap, Graph, Id, ROLES, Reach, Role, Root, Visit};
-use crate::project::{Config, Project};
+use crate::project::{Config, Project, WorkspaceInfo};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Form {
@@ -32,6 +32,7 @@ struct Record<'a> {
     kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_gap: Option<&'a str>,
+    workspace: &'a str,
     file: &'a str,
     export_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +85,8 @@ pub struct Report {
     roots: Vec<Root>,
     excluded: Vec<String>,
     gaps: Vec<Gap>,
+    workspaces: Vec<WorkspaceInfo>,
+    workspace_for_file: Vec<usize>,
     reach: Reach,
     subjects: Vec<Subject>,
     evidence: Evidence,
@@ -238,6 +241,8 @@ impl Report {
             roots: project.roots,
             excluded: project.excluded,
             gaps,
+            workspaces: project.workspace_infos,
+            workspace_for_file: project.workspace_for_file,
             subjects,
             evidence,
         })
@@ -253,10 +258,12 @@ impl Report {
         #[derive(Serialize)]
         struct Metadata<'a> {
             roots: &'a [Root],
+            workspaces: &'a [WorkspaceInfo],
             coverage: Coverage<'a>,
         }
         serde_json::to_string(&Metadata {
             roots: &self.roots,
+            workspaces: &self.workspaces,
             coverage: Coverage {
                 status: if self.gaps.is_empty() {
                     "complete"
@@ -277,10 +284,13 @@ impl Report {
             }))
         };
         let node = &self.graph.nodes[s.surface];
+        let ws_id = self.workspace_for_file.get(s.file).copied().unwrap_or(0);
+        let workspace = self.workspaces.get(ws_id).map_or(".", |w| w.dir.as_str());
         Record {
             id: format!("s{index}"),
             workspace_gap: self.evidence.gap_for(s.binding),
             kind: s.kind,
+            workspace,
             file: &self.graph.paths[s.file],
             location: node.loc,
             export_name: (s.form == Form::Export).then_some(node.name.as_str()),

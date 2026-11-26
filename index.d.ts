@@ -15,8 +15,9 @@ export interface Gap { id: string; code: string; file: string | null; location: 
 export interface InlineGap { id: string; code: string; file: string | null; location: Location | null; message: string }
 export interface Coverage { status: 'complete' | 'partial'; files: string[]; excluded: string[]; gaps: Gap[] }
 export interface Usage { value: Context[]; type: Context[]; contract: boolean; evaluation: Context[] }
+export interface WorkspaceInfo { dir: string; name: string | null }
 interface SubjectRecord {
-  id: string; file: string; exportName: string | null; bindingName?: string; location: Location; usage: Usage;
+  id: string; workspace: string; file: string; exportName: string | null; bindingName?: string; location: Location; usage: Usage;
   status: 'complete' | 'conditional'; gapIds: readonly string[]; primaryGaps: readonly InlineGap[];
 }
 export type DiffStatus = 'introduced' | 'pre-existing';
@@ -43,9 +44,10 @@ export type Subject = string | { file: string; exportName?: string; bindingName?
   | { file: string; bindingName: string; exportName?: never };
 export interface Report {
   readonly roots: readonly Root[];
+  readonly workspaces: readonly WorkspaceInfo[];
   readonly coverage: Coverage;
   readonly diff?: DiffSummary;
-  findings(filter?: { kind?: FindingKind; diff?: DiffStatus }): Finding[];
+  findings(filter?: { kind?: FindingKind; diff?: DiffStatus; workspace?: string | readonly string[] }): Finding[];
   explain(subject: Subject): Explanation;
   dispose(): void;
 }
