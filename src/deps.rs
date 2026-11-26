@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::discover::split_shell_words;
+use crate::discover::{is_bundler_config_name, split_shell_words};
 use crate::graph::{Id, Loc, Reach};
 use crate::project::Project;
 use crate::source_map::to_slash;
@@ -349,45 +349,6 @@ const BUNDLER_BINS: &[&str] = &[
     "vite", "webpack", "tsdown", "tsup", "esbuild", "rollup", "rspack", "rsbuild", "parcel",
     "next", "nuxt", "astro",
 ];
-
-fn is_bundler_config_name(name: &str) -> bool {
-    let stems = [
-        "vite.config.",
-        "webpack.config.",
-        "tsdown.config.",
-        "tsup.config.",
-        "rollup.config.",
-        "esbuild.config.",
-        "rspack.config.",
-        "rsbuild.config.",
-        "next.config.",
-        "nuxt.config.",
-        "astro.config.",
-        "svelte.config.",
-    ];
-    stems.iter().any(|p| name.starts_with(p))
-        || (name.starts_with("vite.") && name.contains(".config."))
-        || (name.starts_with("webpack.") && name.contains(".config."))
-        || matches!(
-            name,
-            "webpack.common.js"
-                | "webpack.common.cjs"
-                | "webpack.common.mjs"
-                | "webpack.common.ts"
-                | "webpack.dev.js"
-                | "webpack.dev.cjs"
-                | "webpack.dev.mjs"
-                | "webpack.dev.ts"
-                | "webpack.prod.js"
-                | "webpack.prod.cjs"
-                | "webpack.prod.mjs"
-                | "webpack.prod.ts"
-                | "webpack.base.js"
-                | "webpack.base.cjs"
-                | "webpack.base.mjs"
-                | "webpack.base.ts"
-        )
-}
 
 fn is_bundled_workspace(project: &Project, m: &WorkspaceManifest) -> bool {
     for (file_id, path) in project.graph.paths.iter().enumerate() {

@@ -74,65 +74,60 @@ impl Serialize for Contexts {
     }
 }
 
+const TEST_SUPPORT_DIRS: &[&str] = &[
+    "__tests__",
+    "__mocks__",
+    "__fixtures__",
+    "__helpers__",
+    "__support__",
+    "test",
+    "tests",
+    "testing",
+    "test-utils",
+    "test-helpers",
+    "test-support",
+    "testUtils",
+    "testHelpers",
+    "testSupport",
+    "browser-tests",
+    "e2e",
+    "e2e-tests",
+    "integration-tests",
+    "unit-tests",
+    "playwright",
+    "cypress",
+];
+
+const TEST_SUPPORT_MARKERS: &[&str] = &[
+    ".test.",
+    ".spec.",
+    ".mock.",
+    ".mocks.",
+    ".fixture.",
+    ".fixtures.",
+    ".stub.",
+    ".stubs.",
+    ".setup.",
+    ".test-util.",
+    ".test-utils.",
+    ".test-helper.",
+    ".test-helpers.",
+];
+
+const TEST_SETUP_PREFIXES: &[&str] = &["test-setup.", "setup-tests.", "setuptests."];
+
 fn is_test_support_file(path: &str, is_test_root: bool) -> bool {
     if is_test_root {
         return true;
     }
-    let parts: Vec<&str> = path.split('/').collect();
-    for dir in &parts[..parts.len().saturating_sub(1)] {
-        if matches!(
-            *dir,
-            "__tests__"
-                | "__mocks__"
-                | "__fixtures__"
-                | "__helpers__"
-                | "__support__"
-                | "test"
-                | "tests"
-                | "testing"
-                | "test-utils"
-                | "test-helpers"
-                | "test-support"
-                | "testUtils"
-                | "testHelpers"
-                | "testSupport"
-                | "browser-tests"
-                | "e2e"
-                | "e2e-tests"
-                | "integration-tests"
-                | "unit-tests"
-                | "playwright"
-                | "cypress"
-        ) {
-            return true;
-        }
+    let mut parts = path.rsplit('/');
+    let file_name = parts.next().unwrap_or("");
+    if parts.any(|dir| TEST_SUPPORT_DIRS.contains(&dir)) {
+        return true;
     }
-    if let Some(name) = parts.last() {
-        let lower = name.to_ascii_lowercase();
-        let markers = [
-            ".test.",
-            ".spec.",
-            ".mock.",
-            ".mocks.",
-            ".fixture.",
-            ".fixtures.",
-            ".stub.",
-            ".stubs.",
-            ".setup.",
-            ".test-util.",
-            ".test-utils.",
-            ".test-helper.",
-            ".test-helpers.",
-        ];
-        if markers.iter().any(|m| lower.contains(m))
-            || lower.starts_with("test-setup.")
-            || lower.starts_with("setup-tests.")
-            || lower.starts_with("setuptests.")
-        {
-            return true;
-        }
-    }
-    false
+    let lower = file_name.to_ascii_lowercase();
+    TEST_SUPPORT_MARKERS.iter().any(|m| lower.contains(m))
+        || TEST_SETUP_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
 fn classification(lanes: &[Option<Visit>; 8]) -> Option<&'static str> {

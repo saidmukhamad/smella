@@ -571,47 +571,93 @@ fn resolve_discovered_path(project: &Project, cfg_dir: &Path, raw: &str) -> Opti
     None
 }
 
+const BUNDLER_TOOLS: &[&str] = &[
+    "vite", "webpack", "tsdown", "tsup", "rollup", "esbuild", "rspack", "rsbuild", "next", "nuxt",
+    "astro", "svelte",
+];
+
+const WEBPACK_ENV_CONFIGS: &[&str] = &["common", "dev", "prod", "base"];
+
+const TOOL_CONFIGS: &[&str] = &[
+    "vite",
+    "vitest",
+    "jest",
+    "webpack",
+    "rollup",
+    "eslint",
+    "next",
+    "tailwind",
+    "postcss",
+    "babel",
+    "prettier",
+    "playwright",
+    "cypress",
+    "tsdown",
+    "tsup",
+    "esbuild",
+    "rspack",
+    "rsbuild",
+    "nuxt",
+    "astro",
+    "svelte",
+    "metro",
+    "uno",
+    "knip",
+    "commitlint",
+    "lint-staged",
+    "stylelint",
+    "drizzle",
+    "prisma",
+    "oxlint",
+    "swc",
+    "turbo",
+];
+
+const RC_CONFIGS: &[&str] = &[
+    ".eslintrc",
+    ".prettierrc",
+    ".babelrc",
+    ".lintstagedrc",
+    ".stylelintrc",
+];
+
+pub fn is_bundler_config_name(name: &str) -> bool {
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if !EXTENSIONS.contains(&ext) {
+        return false;
+    }
+    if let Some(tool) = stem.strip_suffix(".config") {
+        let base = tool.split('.').next().unwrap_or(tool);
+        return BUNDLER_TOOLS.contains(&base);
+    }
+    stem.strip_prefix("webpack.")
+        .is_some_and(|env| WEBPACK_ENV_CONFIGS.contains(&env))
+}
+
+fn is_tool_config_name(name: &str) -> bool {
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if !EXTENSIONS.contains(&ext) {
+        return false;
+    }
+    if is_bundler_config_name(name) || RC_CONFIGS.contains(&stem) {
+        return true;
+    }
+    stem.strip_suffix(".config")
+        .is_some_and(|tool| TOOL_CONFIGS.contains(&tool.split('.').next().unwrap_or(tool)))
+}
+
 fn is_bundler_config_file(path: &str) -> bool {
     if path.contains("/.storybook/") || path.starts_with(".storybook/") {
         return false;
     }
-    let name = Path::new(path)
+    Path::new(path)
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("");
-    let ext_ok = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| EXTENSIONS.contains(&e));
-    if !ext_ok {
-        return false;
-    }
-    ((name.starts_with("vite.") || name.starts_with("webpack.")) && name.contains(".config."))
-        || name.starts_with("tsdown.config.")
-        || name.starts_with("tsup.config.")
-        || name.starts_with("rollup.config.")
-        || name.starts_with("esbuild.config.")
-        || name.starts_with("rspack.config.")
-        || name.starts_with("rsbuild.config.")
-        || matches!(
-            name,
-            "webpack.common.js"
-                | "webpack.common.cjs"
-                | "webpack.common.mjs"
-                | "webpack.common.ts"
-                | "webpack.dev.js"
-                | "webpack.dev.cjs"
-                | "webpack.dev.mjs"
-                | "webpack.dev.ts"
-                | "webpack.prod.js"
-                | "webpack.prod.cjs"
-                | "webpack.prod.mjs"
-                | "webpack.prod.ts"
-                | "webpack.base.js"
-                | "webpack.base.cjs"
-                | "webpack.base.mjs"
-                | "webpack.base.ts"
-        )
+        .is_some_and(is_bundler_config_name)
 }
 
 fn is_build_script_candidate(path: &str) -> bool {
@@ -970,69 +1016,16 @@ pub fn discover_extra_tooling_configs(project: &mut Project) {
         .filter(|r| r.role == Role::Tooling)
         .map(|r| r.file.clone())
         .collect();
-    const CONFIG_STEMS: &[&str] = &[
-        "vite.config.",
-        "vitest.config.",
-        "jest.config.",
-        "webpack.config.",
-        "rollup.config.",
-        "eslint.config.",
-        "next.config.",
-        "tailwind.config.",
-        "postcss.config.",
-        "babel.config.",
-        "prettier.config.",
-        "playwright.config.",
-        "cypress.config.",
-        "tsdown.config.",
-        "tsup.config.",
-        "esbuild.config.",
-        "rspack.config.",
-        "rsbuild.config.",
-        "nuxt.config.",
-        "astro.config.",
-        "svelte.config.",
-        "metro.config.",
-        "uno.config.",
-        "knip.config.",
-        "commitlint.config.",
-        "lint-staged.config.",
-        "stylelint.config.",
-        "drizzle.config.",
-        "prisma.config.",
-        "oxlint.config.",
-        "swc.config.",
-        "turbo.config.",
-        ".eslintrc.",
-        ".prettierrc.",
-        ".babelrc.",
-        ".lintstagedrc.",
-        ".stylelintrc.",
-    ];
     let extra: Vec<String> = project
         .graph
         .paths
         .iter()
         .filter(|p| {
-            if existing.contains(*p) {
-                return false;
-            }
-            let name = Path::new(p)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            let ext_ok = Path::new(p)
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| EXTENSIONS.contains(&e));
-            ext_ok
-                && (CONFIG_STEMS.iter().any(|stem| name.starts_with(stem))
-                    || ((name.starts_with("vite.")
-                        || name.starts_with("vitest.")
-                        || name.starts_with("jest.")
-                        || name.starts_with("webpack."))
-                        && name.contains(".config."))
-                    || is_bundler_config_file(p))
+            !existing.contains(*p)
+                && Path::new(p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(is_tool_config_name)
         })
         .cloned()
         .collect();
