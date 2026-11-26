@@ -16,11 +16,36 @@ export interface DependencyFinding {
   status: 'complete';
   diff?: DiffStatus;
 }
+export interface SuppressionRule {
+  file: string;
+  symbol: string;
+  reason: string;
+}
+export interface SuppressedFinding {
+  workspace: string;
+  file: string;
+  symbol: string;
+  kind: FindingKind;
+  reason: string;
+  source: 'config' | 'jsdoc';
+  location: Location;
+}
+export interface StaleConfigItem {
+  kind: 'stale-entry' | 'stale-include' | 'stale-exclude' | 'stale-suppression' | 'stale-dynamic-import' | 'invalid-suppression';
+  source: string;
+  pattern?: string;
+  file?: string;
+  symbol?: string;
+  location?: Location;
+  message: string;
+}
 export interface Config {
   include?: readonly string[];
   exclude?: readonly string[];
   entries?: Partial<Record<Context, readonly string[]>>;
   publicEntries?: readonly string[];
+  dynamicImports?: Readonly<Record<string, readonly string[]>>;
+  suppressions?: readonly SuppressionRule[];
 }
 export function createConfig<T extends Config>(config: T): T;
 export interface Root { file: string; role: Role; origin: 'explicit' | 'discovered'; input: string }
@@ -60,6 +85,8 @@ export type Subject = string | { file: string; exportName?: string; bindingName?
 export interface Report {
   readonly roots: readonly Root[];
   readonly workspaces: readonly WorkspaceInfo[];
+  readonly suppressed: readonly SuppressedFinding[];
+  readonly staleConfig: readonly StaleConfigItem[];
   readonly coverage: Coverage;
   readonly diff?: DiffSummary;
   dependencies(filter?: { kind?: DependencyFindingKind; diff?: DiffStatus; workspace?: string | readonly string[] }): DependencyFinding[];

@@ -492,6 +492,8 @@ export async function analyze({ root = process.cwd(), base, dependencies = false
   return Object.freeze({
     get roots() { live(); return metadata.roots; },
     get workspaces() { live(); return metadata.workspaces; },
+    get suppressed() { live(); return metadata.suppressed; },
+    get staleConfig() { live(); return metadata.staleConfig; },
     get coverage() { live(); return metadata.coverage; },
     get diff() { live(); return diffContext?.summary; },
     dependencies(filter = {}) {

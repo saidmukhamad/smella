@@ -1228,3 +1228,59 @@ test('dependency analysis detects unused, unlisted, unlisted-binary and dev-depe
   // Root typescript devDependency was consumed by child workspace's `tsc --noEmit` script.
   assert.deepEqual(r.dependencies({ workspace: '.' }), []);
 });
+
+test('per-symbol suppressions require a reason and stale configuration entries are reported', async t => {
+  const root = await fixture(t, {
+    'app.ts': 'import { live } from "./lib"; live();',
+    'lib.ts': [
+      '/** @smella-ignore loaded dynamically by host plugin registry */',
+      'export function hostHook() {}',
+      '/** @smella-ignore */',
+      'export function missingReason() {}',
+      '/** @smella-ignore stale note on live export */',
+      'export function live() {}',
+      'export function configIgnored() {}',
+      'export function genuinelyDead() {}',
+    ].join('\n'),
+  });
+
+  // File-level / glob / empty-reason config suppressions are rejected.
+  await assert.rejects(
+    analyze({ root, ...app, suppressions: [{ file: 'lib.ts', symbol: '*', reason: 'nope' }] }),
+    { code: 'ANALYSIS_FAILED' },
+  );
+  await assert.rejects(
+    analyze({ root, ...app, suppressions: [{ file: 'lib.ts', symbol: 'configIgnored', reason: '   ' }] }),
+    { code: 'ANALYSIS_FAILED' },
+  );
+
+  const r = await inspect(t, root, {
+    entries: { runtime: ['app.ts', 'missing-entry.ts'], test: [], tooling: [] },
+    publicEntries: [],
+    exclude: ['does-not-exist/**'],
+    suppressions: [
+      { file: 'lib.ts', symbol: 'configIgnored', reason: 'invoked by external scheduler' },
+      { file: 'lib.ts', symbol: 'nonExistent', reason: 'old hook removed' },
+    ],
+  });
+
+  assert.deepEqual(
+    r.findings().map(f => f.exportName),
+    ['genuinelyDead', 'missingReason'],
+  );
+  assert.deepEqual(
+    r.suppressed.map(s => `${s.source}:${s.symbol}:${s.reason}`).sort(),
+    [
+      'config:configIgnored:invoked by external scheduler',
+      'jsdoc:hostHook:loaded dynamically by host plugin registry',
+    ],
+  );
+  const staleKinds = r.staleConfig.map(s => `${s.kind}:${s.symbol ?? s.pattern ?? ''}`).sort();
+  assert.deepEqual(staleKinds, [
+    'invalid-suppression:',
+    'stale-entry:missing-entry.ts',
+    'stale-exclude:does-not-exist/**',
+    'stale-suppression:live',
+    'stale-suppression:nonExistent',
+  ]);
+});

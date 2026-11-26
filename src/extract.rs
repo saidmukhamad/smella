@@ -21,7 +21,15 @@ use oxc_syntax::symbol::SymbolId;
 
 use crate::deps::{PackageRef, extract_dep_package};
 use crate::graph::{Edge, Export, Gap, Graph, Id, Link, Loc, Module, Node, PendingGap};
-use crate::project::Project;
+use crate::project::{Project, StaleConfigItem};
+
+#[derive(Clone, Debug)]
+pub struct InlineSuppression {
+    pub file: Id,
+    pub symbol: String,
+    pub reason: String,
+    pub loc: Loc,
+}
 
 #[derive(Clone, Copy)]
 struct Owner {
@@ -48,6 +56,9 @@ pub struct FileSummary {
     links: Vec<Link>,
     gaps: Vec<PendingGap>,
     pub package_refs: Vec<PackageRef>,
+    pub inline_suppressions: Vec<InlineSuppression>,
+    pub invalid_suppressions: Vec<StaleConfigItem>,
+    pub used_dynamic_imports: bool,
     pub parsed: bool,
 }
 
@@ -726,6 +737,163 @@ fn extract_spawn_exec_paths(
         .unwrap_or_default()
 }
 
+fn collect_decl_names(decl: &oxc_ast::ast::Declaration<'_>, out: &mut Vec<String>) {
+    use oxc_ast::ast::Declaration;
+    match decl {
+        Declaration::VariableDeclaration(v) => {
+            for d in &v.declarations {
+                collect_pattern_names(&d.id.kind, out);
+            }
+        }
+        Declaration::FunctionDeclaration(f) => {
+            if let Some(id) = &f.id {
+                out.push(id.name.to_string());
+            }
+        }
+        Declaration::ClassDeclaration(c) => {
+            if let Some(id) = &c.id {
+                out.push(id.name.to_string());
+            }
+        }
+        Declaration::TSTypeAliasDeclaration(t) => out.push(t.id.name.to_string()),
+        Declaration::TSInterfaceDeclaration(i) => out.push(i.id.name.to_string()),
+        Declaration::TSEnumDeclaration(e) => out.push(e.id.name.to_string()),
+        Declaration::TSModuleDeclaration(m) => {
+            if let oxc_ast::ast::TSModuleDeclarationName::Identifier(id) = &m.id {
+                out.push(id.name.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_pattern_names(kind: &BindingPatternKind<'_>, out: &mut Vec<String>) {
+    match kind {
+        BindingPatternKind::BindingIdentifier(id) => out.push(id.name.to_string()),
+        BindingPatternKind::ObjectPattern(obj) => {
+            for p in &obj.properties {
+                collect_pattern_names(&p.value.kind, out);
+            }
+            if let Some(rest) = &obj.rest {
+                collect_pattern_names(&rest.argument.kind, out);
+            }
+        }
+        BindingPatternKind::ArrayPattern(arr) => {
+            for el in arr.elements.iter().flatten() {
+                collect_pattern_names(&el.kind, out);
+            }
+            if let Some(rest) = &arr.rest {
+                collect_pattern_names(&rest.argument.kind, out);
+            }
+        }
+        BindingPatternKind::AssignmentPattern(a) => collect_pattern_names(&a.left.kind, out),
+    }
+}
+
+fn statement_symbol_names(stmt: &oxc_ast::ast::Statement<'_>) -> Vec<String> {
+    use oxc_ast::ast::Statement;
+    let mut names = Vec::new();
+    match stmt {
+        Statement::ExportDefaultDeclaration(_) => names.push("default".into()),
+        Statement::ExportNamedDeclaration(exp) => {
+            if let Some(decl) = &exp.declaration {
+                collect_decl_names(decl, &mut names);
+            }
+            for spec in &exp.specifiers {
+                names.push(spec.exported.name().to_string());
+            }
+        }
+        other => {
+            if let Some(decl) = other.as_declaration() {
+                collect_decl_names(decl, &mut names);
+            }
+        }
+    }
+    names
+}
+
+fn extract_inline_suppressions(
+    source: &str,
+    program: &oxc_ast::ast::Program<'_>,
+    out: &mut FileSummary,
+) {
+    if !source.contains("@smella-ignore") {
+        return;
+    }
+    for comment in &program.comments {
+        let start = comment.span.start as usize;
+        let end = comment.span.end as usize;
+        let Some(text) = source.get(start..end) else {
+            continue;
+        };
+        let Some(tag_pos) = text.find("@smella-ignore") else {
+            continue;
+        };
+        let after = &text[tag_pos + "@smella-ignore".len()..];
+        let raw_line = after.lines().next().unwrap_or("");
+        let reason = raw_line
+            .trim_end_matches("*/")
+            .trim()
+            .trim_start_matches(':')
+            .trim();
+        let loc: Loc = comment.span.into();
+        if reason.is_empty() {
+            out.invalid_suppressions.push(StaleConfigItem {
+                kind: "invalid-suppression",
+                source: out.path.clone(),
+                pattern: None,
+                file: Some(out.path.clone()),
+                symbol: None,
+                location: Some(loc),
+                message: "@smella-ignore requires a non-empty reason.".into(),
+            });
+            continue;
+        }
+        // Attach only to a top-level declaration immediately following this comment (no code in between).
+        let target_stmt = program
+            .body
+            .iter()
+            .find(|stmt| stmt.span().start >= comment.span.end);
+        let attached_names = target_stmt
+            .filter(|stmt| {
+                let gap_start = end;
+                let gap_end = stmt.span().start as usize;
+                let between = source.get(gap_start..gap_end).unwrap_or("");
+                // Allow whitespace and additional comment lines between JSDoc and declaration.
+                between.lines().all(|l| {
+                    let t = l.trim();
+                    t.is_empty()
+                        || t.starts_with("//")
+                        || t.starts_with("/*")
+                        || t.starts_with('*')
+                        || t.starts_with('@')
+                })
+            })
+            .map(statement_symbol_names)
+            .unwrap_or_default();
+        if attached_names.is_empty() {
+            out.invalid_suppressions.push(StaleConfigItem {
+                kind: "invalid-suppression",
+                source: out.path.clone(),
+                pattern: None,
+                file: Some(out.path.clone()),
+                symbol: None,
+                location: Some(loc),
+                message: "@smella-ignore must precede a specific export or binding declaration (file-level ignores are not supported).".into(),
+            });
+            continue;
+        }
+        for symbol in attached_names {
+            out.inline_suppressions.push(InlineSuppression {
+                file: out.file,
+                symbol,
+                reason: reason.to_owned(),
+                loc,
+            });
+        }
+    }
+}
+
 fn leftmost_type_name<'a>(name: &'a TSTypeName<'a>) -> Option<&'a str> {
     match name {
         TSTypeName::IdentifierReference(id) => Some(id.name.as_str()),
@@ -1100,6 +1268,9 @@ pub fn summarize(
         links: vec![],
         gaps: vec![],
         package_refs: vec![],
+        inline_suppressions: vec![],
+        invalid_suppressions: vec![],
+        used_dynamic_imports: false,
         parsed: false,
     };
     summary.parsed = extract(project, &mut summary, arena, entry_file);
@@ -1150,6 +1321,7 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
     if parsed.panicked {
         return false;
     }
+    extract_inline_suppressions(&source, &parsed.program, out);
     let sem = built.semantic;
     let nodes = sem.nodes();
     let scoping = sem.scoping();
@@ -1848,6 +2020,7 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                             } else if let Some(configured) =
                                 project.dynamic_imports.get(&project.graph.paths[file])
                             {
+                                out.used_dynamic_imports = true;
                                 for s in configured {
                                     specs.push((s.clone(), call.span));
                                 }
@@ -2170,7 +2343,11 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                     None
                 };
                 let configured_specs = if static_spec.is_none() && glob_targets.is_none() {
-                    project.dynamic_imports.get(&project.graph.paths[file])
+                    let cfg = project.dynamic_imports.get(&project.graph.paths[file]);
+                    if cfg.is_some() {
+                        out.used_dynamic_imports = true;
+                    }
+                    cfg
                 } else {
                     None
                 };
