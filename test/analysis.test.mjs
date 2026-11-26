@@ -1393,3 +1393,150 @@ test('package scripts discover tooling entries and CLI --check gates findings cl
   assert.equal(failed.code, 1);
   assert.ok(failed.stdout.includes('orphan'));
 });
+
+test('git-ignored build outputs are skipped while workspace source mapping still resolves them', async t => {
+  const root = await fixture(t, {
+    '.gitignore': 'packages/*/lib/\n*.generated.ts\n',
+    'package.json': JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
+    'packages/core/package.json': JSON.stringify({ name: '@mono/core', main: './lib/index.js', types: './lib/index.d.ts' }),
+    'packages/core/tsconfig.json': JSON.stringify({ compilerOptions: { rootDir: 'src', outDir: 'lib' } }),
+    'packages/core/src/index.ts': 'export function greet() { return "hi"; }',
+    'packages/core/lib/index.js': 'exports.greet = () => "hi"; exports.compiledNoise = () => 0;',
+    'packages/core/lib/index.d.ts': 'export declare function greet(): string;',
+    'packages/app/package.json': JSON.stringify({ name: '@mono/app', bin: { app: './src/main.ts' }, dependencies: { '@mono/core': '*' } }),
+    'packages/app/src/main.ts': 'import { greet } from "@mono/core"; console.log(greet());',
+    'packages/app/src/schema.generated.ts': 'export const generatedUnused = 1;',
+  });
+  const r = await inspect(t, root);
+  assert.equal(r.coverage.status, 'complete');
+  assert.ok(!r.coverage.files.some(f => f.includes('/lib/') || f.endsWith('.generated.ts')));
+  assert.deepEqual(subject(r, 'packages/core/src/index.ts', 'greet').usage.value, ['runtime']);
+  assert.deepEqual(r.findings(), []);
+});
+
+test('declaration namespace import aliases, export assignments, and global or helper React.lazy resolve without global gaps', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ name: 'dts-lazy-demo', type: 'module', bin: { app: './src/app.tsx' } }),
+    'src/types.d.ts': [
+      'declare namespace InternalUI {',
+      '  export interface ModalProps { open: boolean; }',
+      '}',
+      'import ModalProps = InternalUI.ModalProps;',
+      'declare class Modal { props: ModalProps; }',
+      'export = Modal;',
+    ].join('\n'),
+    'src/ambient.d.ts': 'declare module "virtual:widget" { export const ready: boolean; }',
+    'src/panel.tsx': 'export function SettingsPanel() { return null; }',
+    'src/modal.tsx': 'export default function ModalView() { return null; }',
+    'src/app.tsx': [
+      'import type Modal from "./types";',
+      'const loadPanel = () => import("./panel").then(m => ({ default: m.SettingsPanel })).catch(() => ({ default: () => null }));',
+      'const LazyPanel = React.lazy(loadPanel);',
+      'const LazyModal = React.lazy(() => import("./modal"));',
+      'export function App(m: Modal) { return [m, <LazyPanel />, <LazyModal />]; }',
+      'App({} as Modal);',
+    ].join('\n'),
+  });
+  const r = await inspect(t, root);
+  assert.equal(r.coverage.status, 'complete');
+  assert.equal(r.coverage.gaps.length, 0);
+  assert.deepEqual(subject(r, 'src/panel.tsx', 'SettingsPanel').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'src/modal.tsx', 'default').usage.value, ['runtime']);
+  assert.deepEqual(r.findings(), []);
+});
+
+test('bundled workspaces allow runtime imports from devDependencies while non-bundled packages still flag them', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ name: 'bundle-deps', private: true, workspaces: ['packages/*'] }),
+    'node_modules/ui-kit/package.json': JSON.stringify({ name: 'ui-kit', main: 'index.js' }),
+    'node_modules/ui-kit/index.js': 'exports.Button = () => null;',
+    'node_modules/vite/package.json': JSON.stringify({ name: 'vite', bin: { vite: 'bin.js' } }),
+    'packages/web/package.json': JSON.stringify({
+      name: '@demo/web',
+      private: true,
+      scripts: { build: 'vite build' },
+      devDependencies: { 'ui-kit': '^1.0.0', vite: '^5.0.0' },
+    }),
+    'packages/web/vite.config.ts': 'export default { build: { rollupOptions: { input: "./src/main.tsx" } } };',
+    'packages/web/src/main.tsx': 'import { Button } from "ui-kit"; console.log(Button);',
+    'packages/server/package.json': JSON.stringify({
+      name: '@demo/server',
+      bin: { srv: './src/index.ts' },
+      devDependencies: { 'ui-kit': '^1.0.0' },
+    }),
+    'packages/server/src/index.ts': 'import { Button } from "ui-kit"; console.log(Button);',
+  });
+  const r = await inspect(t, root, { dependencies: true });
+  const devRuntime = r.dependencies({ kind: 'dev-dependency-in-runtime' });
+  assert.deepEqual(
+    devRuntime.map(d => [d.workspace, d.dependency]),
+    [['packages/server', 'ui-kit']],
+  );
+});
+
+test('path strings, tool configs, build script entries, Vite/Jest config paths, and public static files are reached cleanly', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({
+      name: 'refs-demo',
+      private: true,
+      type: 'module',
+      bin: { app: './src/app.ts' },
+      scripts: { 'build:tool': 'node scripts/build-cli.cjs' },
+    }),
+    'src/app.ts': [
+      'import path from "node:path";',
+      'const preload = path.resolve(__dirname, "./preload.cjs");',
+      'const helperPath = require.resolve("./resolved-helper.cjs");',
+      'console.log(preload, helperPath);',
+    ].join('\n'),
+    'src/preload.cjs': 'console.log("preload");',
+    'src/resolved-helper.cjs': 'exports.run = () => 1;',
+    'src/mocks/disabled.ts': 'export const enabled = false;',
+    'src/mocks/style-mock.js': 'module.exports = {};',
+    'src/cli-tool.cjs': 'console.log("cli tool");',
+    'src/webpack-entry.ts': 'console.log("webpack entry");',
+    'public/mockServiceWorker.js': 'self.addEventListener("fetch", () => {});',
+    'scripts/build-cli.cjs': 'const entry = "src/cli-tool.cjs"; build({ entryPoints: [entry] });',
+    'vite.config.ts': [
+      'import path from "node:path";',
+      'export default {',
+      '  plugins: [{ name: "stub", resolveId() { return path.resolve(__dirname, "src/mocks/disabled.ts"); } }],',
+      '};',
+    ].join('\n'),
+    'webpack.common.js': 'const path = require("node:path"); module.exports = { entry: path.resolve(__dirname, "src/webpack-entry.ts") };',
+    'jest.config.js': 'module.exports = { testEnvironment: "node", moduleNameMapper: { "\\\\.css$": "<rootDir>/src/mocks/style-mock.js" } };',
+    'next.config.mjs': 'export default { reactStrictMode: true };',
+    'tailwind.config.js': 'module.exports = { content: ["./src/**/*.tsx"] };',
+  });
+  const r = await inspect(t, root);
+  assert.deepEqual(subject(r, 'src/preload.cjs').usage.evaluation, ['runtime']);
+  assert.deepEqual(subject(r, 'src/resolved-helper.cjs', 'run').usage.value, ['runtime']);
+  assert.ok(subject(r, 'src/mocks/disabled.ts', 'enabled').usage.value.includes('runtime'));
+  assert.ok(subject(r, 'src/cli-tool.cjs').usage.evaluation.includes('runtime'));
+  assert.ok(subject(r, 'src/webpack-entry.ts').usage.evaluation.includes('runtime'));
+  assert.deepEqual(subject(r, 'public/mockServiceWorker.js').usage.evaluation, ['runtime']);
+  assert.deepEqual(r.findings(), []);
+});
+
+test('test support files do not report test-only exports or bindings while still reporting dead exports', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ name: 'test-support-demo', type: 'module', bin: { app: './src/app.ts' } }),
+    'src/app.ts': 'export function prod() { return 1; } prod();',
+    'src/service.ts': 'export function prodResetForTests() { return 0; }',
+    'browser-tests/support/paths.ts': 'function internalBase() { return "/"; } export const APP_ROOT = internalBase(); export const deadSupport = 1;',
+    '__tests__/support/helper.ts': 'export function makeEnv() { return {}; }',
+    '__tests__/app.test.ts': 'import { prodResetForTests } from "../src/service"; import { APP_ROOT } from "../browser-tests/support/paths"; import { makeEnv } from "./support/helper"; console.log(prodResetForTests(), APP_ROOT, makeEnv());',
+  });
+  const r = await inspect(t, root);
+  assert.equal(subject(r, 'src/service.ts', 'prodResetForTests').kind, 'test-only-export');
+  assert.equal(subject(r, 'browser-tests/support/paths.ts', 'APP_ROOT').kind, null);
+  assert.equal(subject(r, 'browser-tests/support/paths.ts', 'deadSupport').kind, 'unused-export');
+  assert.equal(subject(r, '__tests__/support/helper.ts', 'makeEnv').kind, null);
+  assert.deepEqual(
+    r.findings().map(f => [f.kind, f.file, f.exportName]),
+    [
+      ['unused-export', 'browser-tests/support/paths.ts', 'deadSupport'],
+      ['test-only-export', 'src/service.ts', 'prodResetForTests'],
+    ],
+  );
+});
