@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { analyze } from '../index.js';
 
@@ -10,16 +12,39 @@ Options:
                         <role>:<path1>,<path2>  where role is runtime|test|tooling|public
                         <path>                  shorthand for runtime:<path>
                         <role>:                 empty list disables discovery for that role
+  --workspace <dir>   Filter findings to one or more workspaces by directory or
+                      package name (repeatable or comma-separated)
   --base <ref>        Git ref to diff against (only findings in changed files,
                       marked "introduced" or "pre-existing")
-  --diff <status>     Filter diff findings: introduced | pre-existing (requires --base)
+  --diff [ref|status] Without --base: diff working tree against merge-base of [ref]
+                      (or judge a clean merge commit against both parents), exiting 1
+                      if any finding is introduced.
+                      With --base: filter diff status ("introduced" | "pre-existing").
+  --staged            Diff staged git index against HEAD (or HEAD + MERGE_HEAD),
+                      exiting 1 if any finding is introduced
+  --all               Report all findings without failing (always exits 0)
+  --dependencies      Include dependency findings (unused-dependency,
+                      unlisted-dependency, unlisted-binary, dev-dependency-in-runtime)
   --kind <kind>       Filter finding kind (repeatable or comma-separated):
                         unused-export, test-only-export, test-only-binding,
-                        tooling-only-export, unreferenced-module
+                        tooling-only-export, unreferenced-module,
+                        unused-dependency, unlisted-dependency,
+                        unlisted-binary, dev-dependency-in-runtime
+  --format <fmt>      Output format: ndjson | human (default: human for --staged/--diff/--all,
+                      ndjson otherwise)
+  --json              Shorthand for --format ndjson
+  --human             Shorthand for --format human
   --include-gap-ids   Include full gapIds array on each NDJSON line (omitted by default)
-  --summary           Print summary counts to stderr
+  --summary           Print summary counts to stderr (NDJSON mode)
   -h, --help          Show this help message
 `;
+
+const DEP_KINDS = new Set([
+  'unused-dependency',
+  'unlisted-dependency',
+  'unlisted-binary',
+  'dev-dependency-in-runtime',
+]);
 
 const VALID_KINDS = new Set([
   'unused-export',
@@ -27,9 +52,11 @@ const VALID_KINDS = new Set([
   'test-only-binding',
   'tooling-only-export',
   'unreferenced-module',
+  ...DEP_KINDS,
 ]);
 
 const VALID_DIFF = new Set(['introduced', 'pre-existing']);
+const VALID_FORMATS = new Set(['ndjson', 'human']);
 
 function parseEntrySpecs(specs) {
   if (!specs || specs.length === 0) return {};
@@ -59,16 +86,146 @@ function parseEntrySpecs(specs) {
   return result;
 }
 
+// Allow `--diff` to take an optional ref argument (e.g. `--diff` or `--diff origin/main`)
+// while remaining backward-compatible with `--base <ref> --diff introduced`.
+function preprocessArgv(argv) {
+  const hasBase = argv.some(a => a === '--base' || a.startsWith('--base='));
+  const out = [];
+  let diffMode = false;
+  let diffRef = '';
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (!hasBase && arg === '--diff') {
+      diffMode = true;
+      const next = argv[i + 1];
+      if (next && !next.startsWith('-')) {
+        diffRef = next;
+        i++;
+      }
+      continue;
+    }
+    if (!hasBase && arg.startsWith('--diff=')) {
+      diffMode = true;
+      diffRef = arg.slice('--diff='.length);
+      continue;
+    }
+    out.push(arg);
+  }
+  return { args: out, diffMode, diffRef };
+}
+
+function lineNumberCache(rootDir) {
+  const cache = new Map();
+  return (relFile, byteOffset) => {
+    if (byteOffset === undefined || byteOffset === null) return null;
+    let offsets = cache.get(relFile);
+    if (offsets === undefined) {
+      try {
+        const buf = readFileSync(join(rootDir, relFile));
+        offsets = [0];
+        for (let i = 0; i < buf.length; i++) {
+          if (buf[i] === 0x0a) offsets.push(i + 1);
+        }
+      } catch {
+        offsets = null;
+      }
+      cache.set(relFile, offsets);
+    }
+    if (!offsets) return null;
+    let lo = 0;
+    let hi = offsets.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (offsets[mid] <= byteOffset) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return hi + 1;
+  };
+}
+
+function formatWitnessPath(report, finding) {
+  if (finding.kind !== 'test-only-export' && finding.kind !== 'test-only-binding') return '';
+  try {
+    const exp = report.explain(finding.id);
+    const witness = exp.witnesses.find(w => w.role === 'test') ?? exp.witnesses[0];
+    if (witness?.path?.length) {
+      const files = [];
+      for (const step of witness.path) {
+        if (files[files.length - 1] !== step.file) files.push(step.file);
+      }
+      return ` via ${files.join(' -> ')}`;
+    }
+  } catch {}
+  return '';
+}
+
+function renderHuman(report, findings, rootDir, hookMode) {
+  const lineOf = lineNumberCache(rootDir);
+  const byWorkspace = new Map();
+  for (const f of findings) {
+    const ws = f.workspace || '.';
+    if (!byWorkspace.has(ws)) byWorkspace.set(ws, []);
+    byWorkspace.get(ws).push(f);
+  }
+  const lines = [];
+  for (const [ws, list] of [...byWorkspace.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    lines.push(`[${ws}] (${list.length})`);
+    for (const f of list) {
+      const diffTag = f.diff ? `[${f.diff}] ` : '';
+      const line = f.location ? lineOf(f.file, f.location.start) : null;
+      const locStr = line ? `${f.file}:${line}` : f.file;
+      if (DEP_KINDS.has(f.kind)) {
+        const target = f.dependency ?? f.binary ?? '';
+        const extra = f.script
+          ? ` (script ${f.script} in ${f.manifest})`
+          : f.file !== f.manifest
+            ? ` (manifest ${f.manifest})`
+            : '';
+        lines.push(`  ${diffTag}${f.kind}  ${target}  ${locStr}${extra}`);
+      } else {
+        const sym = f.exportName ?? f.bindingName ?? '<module>';
+        const statusNote = f.status === 'conditional' && f.primaryGaps?.length
+          ? ` [conditional: ${f.primaryGaps[0].code} - ${f.primaryGaps[0].message}]`
+          : '';
+        const witness = formatWitnessPath(report, f);
+        lines.push(`  ${diffTag}${f.kind}  ${locStr}  ${sym}${witness}${statusNote}`);
+      }
+    }
+  }
+  if (report.staleConfig.length > 0) {
+    lines.push(`[stale-config] (${report.staleConfig.length})`);
+    for (const item of report.staleConfig) {
+      lines.push(`  ${item.kind}  ${item.source}  ${item.message}`);
+    }
+  }
+  const introduced = findings.filter(f => f.diff === 'introduced').length;
+  const conditional = findings.filter(f => f.status === 'conditional').length;
+  const header = hookMode && report.diff
+    ? `smella: ${introduced} introduced (${findings.length} in diff against ${report.diff.base}, ${conditional} conditional, ${report.staleConfig.length} stale config)`
+    : `smella: ${findings.length} findings (${conditional} conditional, ${report.coverage.gaps.length} gaps, ${report.staleConfig.length} stale config)`;
+  lines.push(header);
+  return `${lines.join('\n')}\n`;
+}
+
 async function main() {
+  const { args, diffMode, diffRef } = preprocessArgv(process.argv.slice(2));
   let values;
   try {
     ({ values } = parseArgs({
+      args,
       options: {
         root: { type: 'string' },
         entries: { type: 'string', multiple: true },
+        workspace: { type: 'string', multiple: true },
         base: { type: 'string' },
         diff: { type: 'string' },
+        staged: { type: 'boolean', default: false },
+        all: { type: 'boolean', default: false },
         kind: { type: 'string', multiple: true },
+        dependencies: { type: 'boolean', default: false },
+        format: { type: 'string' },
+        json: { type: 'boolean', default: false },
+        human: { type: 'boolean', default: false },
         'include-gap-ids': { type: 'boolean', default: false },
         summary: { type: 'boolean', default: false },
         help: { type: 'boolean', short: 'h', default: false },
@@ -111,10 +268,31 @@ async function main() {
     }
   }
 
+  if (values.format && !VALID_FORMATS.has(values.format)) {
+    process.stderr.write(`smella: invalid --format ${JSON.stringify(values.format)}\n`);
+    process.exitCode = 2;
+    return;
+  }
+
+  const hookMode = Boolean(values.staged) || diffMode;
+  const format = values.format ?? (values.json ? 'ndjson' : values.human ? 'human' : (hookMode || values.all) ? 'human' : 'ndjson');
+
+  const workspaces = [];
+  for (const raw of values.workspace ?? []) {
+    for (const part of raw.split(',').map(s => s.trim()).filter(Boolean)) {
+      workspaces.push(part);
+    }
+  }
+
+  const includeDeps = Boolean(values.dependencies) || [...kinds].some(k => DEP_KINDS.has(k));
   const entryOpts = parseEntrySpecs(values.entries);
+  const rootDir = resolve(values.root ?? process.cwd());
   const options = {
     ...(values.root ? { root: values.root } : {}),
     ...(values.base ? { base: values.base } : {}),
+    ...(values.staged ? { staged: true } : {}),
+    ...(diffMode ? { mergeBase: diffRef || true } : {}),
+    ...(includeDeps ? { dependencies: true } : {}),
     ...entryOpts,
   };
 
@@ -122,42 +300,59 @@ async function main() {
   try {
     report = await analyze(options);
     const kindFilter = kinds.size === 1 ? [...kinds][0] : undefined;
-    let findings = report.findings({ kind: kindFilter, diff: values.diff });
+    const diffFilter = hookMode ? 'introduced' : values.diff;
+    let findings = report.findings({
+      kind: kindFilter,
+      diff: diffFilter,
+      ...(workspaces.length > 0 ? { workspace: workspaces } : {}),
+    });
     if (kinds.size > 1) {
       findings = findings.filter(f => kinds.has(f.kind));
     }
 
-    const includeGapIds = Boolean(values['include-gap-ids']);
-    // Stream newline-delimited JSON one finding per line to avoid V8 max string limits on large repos.
-    for (const f of findings) {
-      const record = {
-        id: f.id,
-        kind: f.kind,
-        ...(f.diff !== undefined ? { diff: f.diff } : {}),
-        file: f.file,
-        exportName: f.exportName,
-        ...(f.bindingName !== undefined ? { bindingName: f.bindingName } : {}),
-        location: f.location,
-        usage: f.usage,
-        status: f.status,
-        gapCount: f.gapIds.length,
-        primaryGaps: f.primaryGaps,
-        ...(includeGapIds ? { gapIds: f.gapIds } : {}),
-      };
-      if (!process.stdout.write(`${JSON.stringify(record)}\n`)) {
-        await new Promise(resolve => process.stdout.once('drain', resolve));
+    if (format === 'human') {
+      process.stdout.write(renderHuman(report, findings, rootDir, hookMode));
+    } else {
+      const includeGapIds = Boolean(values['include-gap-ids']);
+      // Stream newline-delimited JSON one finding per line to avoid V8 max string limits on large repos.
+      for (const f of findings) {
+        const record = DEP_KINDS.has(f.kind)
+          ? f
+          : {
+              id: f.id,
+              kind: f.kind,
+              ...(f.diff !== undefined ? { diff: f.diff } : {}),
+              workspace: f.workspace,
+              file: f.file,
+              exportName: f.exportName,
+              ...(f.bindingName !== undefined ? { bindingName: f.bindingName } : {}),
+              location: f.location,
+              usage: f.usage,
+              status: f.status,
+              gapCount: f.gapIds.length,
+              primaryGaps: f.primaryGaps,
+              ...(includeGapIds ? { gapIds: f.gapIds } : {}),
+            };
+        if (!process.stdout.write(`${JSON.stringify(record)}\n`)) {
+          await new Promise(resolveDrain => process.stdout.once('drain', resolveDrain));
+        }
+      }
+
+      if (values.summary) {
+        const conditional = findings.filter(f => f.status === 'conditional').length;
+        const info = {
+          findings: findings.length,
+          conditional,
+          gaps: report.coverage.gaps.length,
+          staleConfig: report.staleConfig.length,
+          ...(report.diff ? { diff: report.diff } : {}),
+        };
+        process.stderr.write(`${JSON.stringify(info)}\n`);
       }
     }
 
-    if (values.summary) {
-      const conditional = findings.filter(f => f.status === 'conditional').length;
-      const info = {
-        findings: findings.length,
-        conditional,
-        gaps: report.coverage.gaps.length,
-        ...(report.diff ? { diff: report.diff } : {}),
-      };
-      process.stderr.write(`${JSON.stringify(info)}\n`);
+    if (hookMode && !values.all && findings.some(f => f.diff === 'introduced')) {
+      process.exitCode = 1;
     }
   } catch (err) {
     process.stderr.write(`smella: ${err.message}\n`);

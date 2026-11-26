@@ -10,6 +10,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use walkdir::WalkDir;
 
+use crate::deps::{
+    WorkspaceManifest, manifest_bins, manifest_dep_set, manifest_path_for, manifest_scripts,
+};
 use crate::graph::{Graph, Id, ROLES, Role, Root, RootEntryMode};
 use crate::source_map::{
     SourceMapper, is_non_code_export, normalize_rel, resolve_exports_targets, to_slash,
@@ -45,6 +48,30 @@ impl Entries {
     }
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SuppressionRule {
+    pub file: String,
+    pub symbol: String,
+    pub reason: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaleConfigItem {
+    pub kind: &'static str,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<crate::graph::Loc>,
+    pub message: String,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
@@ -53,6 +80,7 @@ pub struct Config {
     pub include: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
     pub dynamic_imports: Option<BTreeMap<String, Vec<String>>>,
+    pub suppressions: Option<Vec<SuppressionRule>>,
 }
 
 pub(crate) fn matcher(pattern: &str) -> Result<GlobMatcher, String> {
@@ -89,6 +117,13 @@ enum WorkspacePackage {
     Ambiguous,
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceInfo {
+    pub dir: String,
+    pub name: Option<String>,
+}
+
 pub struct Project {
     pub root: PathBuf,
     pub roots: Vec<Root>,
@@ -99,9 +134,13 @@ pub struct Project {
     workspaces: BTreeMap<String, WorkspacePackage>,
     pub workspace_for_file: Vec<usize>,
     workspace_dirs: Vec<PathBuf>,
+    pub workspace_infos: Vec<WorkspaceInfo>,
+    pub manifests: Vec<WorkspaceManifest>,
     pub react_entry: Option<Id>,
     pub source_mapper: SourceMapper,
     pub dynamic_imports: BTreeMap<String, Vec<String>>,
+    pub suppressions: Vec<SuppressionRule>,
+    pub stale_config: Vec<StaleConfigItem>,
 }
 
 impl Project {
@@ -118,18 +157,43 @@ impl Project {
         } else {
             Config::default()
         };
-        let include = input
-            .include
-            .or(defaults.include)
-            .map(|v| matchers(&v))
-            .transpose()?;
-        let exclude = matchers(&input.exclude.or(defaults.exclude).unwrap_or_default())?;
+        let include_raw = input.include.or(defaults.include);
+        let include = include_raw.as_deref().map(matchers).transpose()?;
+        let exclude_raw = input.exclude.or(defaults.exclude).unwrap_or_default();
+        let exclude = matchers(&exclude_raw)?;
+        let mut include_matched = vec![false; include_raw.as_ref().map_or(0, Vec::len)];
+        let mut exclude_matched = vec![false; exclude_raw.len()];
         let entries = input.entries.merge(defaults.entries);
         let public = input.public_entries.or(defaults.public_entries);
         let dynamic_imports = input
             .dynamic_imports
             .or(defaults.dynamic_imports)
             .unwrap_or_default();
+        let suppressions = input
+            .suppressions
+            .or(defaults.suppressions)
+            .unwrap_or_default();
+        for rule in &suppressions {
+            let file = rule.file.trim();
+            let symbol = rule.symbol.trim();
+            let reason = rule.reason.trim();
+            if file.is_empty() || file.contains(['*', '?', '[', '{']) || file.ends_with('/') {
+                return Err(format!(
+                    "Invalid suppression for {:?}: file must be a literal relative file path, not a glob or directory.",
+                    rule.file
+                ));
+            }
+            if symbol.is_empty() || symbol == "*" {
+                return Err(format!(
+                    "Invalid suppression for {file:?}: symbol is required (file-level ignores are not supported)."
+                ));
+            }
+            if reason.is_empty() {
+                return Err(format!(
+                    "Invalid suppression for {file:?}#{symbol}: a non-empty reason is required."
+                ));
+            }
+        }
         let mut paths = vec![];
         let mut excluded = vec![];
         let nx_enabled = root
@@ -152,9 +216,16 @@ impl Project {
                 .replace('\\', "/");
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().is_dir() {
-                if entry.depth() > 0
-                    && (SKIP.contains(&name.as_ref()) || exclude.iter().any(|p| p.is_match(&file)))
-                {
+                let mut excluded_by_rule = false;
+                if entry.depth() > 0 {
+                    for (idx, p) in exclude.iter().enumerate() {
+                        if p.is_match(&file) {
+                            exclude_matched[idx] = true;
+                            excluded_by_rule = true;
+                        }
+                    }
+                }
+                if entry.depth() > 0 && (SKIP.contains(&name.as_ref()) || excluded_by_rule) {
                     excluded.push(format!("{file}/"));
                     walker.skip_current_dir();
                 }
@@ -202,11 +273,23 @@ impl Project {
             ) {
                 continue;
             }
-            if include
-                .as_ref()
-                .is_none_or(|v| v.iter().any(|p| p.is_match(&file)))
-                && !exclude.iter().any(|p| p.is_match(&file))
-            {
+            let mut inc_ok = include.is_none();
+            if let Some(inc) = include.as_ref() {
+                for (idx, p) in inc.iter().enumerate() {
+                    if p.is_match(&file) {
+                        include_matched[idx] = true;
+                        inc_ok = true;
+                    }
+                }
+            }
+            let mut exc_hit = false;
+            for (idx, p) in exclude.iter().enumerate() {
+                if p.is_match(&file) {
+                    exclude_matched[idx] = true;
+                    exc_hit = true;
+                }
+            }
+            if inc_ok && !exc_hit {
                 paths.push(file);
             } else {
                 excluded.push(file);
@@ -434,6 +517,72 @@ impl Project {
                 workspace_dirs[id] = dir.clone();
             }
         }
+        let mut pkg_names_by_dir: BTreeMap<PathBuf, Option<String>> = BTreeMap::new();
+        for (dir, pkg) in &packages {
+            pkg_names_by_dir.insert(dir.clone(), pkg["name"].as_str().map(str::to_owned));
+        }
+        let workspace_infos: Vec<WorkspaceInfo> = workspace_dirs
+            .iter()
+            .map(|dir| {
+                let s = to_slash(dir);
+                WorkspaceInfo {
+                    dir: if s.is_empty() { ".".into() } else { s },
+                    name: pkg_names_by_dir.get(dir).cloned().flatten(),
+                }
+            })
+            .collect();
+        let mut manifests_data = Vec::new();
+        for (dir, pkg) in &packages {
+            if !pkg.is_object() {
+                continue;
+            }
+            let ws_id = directories.get(dir).copied().unwrap_or(0);
+            let s = to_slash(dir);
+            let ws_dir = if s.is_empty() { ".".into() } else { s };
+            manifests_data.push(WorkspaceManifest {
+                ws_id,
+                ws_dir,
+                rel_dir: dir.clone(),
+                manifest_path: manifest_path_for(dir),
+                name: pkg["name"].as_str().map(str::to_owned),
+                dependencies: manifest_dep_set(pkg, "dependencies"),
+                dev_dependencies: manifest_dep_set(pkg, "devDependencies"),
+                peer_dependencies: manifest_dep_set(pkg, "peerDependencies"),
+                optional_dependencies: manifest_dep_set(pkg, "optionalDependencies"),
+                scripts: manifest_scripts(pkg),
+                bins: manifest_bins(pkg),
+                config_deps: BTreeSet::new(),
+            });
+        }
+        let mut stale_config = Vec::new();
+        if let Some(inc) = &include_raw {
+            for (pat, matched) in inc.iter().zip(include_matched) {
+                if !matched {
+                    stale_config.push(StaleConfigItem {
+                        kind: "stale-include",
+                        source: "config#include".into(),
+                        pattern: Some(pat.clone()),
+                        file: None,
+                        symbol: None,
+                        location: None,
+                        message: format!("Include pattern {pat:?} matched no files."),
+                    });
+                }
+            }
+        }
+        for (pat, matched) in exclude_raw.iter().zip(exclude_matched) {
+            if !matched {
+                stale_config.push(StaleConfigItem {
+                    kind: "stale-exclude",
+                    source: "config#exclude".into(),
+                    pattern: Some(pat.clone()),
+                    file: None,
+                    symbol: None,
+                    location: None,
+                    message: format!("Exclude pattern {pat:?} matched no files or directories."),
+                });
+            }
+        }
         let mut project = Self {
             root,
             graph: Graph::new(paths),
@@ -444,9 +593,13 @@ impl Project {
             file_profile,
             workspace_for_file,
             workspace_dirs,
+            workspace_infos,
+            manifests: manifests_data,
             react_entry,
             source_mapper,
             dynamic_imports,
+            suppressions,
+            stale_config,
         };
         for (role, supplied) in
             ROLES
@@ -753,6 +906,17 @@ impl Project {
             } else {
                 None
             };
+            if origin == "explicit" {
+                self.stale_config.push(StaleConfigItem {
+                    kind: "stale-entry",
+                    source: format!("entries.{role:?}").to_lowercase(),
+                    pattern: Some(pattern.to_owned()),
+                    file: None,
+                    symbol: None,
+                    location: None,
+                    message: format!("Entry pattern {pattern:?} matched no included file."),
+                });
+            }
             self.graph
                 .gap_scoped("invalid-root", None, None, message, None, None, scope);
         }

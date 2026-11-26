@@ -27,7 +27,7 @@ pub enum ScriptOutcome {
     Ambiguous,
 }
 
-fn split_shell_words(input: &str) -> Vec<String> {
+pub(crate) fn split_shell_words(input: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut cur = String::new();
     let mut chars = input.chars().peekable();

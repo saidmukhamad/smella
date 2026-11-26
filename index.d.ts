@@ -1,11 +1,51 @@
 export type Context = 'runtime' | 'test' | 'tooling';
 export type Role = Context | 'public';
 export type FindingKind = 'unused-export' | 'test-only-export' | 'test-only-binding' | 'tooling-only-export' | 'unreferenced-module';
+export type DependencyFindingKind = 'unused-dependency' | 'unlisted-dependency' | 'unlisted-binary' | 'dev-dependency-in-runtime';
+export interface DependencyFinding {
+  id: string;
+  kind: DependencyFindingKind;
+  workspace: string;
+  file: string;
+  manifest: string;
+  dependency?: string;
+  dependencyGroup?: 'dependencies' | 'devDependencies';
+  binary?: string;
+  script?: string;
+  location?: Location;
+  status: 'complete';
+  diff?: DiffStatus;
+}
+export interface SuppressionRule {
+  file: string;
+  symbol: string;
+  reason: string;
+}
+export interface SuppressedFinding {
+  workspace: string;
+  file: string;
+  symbol: string;
+  kind: FindingKind;
+  reason: string;
+  source: 'config' | 'jsdoc';
+  location: Location;
+}
+export interface StaleConfigItem {
+  kind: 'stale-entry' | 'stale-include' | 'stale-exclude' | 'stale-suppression' | 'stale-dynamic-import' | 'invalid-suppression';
+  source: string;
+  pattern?: string;
+  file?: string;
+  symbol?: string;
+  location?: Location;
+  message: string;
+}
 export interface Config {
   include?: readonly string[];
   exclude?: readonly string[];
   entries?: Partial<Record<Context, readonly string[]>>;
   publicEntries?: readonly string[];
+  dynamicImports?: Readonly<Record<string, readonly string[]>>;
+  suppressions?: readonly SuppressionRule[];
 }
 export function createConfig<T extends Config>(config: T): T;
 export interface Root { file: string; role: Role; origin: 'explicit' | 'discovered'; input: string }
@@ -15,14 +55,17 @@ export interface Gap { id: string; code: string; file: string | null; location: 
 export interface InlineGap { id: string; code: string; file: string | null; location: Location | null; message: string }
 export interface Coverage { status: 'complete' | 'partial'; files: string[]; excluded: string[]; gaps: Gap[] }
 export interface Usage { value: Context[]; type: Context[]; contract: boolean; evaluation: Context[] }
+export interface WorkspaceInfo { dir: string; name: string | null }
 interface SubjectRecord {
-  id: string; file: string; exportName: string | null; bindingName?: string; location: Location; usage: Usage;
+  id: string; workspace: string; file: string; exportName: string | null; bindingName?: string; location: Location; usage: Usage;
   status: 'complete' | 'conditional'; gapIds: readonly string[]; primaryGaps: readonly InlineGap[];
 }
 export type DiffStatus = 'introduced' | 'pre-existing';
 export interface Finding extends SubjectRecord { kind: FindingKind; diff?: DiffStatus }
 export interface DiffSummary {
   base: string;
+  parents?: readonly string[];
+  staged?: boolean;
   changedFiles: readonly string[];
   introduced: number;
   preExisting: number;
@@ -43,13 +86,23 @@ export type Subject = string | { file: string; exportName?: string; bindingName?
   | { file: string; bindingName: string; exportName?: never };
 export interface Report {
   readonly roots: readonly Root[];
+  readonly workspaces: readonly WorkspaceInfo[];
+  readonly suppressed: readonly SuppressedFinding[];
+  readonly staleConfig: readonly StaleConfigItem[];
   readonly coverage: Coverage;
   readonly diff?: DiffSummary;
-  findings(filter?: { kind?: FindingKind; diff?: DiffStatus }): Finding[];
+  dependencies(filter?: { kind?: DependencyFindingKind; diff?: DiffStatus; workspace?: string | readonly string[] }): DependencyFinding[];
+  findings(filter?: { kind?: FindingKind | DependencyFindingKind; diff?: DiffStatus; workspace?: string | readonly string[] }): (Finding | DependencyFinding)[];
   explain(subject: Subject): Explanation;
   dispose(): void;
 }
 export class AnalysisError extends Error {
   readonly code: 'NATIVE_LOAD' | 'ANALYSIS_FAILED' | 'REPORT_DISPOSED' | 'UNKNOWN_SUBJECT';
 }
-export function analyze(options?: Config & { root?: string; base?: string }): Promise<Report>;
+export function analyze(options?: Config & {
+  root?: string;
+  base?: string;
+  staged?: boolean;
+  mergeBase?: string | boolean;
+  dependencies?: boolean;
+}): Promise<Report>;

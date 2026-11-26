@@ -6,9 +6,22 @@ use crate::evidence::Evidence;
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
+use crate::deps::{DependencyFinding, analyze_dependencies};
 use crate::extract::summarize;
-use crate::graph::{Gap, Graph, Id, ROLES, Reach, Role, Root, Visit};
-use crate::project::{Config, Project};
+use crate::graph::{Gap, Graph, Id, Loc, ROLES, Reach, Role, Root, Visit};
+use crate::project::{Config, Project, StaleConfigItem, WorkspaceInfo};
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuppressedFinding {
+    pub workspace: String,
+    pub file: String,
+    pub symbol: String,
+    pub kind: &'static str,
+    pub reason: String,
+    pub source: &'static str,
+    pub location: Loc,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Form {
@@ -32,6 +45,7 @@ struct Record<'a> {
     kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_gap: Option<&'a str>,
+    workspace: &'a str,
     file: &'a str,
     export_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +98,11 @@ pub struct Report {
     roots: Vec<Root>,
     excluded: Vec<String>,
     gaps: Vec<Gap>,
+    workspaces: Vec<WorkspaceInfo>,
+    workspace_for_file: Vec<usize>,
+    dependencies: Vec<DependencyFinding>,
+    suppressed: Vec<SuppressedFinding>,
+    stale_config: Vec<StaleConfigItem>,
     reach: Reach,
     subjects: Vec<Subject>,
     evidence: Evidence,
@@ -138,8 +157,33 @@ impl Report {
             .iter()
             .enumerate()
             .any(|(file, summary)| roles[file] != 0 && summary.parsed);
-        for summary in summaries {
+        let mut package_refs = Vec::new();
+        let mut inline_suppressions = Vec::new();
+        let mut stale_config = std::mem::take(&mut project.stale_config);
+        let mut dynamic_import_files_used = std::collections::BTreeSet::new();
+        for (file_id, mut summary) in summaries.into_iter().enumerate() {
+            if summary.used_dynamic_imports {
+                dynamic_import_files_used.insert(project.graph.paths[file_id].clone());
+            }
+            package_refs.append(&mut summary.package_refs);
+            inline_suppressions.append(&mut summary.inline_suppressions);
+            stale_config.append(&mut summary.invalid_suppressions);
             summary.append(&mut project.graph);
+        }
+        for file_key in project.dynamic_imports.keys() {
+            if !dynamic_import_files_used.contains(file_key) {
+                stale_config.push(StaleConfigItem {
+                    kind: "stale-dynamic-import",
+                    source: "config#dynamicImports".into(),
+                    pattern: Some(file_key.clone()),
+                    file: Some(file_key.clone()),
+                    symbol: None,
+                    location: None,
+                    message: format!(
+                        "dynamicImports entry for {file_key:?} was not consumed by any dynamic import or require."
+                    ),
+                });
+            }
         }
         if !usable {
             let first = project.graph.gaps.iter().find(|g| {
@@ -159,9 +203,10 @@ impl Report {
             ));
         }
         let multi_workspace = project.is_multi_workspace();
+        project.graph.link();
+        let reach = Reach::compute(&project.graph, &project.roots);
+        let dependencies = analyze_dependencies(&project, &reach, &package_refs);
         let mut graph = project.graph;
-        graph.link();
-        let reach = Reach::compute(&graph, &project.roots);
         let mut workspace_gaps = Vec::new();
         let evidence = Evidence::build(
             &graph,
@@ -225,6 +270,103 @@ impl Report {
                 });
             }
         }
+        // Apply per-symbol suppressions (config + JSDoc) and detect stale suppressions.
+        let mut config_supp_used = vec![false; project.suppressions.len()];
+        let mut config_supp_map: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        for (idx, rule) in project.suppressions.iter().enumerate() {
+            let file_norm = rule.file.trim().trim_start_matches("./").replace('\\', "/");
+            config_supp_map.insert((file_norm, rule.symbol.trim().to_owned()), idx);
+        }
+        let mut inline_supp_used = vec![false; inline_suppressions.len()];
+        let mut inline_supp_map: std::collections::HashMap<(Id, String), usize> =
+            std::collections::HashMap::new();
+        for (idx, s) in inline_suppressions.iter().enumerate() {
+            inline_supp_map.insert((s.file, s.symbol.clone()), idx);
+        }
+        let mut suppressed = Vec::new();
+        for subj in &mut subjects {
+            if subj.form == Form::Module {
+                continue;
+            }
+            let Some(kind) = subj.kind else {
+                continue;
+            };
+            let file_path = &graph.paths[subj.file];
+            let sym_name = &graph.nodes[subj.surface].name;
+            let ws_id = project
+                .workspace_for_file
+                .get(subj.file)
+                .copied()
+                .unwrap_or(0);
+            let workspace = project
+                .workspace_infos
+                .get(ws_id)
+                .map_or(".", |w| w.dir.as_str())
+                .to_owned();
+            if let Some(&idx) = inline_supp_map.get(&(subj.file, sym_name.clone())) {
+                inline_supp_used[idx] = true;
+                suppressed.push(SuppressedFinding {
+                    workspace,
+                    file: file_path.clone(),
+                    symbol: sym_name.clone(),
+                    kind,
+                    reason: inline_suppressions[idx].reason.clone(),
+                    source: "jsdoc",
+                    location: graph.nodes[subj.surface].loc,
+                });
+                subj.kind = None;
+            } else if let Some(&idx) = config_supp_map.get(&(file_path.clone(), sym_name.clone())) {
+                config_supp_used[idx] = true;
+                suppressed.push(SuppressedFinding {
+                    workspace,
+                    file: file_path.clone(),
+                    symbol: sym_name.clone(),
+                    kind,
+                    reason: project.suppressions[idx].reason.trim().to_owned(),
+                    source: "config",
+                    location: graph.nodes[subj.surface].loc,
+                });
+                subj.kind = None;
+            }
+        }
+        for (rule, used) in project.suppressions.iter().zip(config_supp_used) {
+            if !used {
+                stale_config.push(StaleConfigItem {
+                    kind: "stale-suppression",
+                    source: "config#suppressions".into(),
+                    pattern: None,
+                    file: Some(rule.file.clone()),
+                    symbol: Some(rule.symbol.clone()),
+                    location: None,
+                    message: format!(
+                        "Suppression for {}#{} matched no finding (symbol is used or no longer exists).",
+                        rule.file, rule.symbol
+                    ),
+                });
+            }
+        }
+        for (item, used) in inline_suppressions.iter().zip(inline_supp_used) {
+            if !used {
+                let file = graph.paths[item.file].clone();
+                stale_config.push(StaleConfigItem {
+                    kind: "stale-suppression",
+                    source: file.clone(),
+                    pattern: None,
+                    file: Some(file.clone()),
+                    symbol: Some(item.symbol.clone()),
+                    location: Some(item.loc),
+                    message: format!(
+                        "@smella-ignore on {file}#{} is stale (symbol is already used).",
+                        item.symbol
+                    ),
+                });
+            }
+        }
+        stale_config.sort_by(|a, b| {
+            (&a.kind, &a.file, &a.symbol, &a.pattern, &a.message)
+                .cmp(&(&b.kind, &b.file, &b.symbol, &b.pattern, &b.message))
+        });
         // Queries need the predecessor forest and source labels. Drop build-time
         // adjacency lists and module tables before handing the snapshot to JS.
         for node in &mut graph.nodes {
@@ -238,6 +380,11 @@ impl Report {
             roots: project.roots,
             excluded: project.excluded,
             gaps,
+            workspaces: project.workspace_infos,
+            workspace_for_file: project.workspace_for_file,
+            dependencies,
+            suppressed,
+            stale_config,
             subjects,
             evidence,
         })
@@ -251,12 +398,19 @@ impl Report {
             gaps: &'a [Gap],
         }
         #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
         struct Metadata<'a> {
             roots: &'a [Root],
+            workspaces: &'a [WorkspaceInfo],
+            suppressed: &'a [SuppressedFinding],
+            stale_config: &'a [StaleConfigItem],
             coverage: Coverage<'a>,
         }
         serde_json::to_string(&Metadata {
             roots: &self.roots,
+            workspaces: &self.workspaces,
+            suppressed: &self.suppressed,
+            stale_config: &self.stale_config,
             coverage: Coverage {
                 status: if self.gaps.is_empty() {
                     "complete"
@@ -277,10 +431,13 @@ impl Report {
             }))
         };
         let node = &self.graph.nodes[s.surface];
+        let ws_id = self.workspace_for_file.get(s.file).copied().unwrap_or(0);
+        let workspace = self.workspaces.get(ws_id).map_or(".", |w| w.dir.as_str());
         Record {
             id: format!("s{index}"),
             workspace_gap: self.evidence.gap_for(s.binding),
             kind: s.kind,
+            workspace,
             file: &self.graph.paths[s.file],
             location: node.loc,
             export_name: (s.form == Form::Export).then_some(node.name.as_str()),
@@ -308,6 +465,9 @@ impl Report {
         let mut output = Vec::new();
         serde_json::Serializer::new(&mut output).collect_seq(records)?;
         Ok(String::from_utf8(output).expect("JSON is UTF-8"))
+    }
+    pub fn dependencies(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&self.dependencies)
     }
     fn witness(&self, mut id: Id, mut lane: usize) -> Value {
         let mut path = vec![];

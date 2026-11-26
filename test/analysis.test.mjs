@@ -1144,3 +1144,219 @@ test('gaps in one monorepo workspace leave fully resolved findings in unrelated 
   assert.equal(subject(r, 'packages/noisy/src/index.ts', 'noisyUnused').status, 'conditional');
   assert.equal(subject(r, 'packages/noisy/src/broken.ts', 'present').status, 'conditional');
 });
+
+test('findings carry owning workspace attribution and filter cleanly by workspace directory or package name', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ name: 'mono-root', workspaces: ['packages/*'], bin: { app: './app.ts' } }),
+    'app.ts': 'import { shared } from "@org/core"; shared();',
+    'packages/core/package.json': JSON.stringify({ name: '@org/core', exports: { '.': './src/index.ts' } }),
+    'packages/core/src/index.ts': 'export function shared() {} export function deadCore() {}',
+    'packages/web/package.json': JSON.stringify({ name: '@org/web', exports: { '.': './src/index.ts' } }),
+    'packages/web/src/index.ts': 'export function deadWeb() {}',
+  });
+
+  const r = await inspect(t, root, { publicEntries: [] });
+  assert.ok(r.workspaces.some(w => w.dir === 'packages/core' && w.name === '@org/core'));
+  assert.ok(r.workspaces.some(w => w.dir === 'packages/web' && w.name === '@org/web'));
+  assert.equal(subject(r, 'packages/core/src/index.ts', 'deadCore').workspace, 'packages/core');
+  assert.deepEqual(
+    r.findings({ workspace: 'packages/core' }).map(f => `${f.workspace}:${f.exportName ?? '<mod>'}`),
+    ['packages/core:deadCore'],
+  );
+  assert.deepEqual(
+    r.findings({ workspace: '@org/web' }).map(f => `${f.workspace}:${f.exportName ?? '<mod>'}`),
+    ['packages/web:<mod>', 'packages/web:deadWeb'],
+  );
+  const cliOut = execFileSync(process.execPath, [
+    cliPath, '--root', root, '--entries', 'public:', '--workspace', 'packages/core',
+  ], { encoding: 'utf8' });
+  const rows = cliOut.trim().split('\n').map(l => JSON.parse(l));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].workspace, 'packages/core');
+  assert.equal(rows[0].exportName, 'deadCore');
+});
+
+test('dependency analysis detects unused, unlisted, unlisted-binary and dev-dependency-in-runtime per workspace', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({
+      name: 'mono',
+      workspaces: ['packages/*'],
+      devDependencies: { typescript: '^5.0.0' },
+    }),
+    'node_modules/used-lib/package.json': JSON.stringify({ name: 'used-lib', main: 'index.js' }),
+    'node_modules/used-lib/index.js': 'exports.ok = 1;',
+    'node_modules/dev-only-lib/package.json': JSON.stringify({ name: 'dev-only-lib', main: 'index.js' }),
+    'node_modules/dev-only-lib/index.js': 'exports.helper = 1;',
+    'node_modules/unlisted-lib/package.json': JSON.stringify({ name: 'unlisted-lib', main: 'index.js' }),
+    'node_modules/unlisted-lib/index.js': 'exports.x = 1;',
+    'node_modules/test-util/package.json': JSON.stringify({ name: 'test-util', main: 'index.js' }),
+    'node_modules/test-util/index.js': 'exports.check = 1;',
+    'packages/svc/package.json': JSON.stringify({
+      name: '@org/svc',
+      bin: { svc: './src/server.ts' },
+      dependencies: { 'used-lib': '^1.0.0', 'unused-pkg': '^1.0.0' },
+      devDependencies: {
+        '@types/used-lib': '^1.0.0',
+        'dev-only-lib': '^1.0.0',
+        'test-util': '^1.0.0',
+      },
+      scripts: {
+        typecheck: 'tsc --noEmit',
+        lint: 'mystery-linter src/',
+      },
+    }),
+    'packages/svc/src/server.ts': [
+      'import { ok } from "used-lib";',
+      'import { helper } from "dev-only-lib";',
+      'import { x } from "unlisted-lib";',
+      'console.log(ok, helper, x);',
+    ].join('\n'),
+    'packages/svc/src/server.test.ts': 'import { check } from "test-util"; check();',
+  });
+
+  const r = await inspect(t, root, { dependencies: true, publicEntries: [] });
+  const deps = r.dependencies({ workspace: 'packages/svc' });
+  assert.deepEqual(
+    deps.map(d => `${d.kind}:${d.dependency ?? d.binary}:${d.manifest}:${d.file}`),
+    [
+      'unlisted-binary:mystery-linter:packages/svc/package.json:packages/svc/package.json',
+      'unused-dependency:unused-pkg:packages/svc/package.json:packages/svc/package.json',
+      'dev-dependency-in-runtime:dev-only-lib:packages/svc/package.json:packages/svc/src/server.ts',
+      'unlisted-dependency:unlisted-lib:packages/svc/package.json:packages/svc/src/server.ts',
+    ],
+  );
+  // Root typescript devDependency was consumed by child workspace's `tsc --noEmit` script.
+  assert.deepEqual(r.dependencies({ workspace: '.' }), []);
+});
+
+test('per-symbol suppressions require a reason and stale configuration entries are reported', async t => {
+  const root = await fixture(t, {
+    'app.ts': 'import { live } from "./lib"; live();',
+    'lib.ts': [
+      '/** @smella-ignore loaded dynamically by host plugin registry */',
+      'export function hostHook() {}',
+      '/** @smella-ignore */',
+      'export function missingReason() {}',
+      '/** @smella-ignore stale note on live export */',
+      'export function live() {}',
+      'export function configIgnored() {}',
+      'export function genuinelyDead() {}',
+    ].join('\n'),
+  });
+
+  // File-level / glob / empty-reason config suppressions are rejected.
+  await assert.rejects(
+    analyze({ root, ...app, suppressions: [{ file: 'lib.ts', symbol: '*', reason: 'nope' }] }),
+    { code: 'ANALYSIS_FAILED' },
+  );
+  await assert.rejects(
+    analyze({ root, ...app, suppressions: [{ file: 'lib.ts', symbol: 'configIgnored', reason: '   ' }] }),
+    { code: 'ANALYSIS_FAILED' },
+  );
+
+  const r = await inspect(t, root, {
+    entries: { runtime: ['app.ts', 'missing-entry.ts'], test: [], tooling: [] },
+    publicEntries: [],
+    exclude: ['does-not-exist/**'],
+    suppressions: [
+      { file: 'lib.ts', symbol: 'configIgnored', reason: 'invoked by external scheduler' },
+      { file: 'lib.ts', symbol: 'nonExistent', reason: 'old hook removed' },
+    ],
+  });
+
+  assert.deepEqual(
+    r.findings().map(f => f.exportName),
+    ['genuinelyDead', 'missingReason'],
+  );
+  assert.deepEqual(
+    r.suppressed.map(s => `${s.source}:${s.symbol}:${s.reason}`).sort(),
+    [
+      'config:configIgnored:invoked by external scheduler',
+      'jsdoc:hostHook:loaded dynamically by host plugin registry',
+    ],
+  );
+  const staleKinds = r.staleConfig.map(s => `${s.kind}:${s.symbol ?? s.pattern ?? ''}`).sort();
+  assert.deepEqual(staleKinds, [
+    'invalid-suppression:',
+    'stale-entry:missing-entry.ts',
+    'stale-exclude:does-not-exist/**',
+    'stale-suppression:live',
+    'stale-suppression:nonExistent',
+  ]);
+});
+
+test('hook modes support --staged, --diff merge-base, two-parent merge commits, --all and human witness output', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ name: 'hook-demo', bin: { app: './app.ts' } }),
+    'app.ts': 'import { live } from "./lib"; live();',
+    'lib.ts': 'export function live() {} export function preExistingDead() {}',
+    'lib.test.ts': 'import { live } from "./lib"; live();',
+  });
+  const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
+  const runCli = (...args) => {
+    try {
+      const stdout = execFileSync(process.execPath, [cliPath, '--root', root, ...args], { encoding: 'utf8' });
+      return { code: 0, stdout };
+    } catch (err) {
+      return { code: err.status ?? 1, stdout: err.stdout ?? '', stderr: err.stderr ?? '' };
+    }
+  };
+  git('init', '-q', '-b', 'main');
+  git('config', 'user.email', 'test@example.com');
+  git('config', 'user.name', 'Test');
+  git('add', '.');
+  git('commit', '-q', '-m', 'base');
+
+  // --all always exits 0 even with pre-existing findings, and renders human format.
+  const allRes = runCli('--all');
+  assert.equal(allRes.code, 0);
+  assert.ok(allRes.stdout.includes('preExistingDead'));
+
+  // Stage a test-only export while leaving an unstaged dead export in the working tree.
+  await writeFile(join(root, 'lib.ts'), 'export function live() {} export function preExistingDead() {} export function onlyTested() {}');
+  await writeFile(join(root, 'lib.test.ts'), 'import { live, onlyTested } from "./lib"; live(); onlyTested();');
+  git('add', 'lib.ts', 'lib.test.ts');
+  await writeFile(join(root, 'lib.ts'), 'export function live() {} export function preExistingDead() {} export function onlyTested() {} export function unstagedDead() {}');
+
+  // --staged inspects only the index (sees onlyTested with witness path, ignores unstagedDead) and exits 1.
+  const stagedRes = runCli('--staged');
+  assert.equal(stagedRes.code, 1);
+  assert.ok(stagedRes.stdout.includes('test-only-export'));
+  assert.ok(stagedRes.stdout.includes('onlyTested'));
+  assert.ok(stagedRes.stdout.includes('via lib.test.ts -> lib.ts'));
+  assert.ok(!stagedRes.stdout.includes('unstagedDead'));
+
+  // --diff against main sees the working-tree unstagedDead too and exits 1.
+  const diffRes = runCli('--diff', 'main');
+  assert.equal(diffRes.code, 1);
+  assert.ok(diffRes.stdout.includes('unstagedDead'));
+
+  // Commit branch A with deadA, branch B with deadB, then merge cleanly:
+  // merge commit judged against both parents has 0 introduced findings.
+  git('reset', '--hard', '-q', 'HEAD');
+  git('checkout', '-q', '-b', 'branch-a');
+  await writeFile(join(root, 'a.ts'), 'export function deadA() {}');
+  git('add', 'a.ts');
+  git('commit', '-q', '-m', 'branch a');
+
+  git('checkout', '-q', 'main');
+  git('checkout', '-q', '-b', 'branch-b');
+  await writeFile(join(root, 'b.ts'), 'export function deadB() {}');
+  git('add', 'b.ts');
+  git('commit', '-q', '-m', 'branch b');
+
+  git('merge', '-q', '--no-edit', 'branch-a');
+  const cleanMerge = runCli('--diff');
+  assert.equal(cleanMerge.code, 0);
+  assert.ok(cleanMerge.stdout.includes('0 introduced'));
+
+  // If a merge commit itself adds a new dead export, --diff catches it.
+  await writeFile(join(root, 'b.ts'), 'export function deadB() {} export function mergeAuthoredDead() {}');
+  git('add', 'b.ts');
+  git('commit', '-q', '--amend', '--no-edit');
+  const dirtyMerge = runCli('--diff');
+  assert.equal(dirtyMerge.code, 1);
+  assert.ok(dirtyMerge.stdout.includes('mergeAuthoredDead'));
+  assert.ok(!dirtyMerge.stdout.includes('deadA'));
+  assert.ok(!dirtyMerge.stdout.includes('deadB'));
+});
