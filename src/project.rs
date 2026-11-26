@@ -278,13 +278,14 @@ impl Project {
                     return true;
                 }
                 if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                    let file = entry
-                        .path()
-                        .strip_prefix(&root_cb)
-                        .unwrap()
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    let name = entry.file_name().to_string_lossy();
+                    let skip_by_name = entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|n| SKIP.contains(&n));
+                    if !skip_by_name && exclude_filter.is_empty() {
+                        return true;
+                    }
+                    let file = rel_path_to_slash(entry.path(), &root_cb);
                     let mut excluded_by_rule = false;
                     for (idx, p) in exclude_filter.iter().enumerate() {
                         if p.is_match(&file) {
@@ -292,7 +293,7 @@ impl Project {
                             excluded_by_rule = true;
                         }
                     }
-                    if SKIP.contains(&name.as_ref()) || excluded_by_rule {
+                    if skip_by_name || excluded_by_rule {
                         excluded_dirs_cb.lock().unwrap().push(format!("{file}/"));
                         return false;
                     }
@@ -354,53 +355,43 @@ impl Project {
                     if entry.depth() == 0 || !entry.file_type().is_some_and(|ft| ft.is_file()) {
                         return WalkState::Continue;
                     }
-                    let file = entry
-                        .path()
-                        .strip_prefix(root_ref)
-                        .unwrap()
-                        .to_string_lossy()
-                        .replace('\\', "/");
                     let name = entry.file_name().to_string_lossy();
-                    if nx_enabled && name == "project.json" {
+                    let is_code = code_ext_of(&name).is_some();
+                    let is_pkg = name == "package.json";
+                    let is_ts_cfg = name.starts_with("tsconfig") && name.ends_with(".json");
+                    let is_nx = nx_enabled && name == "project.json";
+                    if !is_code && !is_pkg && !is_ts_cfg && !is_nx {
+                        return WalkState::Continue;
+                    }
+                    if is_pkg {
+                        guard.local.manifests.push(entry.path().to_owned());
+                        return WalkState::Continue;
+                    }
+                    let file = rel_path_to_slash(entry.path(), root_ref);
+                    if is_nx {
                         guard
                             .local
                             .nx_dirs
                             .push(Path::new(&file).parent().unwrap().to_owned());
-                    }
-                    if name.starts_with("tsconfig") && name.ends_with(".json") {
-                        guard.local.tsconfig_files.push(PathBuf::from(&file));
-                    }
-                    if name.starts_with("tsdown.config.")
-                        && entry
-                            .path()
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .is_some_and(|e| EXTENSIONS.contains(&e))
-                    {
-                        guard.local.bundler_configs.push(PathBuf::from(&file));
-                    }
-                    if name == "tsconfig.json" {
-                        guard.local.config_dirs.push(
-                            entry
-                                .path()
-                                .parent()
-                                .unwrap()
-                                .strip_prefix(root_ref)
-                                .unwrap()
-                                .to_owned(),
-                        );
-                    }
-                    if name == "package.json" {
-                        guard.local.manifests.push(entry.path().to_owned());
-                    }
-                    if !EXTENSIONS.contains(
-                        &entry
-                            .path()
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or(""),
-                    ) {
                         return WalkState::Continue;
+                    }
+                    if is_ts_cfg {
+                        if name == "tsconfig.json" {
+                            guard.local.config_dirs.push(
+                                entry
+                                    .path()
+                                    .parent()
+                                    .unwrap()
+                                    .strip_prefix(root_ref)
+                                    .unwrap()
+                                    .to_owned(),
+                            );
+                        }
+                        guard.local.tsconfig_files.push(PathBuf::from(&file));
+                        return WalkState::Continue;
+                    }
+                    if name.starts_with("tsdown.config.") {
+                        guard.local.bundler_configs.push(PathBuf::from(&file));
                     }
                     let mut inc_ok = include_ref.is_none();
                     if let Some(inc) = include_ref.as_ref() {
@@ -455,51 +446,41 @@ impl Project {
                 if entry.depth() == 0 || !entry.file_type().is_some_and(|ft| ft.is_file()) {
                     continue;
                 }
-                let file = entry
-                    .path()
-                    .strip_prefix(&root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
                 let name = entry.file_name().to_string_lossy();
-                if nx_enabled && name == "project.json" {
-                    nx_dirs.insert(Path::new(&file).parent().unwrap().to_owned());
-                }
-                if name.starts_with("tsconfig") && name.ends_with(".json") {
-                    tsconfig_files.push(PathBuf::from(&file));
-                }
-                if name.starts_with("tsdown.config.")
-                    && entry
-                        .path()
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|e| EXTENSIONS.contains(&e))
-                {
-                    bundler_configs.push(PathBuf::from(&file));
-                }
-                if name == "tsconfig.json" {
-                    config_dirs.insert(
-                        entry
-                            .path()
-                            .parent()
-                            .unwrap()
-                            .strip_prefix(&root)
-                            .unwrap()
-                            .to_owned(),
-                        0usize,
-                    );
-                }
-                if name == "package.json" {
-                    manifests.push(entry.path().to_owned());
-                }
-                if !EXTENSIONS.contains(
-                    &entry
-                        .path()
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or(""),
-                ) {
+                let is_code = code_ext_of(&name).is_some();
+                let is_pkg = name == "package.json";
+                let is_ts_cfg = name.starts_with("tsconfig") && name.ends_with(".json");
+                let is_nx = nx_enabled && name == "project.json";
+                if !is_code && !is_pkg && !is_ts_cfg && !is_nx {
                     continue;
+                }
+                if is_pkg {
+                    manifests.push(entry.path().to_owned());
+                    continue;
+                }
+                let file = rel_path_to_slash(entry.path(), &root);
+                if is_nx {
+                    nx_dirs.insert(Path::new(&file).parent().unwrap().to_owned());
+                    continue;
+                }
+                if is_ts_cfg {
+                    if name == "tsconfig.json" {
+                        config_dirs.insert(
+                            entry
+                                .path()
+                                .parent()
+                                .unwrap()
+                                .strip_prefix(&root)
+                                .unwrap()
+                                .to_owned(),
+                            0usize,
+                        );
+                    }
+                    tsconfig_files.push(PathBuf::from(&file));
+                    continue;
+                }
+                if name.starts_with("tsdown.config.") {
+                    bundler_configs.push(PathBuf::from(&file));
                 }
                 let mut inc_ok = include.is_none();
                 if let Some(inc) = include.as_ref() {
@@ -1904,6 +1885,16 @@ fn workspace_patterns(manifest: &Value) -> Result<WorkspacePatterns, String> {
             .flatten()
             .filter_map(Value::as_str),
     )
+}
+
+#[inline]
+fn rel_path_to_slash(path: &Path, root: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap();
+    #[cfg(unix)]
+    if let Some(s) = rel.to_str() {
+        return s.to_owned();
+    }
+    rel.to_string_lossy().replace('\\', "/")
 }
 
 #[inline]

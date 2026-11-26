@@ -1,6 +1,5 @@
 //! Static discovery of runtime and tooling entries from package.json scripts,
 //! Vite/webpack configs (including Module Federation exposes), and Storybook configs.
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +14,8 @@ use oxc_ast::{
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
+use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 use serde_json::Value;
 
 use crate::graph::{Role, Root, RootEntryMode};
@@ -708,12 +709,15 @@ pub fn discover_bundler_entries(project: &mut Project) {
         })
         .collect();
 
-    let mut arena = Allocator::default();
-    let mut scratch = String::new();
-    let mut new_roots = Vec::new();
-    for (id, cfg, is_config) in config_files {
-        let Some(source) = read_project_source(project, id, &cfg, &mut scratch) else {
-            continue;
+    if config_files.is_empty() {
+        return;
+    }
+    let inspect = |(arena, scratch): &mut (Allocator, String),
+                   &(id, ref cfg, is_config): &(usize, String, bool)|
+     -> Vec<Root> {
+        let mut out = Vec::new();
+        let Some(source) = read_project_source(project, id, cfg, scratch) else {
+            return out;
         };
         if !is_config
             && !source.contains("entryPoints")
@@ -721,18 +725,18 @@ pub fn discover_bundler_entries(project: &mut Project) {
             && !source.contains("input")
             && !source.contains("exposes")
         {
-            continue;
+            return out;
         }
-        let abs = project.root.join(&cfg);
+        let abs = project.root.join(cfg);
         arena.reset();
         let parsed = Parser::new(
-            &arena,
+            arena,
             source,
             SourceType::from_path(&abs).unwrap_or_default(),
         )
         .parse();
         if parsed.panicked {
-            continue;
+            return out;
         }
         let sem = SemanticBuilder::new().build(&parsed.program).semantic;
         let nodes = sem.nodes();
@@ -792,10 +796,10 @@ pub fn discover_bundler_entries(project: &mut Project) {
                 _ => {}
             }
         }
-        let cfg_dir = Path::new(&cfg).parent().unwrap_or_else(|| Path::new(""));
+        let cfg_dir = Path::new(cfg).parent().unwrap_or_else(|| Path::new(""));
         for raw in exposes {
             if let Some(id) = resolve_discovered_path(project, cfg_dir, &raw) {
-                new_roots.push(Root {
+                out.push(Root {
                     file: project.graph.paths[id].clone(),
                     role: Role::Runtime,
                     origin: "discovered",
@@ -806,9 +810,9 @@ pub fn discover_bundler_entries(project: &mut Project) {
         }
         for raw in aliases {
             if let Some(id) = resolve_discovered_path(project, cfg_dir, &raw)
-                && project.graph.paths[id] != cfg
+                && project.graph.paths[id] != *cfg
             {
-                new_roots.push(Root {
+                out.push(Root {
                     file: project.graph.paths[id].clone(),
                     role: Role::Runtime,
                     origin: "discovered",
@@ -824,7 +828,7 @@ pub fn discover_bundler_entries(project: &mut Project) {
                     for script_file in
                         html_script_sources(&project.root, &norm, &project.graph.paths)
                     {
-                        new_roots.push(Root {
+                        out.push(Root {
                             file: script_file,
                             role: Role::Runtime,
                             origin: "discovered",
@@ -834,9 +838,9 @@ pub fn discover_bundler_entries(project: &mut Project) {
                     }
                 }
             } else if let Some(id) = resolve_discovered_path(project, cfg_dir, &raw)
-                && project.graph.paths[id] != cfg
+                && project.graph.paths[id] != *cfg
             {
-                new_roots.push(Root {
+                out.push(Root {
                     file: project.graph.paths[id].clone(),
                     role: Role::Runtime,
                     origin: "discovered",
@@ -845,8 +849,27 @@ pub fn discover_bundler_entries(project: &mut Project) {
                 });
             }
         }
+        out
+    };
+    let batches: Vec<Vec<Root>> = if config_files.len() >= 4
+        && let Some(pool) = crate::io::pool()
+    {
+        pool.install(|| {
+            config_files
+                .par_iter()
+                .map_init(|| (Allocator::default(), String::new()), inspect)
+                .collect()
+        })
+    } else {
+        let mut state = (Allocator::default(), String::new());
+        config_files
+            .iter()
+            .map(|c| inspect(&mut state, c))
+            .collect()
+    };
+    for batch in batches {
+        project.roots.extend(batch);
     }
-    project.roots.extend(new_roots);
 }
 
 /// Inspect Jest configs (`jest.config.*`, `jest.*.config.*`) to discover test setup files,
@@ -873,23 +896,21 @@ pub fn discover_jest_config_entries(project: &mut Project) {
     if configs.is_empty() {
         return;
     }
-    let mut arena = Allocator::default();
-    let mut scratch = String::new();
-    let mut new_roots = Vec::new();
-    for (id, cfg) in configs {
-        let Some(source) = read_project_source(project, id, &cfg, &mut scratch) else {
-            continue;
+    let inspect = |(arena, scratch): &mut (Allocator, String), &(id, ref cfg): &(usize, String)| {
+        let mut out = Vec::new();
+        let Some(source) = read_project_source(project, id, cfg, scratch) else {
+            return out;
         };
-        let abs = project.root.join(&cfg);
+        let abs = project.root.join(cfg);
         arena.reset();
         let parsed = Parser::new(
-            &arena,
+            arena,
             source,
             SourceType::from_path(&abs).unwrap_or_default(),
         )
         .parse();
         if parsed.panicked {
-            continue;
+            return out;
         }
         let sem = SemanticBuilder::new().build(&parsed.program).semantic;
         let nodes = sem.nodes();
@@ -923,16 +944,16 @@ pub fn discover_jest_config_entries(project: &mut Project) {
                 collect_paths_from_expr(&prop.value, &locals, &mut targets);
             }
         }
-        let cfg_dir = Path::new(&cfg).parent().unwrap_or_else(|| Path::new(""));
+        let cfg_dir = Path::new(cfg).parent().unwrap_or_else(|| Path::new(""));
         for raw in targets {
             let cleaned = raw
                 .trim()
                 .trim_start_matches("<rootDir>/")
                 .trim_start_matches("<rootDir>");
             if let Some(id) = resolve_discovered_path(project, cfg_dir, cleaned)
-                && project.graph.paths[id] != cfg
+                && project.graph.paths[id] != *cfg
             {
-                new_roots.push(Root {
+                out.push(Root {
                     file: project.graph.paths[id].clone(),
                     role: Role::Test,
                     origin: "discovered",
@@ -941,36 +962,46 @@ pub fn discover_jest_config_entries(project: &mut Project) {
                 });
             }
         }
+        out
+    };
+    let batches: Vec<Vec<Root>> = if configs.len() >= 4
+        && let Some(pool) = crate::io::pool()
+    {
+        pool.install(|| {
+            configs
+                .par_iter()
+                .map_init(|| (Allocator::default(), String::new()), inspect)
+                .collect()
+        })
+    } else {
+        let mut state = (Allocator::default(), String::new());
+        configs.iter().map(|c| inspect(&mut state, c)).collect()
+    };
+    for batch in batches {
+        project.roots.extend(batch);
     }
-    project.roots.extend(new_roots);
 }
 
 /// Discover served static JS files inside workspace `public/` directories (e.g. service workers).
 pub fn discover_public_static_files(project: &mut Project) {
-    let ws_prefixes: Vec<String> = project
-        .workspace_infos
-        .iter()
-        .map(|w| {
-            if w.dir == "." {
-                "public/".to_owned()
-            } else {
-                format!("{}/public/", w.dir)
-            }
-        })
-        .collect();
-    let new_roots: Vec<Root> = project
-        .graph
-        .paths
-        .iter()
-        .filter(|p| ws_prefixes.iter().any(|pref| p.starts_with(pref)))
-        .map(|file| Root {
-            file: file.clone(),
-            role: Role::Runtime,
-            origin: "discovered",
-            input: "public-static".into(),
-            mode: RootEntryMode::ModuleOnly,
-        })
-        .collect();
+    let mut new_roots = Vec::new();
+    for w in &project.workspace_infos {
+        let dir = if w.dir == "." {
+            PathBuf::from("public")
+        } else {
+            Path::new(&w.dir).join("public")
+        };
+        let (start, end) = project.files_in_dir_range(&dir);
+        for file in &project.graph.paths[start as usize..end as usize] {
+            new_roots.push(Root {
+                file: file.clone(),
+                role: Role::Runtime,
+                origin: "discovered",
+                input: "public-static".into(),
+                mode: RootEntryMode::ModuleOnly,
+            });
+        }
+    }
     project.roots.extend(new_roots);
 }
 
@@ -988,26 +1019,22 @@ pub fn discover_ambient_declarations(project: &mut Project) {
     if candidates.is_empty() {
         return;
     }
-    let mut arena = Allocator::default();
-    let mut scratch = String::new();
-    let mut ambient = Vec::new();
-    for (id, file) in candidates {
-        let Some(source) = read_project_source(project, id, &file, &mut scratch) else {
-            continue;
-        };
-        if !source.contains("declare ") {
-            continue;
+    let check = |(arena, scratch): &mut (Allocator, String), &(id, ref file): &(usize, String)| {
+        let source = read_project_source(project, id, file, scratch)?;
+        if !source.contains("declare") || (!source.contains("global") && !source.contains("module"))
+        {
+            return None;
         }
-        let abs = project.root.join(&file);
+        let abs = project.root.join(file);
         arena.reset();
         let parsed = Parser::new(
-            &arena,
+            arena,
             source,
             SourceType::from_path(&abs).unwrap_or_default(),
         )
         .parse();
         if parsed.panicked {
-            continue;
+            return None;
         }
         let is_ambient = parsed.program.body.iter().any(|stmt| {
             matches!(
@@ -1017,32 +1044,47 @@ pub fn discover_ambient_declarations(project: &mut Project) {
                         || matches!(m.id, TSModuleDeclarationName::StringLiteral(_))
             )
         });
-        if is_ambient {
-            ambient.push(Root {
-                file,
-                role: Role::Runtime,
-                origin: "discovered",
-                input: "ambient-declaration".into(),
-                mode: RootEntryMode::ModuleOnly,
-            });
-        }
-    }
+        is_ambient.then(|| Root {
+            file: file.clone(),
+            role: Role::Runtime,
+            origin: "discovered",
+            input: "ambient-declaration".into(),
+            mode: RootEntryMode::ModuleOnly,
+        })
+    };
+    let ambient: Vec<Root> = if candidates.len() >= 8
+        && let Some(pool) = crate::io::pool()
+    {
+        pool.install(|| {
+            candidates
+                .par_iter()
+                .map_init(|| (Allocator::default(), String::new()), check)
+                .flatten()
+                .collect()
+        })
+    } else {
+        let mut state = (Allocator::default(), String::new());
+        candidates
+            .iter()
+            .filter_map(|c| check(&mut state, c))
+            .collect()
+    };
     project.roots.extend(ambient);
 }
 
 pub fn discover_extra_tooling_configs(project: &mut Project) {
-    let existing: BTreeSet<String> = project
+    let existing: FxHashSet<&str> = project
         .roots
         .iter()
         .filter(|r| r.role == Role::Tooling)
-        .map(|r| r.file.clone())
+        .map(|r| r.file.as_str())
         .collect();
     let extra: Vec<String> = project
         .graph
         .paths
         .iter()
         .filter(|p| {
-            !existing.contains(*p)
+            !existing.contains(p.as_str())
                 && Path::new(p)
                     .file_name()
                     .and_then(|s| s.to_str())
