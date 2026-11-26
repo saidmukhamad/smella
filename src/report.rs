@@ -1,6 +1,6 @@
 use oxc_allocator::Allocator;
 use rayon::prelude::*;
-use std::{path::Path, sync::OnceLock};
+use std::path::Path;
 
 use crate::evidence::Evidence;
 use serde::{Serialize, Serializer};
@@ -166,7 +166,10 @@ pub struct Report {
 
 impl Report {
     pub fn build(root: &Path, config: Config) -> Result<Self, String> {
+        let profile = std::env::var_os("SMELLA_PROFILE").is_some();
+        let t_start = std::time::Instant::now();
         let mut project = Project::open(root, config)?;
+        let t_open = std::time::Instant::now();
         let file_count = project.graph.paths.len();
         let mut roles = vec![0u8; file_count];
         let mut entry_exports_used = vec![false; file_count];
@@ -177,8 +180,6 @@ impl Report {
                 entry_exports_used[file] = true;
             }
         }
-        // Reuse workers across concurrent snapshots, and arenas across files.
-        static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
         let read = |arena: &mut Allocator, file| {
             summarize(
                 &project,
@@ -187,18 +188,9 @@ impl Report {
                 arena,
             )
         };
-        let pool = (file_count >= 32)
-            .then(|| {
-                POOL.get_or_init(|| {
-                    let threads = std::thread::available_parallelism().ok()?.get().min(4);
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(threads)
-                        .build()
-                        .ok()
-                })
-            })
-            .and_then(Option::as_ref);
-        let summaries: Vec<_> = if let Some(pool) = pool {
+        let summaries: Vec<_> = if file_count >= 32
+            && let Some(pool) = crate::io::pool()
+        {
             pool.install(|| {
                 (0..file_count)
                     .into_par_iter()
@@ -209,6 +201,8 @@ impl Report {
             let mut arena = Allocator::default();
             (0..file_count).map(|file| read(&mut arena, file)).collect()
         };
+        project.sources = Vec::new();
+        let t_extract = std::time::Instant::now();
         let usable = summaries
             .iter()
             .enumerate()
@@ -259,9 +253,13 @@ impl Report {
             ));
         }
         let multi_workspace = project.is_multi_workspace();
+        let t_append = std::time::Instant::now();
         project.graph.link();
+        let t_link = std::time::Instant::now();
         let reach = Reach::compute(&project.graph, &project.roots);
+        let t_reach = std::time::Instant::now();
         let dependencies = analyze_dependencies(&project, &reach, &package_refs);
+        let t_deps = std::time::Instant::now();
         let mut graph = project.graph;
         let mut workspace_gaps = Vec::new();
         let evidence = Evidence::build(
@@ -271,6 +269,7 @@ impl Report {
             &project.workspace_for_file,
             &mut workspace_gaps,
         );
+        let t_evidence = std::time::Instant::now();
         let mut gaps = reach.gaps(
             &graph,
             |id| evidence.gap_for(id).is_some(),
@@ -278,6 +277,7 @@ impl Report {
             multi_workspace,
         );
         gaps.append(&mut workspace_gaps);
+        let t_gaps = std::time::Instant::now();
         let mut exported = vec![false; graph.nodes.len()];
         for e in graph.modules.iter().flat_map(|m| m.exports.values()) {
             exported[e.binding] = true;
@@ -437,6 +437,26 @@ impl Report {
         }
         graph.modules = Vec::new();
         graph.gaps = Vec::new();
+        if profile {
+            let t_end = std::time::Instant::now();
+            let ms = |a: std::time::Instant, b: std::time::Instant| {
+                b.duration_since(a).as_secs_f64() * 1000.0
+            };
+            eprintln!(
+                "[profile] files={file_count} nodes={} total={:.2}ms | open={:.2}ms extract={:.2}ms append={:.2}ms link={:.2}ms reach={:.2}ms deps={:.2}ms evidence={:.2}ms gaps={:.2}ms finalize={:.2}ms",
+                graph.nodes.len(),
+                ms(t_start, t_end),
+                ms(t_start, t_open),
+                ms(t_open, t_extract),
+                ms(t_extract, t_append),
+                ms(t_append, t_link),
+                ms(t_link, t_reach),
+                ms(t_reach, t_deps),
+                ms(t_deps, t_evidence),
+                ms(t_evidence, t_gaps),
+                ms(t_gaps, t_end),
+            );
+        }
         Ok(Self {
             graph,
             reach,

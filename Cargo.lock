@@ -430,6 +430,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "878c26bc5e45fe089ce2ca25689260c152a87ce1d7de2ca86101efeea6973932"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1203,7 +1214,9 @@ version = "0.1.0"
 dependencies = [
  "globset",
  "ignore",
+ "io-uring",
  "json-strip-comments",
+ "libc",
  "napi",
  "napi-build",
  "napi-derive",
@@ -1216,6 +1229,7 @@ dependencies = [
  "oxc_span",
  "oxc_syntax",
  "rayon",
+ "rustc-hash",
  "serde",
  "serde_json",
  "serde_yaml_ng",

@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
 use std::path::Path;
 
 use oxc_allocator::Allocator;
@@ -1293,10 +1292,10 @@ pub fn summarize(
 fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_file: bool) -> bool {
     let file = out.file;
     let path = project.root.join(&project.graph.paths[file]);
-    let source = match fs::read_to_string(&path) {
+    let source = match project.source_text(file) {
         Ok(text) => text,
         Err(e) => {
-            out.gap("read-error", None, e.to_string(), None, None);
+            out.gap("read-error", None, e.to_owned(), None, None);
             return false;
         }
     };
@@ -1306,7 +1305,7 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
     if path.extension().is_some_and(|ext| ext == "js") {
         source_type = source_type.with_jsx(true);
     }
-    let mut parsed = Parser::new(arena, &source, source_type).parse();
+    let mut parsed = Parser::new(arena, source, source_type).parse();
     let declaration_file = parsed.program.source_type.is_typescript_definition();
     if declaration_file {
         parsed.program.source_type = parsed.program.source_type.with_typescript(true);
@@ -1334,7 +1333,7 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
     if parsed.panicked {
         return false;
     }
-    extract_inline_suppressions(&source, &parsed.program, out);
+    extract_inline_suppressions(source, &parsed.program, out);
     let sem = built.semantic;
     let nodes = sem.nodes();
     let scoping = sem.scoping();

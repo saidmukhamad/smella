@@ -5,10 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use globset::{GlobBuilder, GlobMatcher};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use oxc_resolver::{
     ResolveError, ResolveOptions, Resolver, TsconfigDiscovery, TsconfigOptions, TsconfigReferences,
 };
+use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -130,6 +131,7 @@ pub struct Project {
     pub root: PathBuf,
     pub roots: Vec<Root>,
     pub graph: Graph,
+    pub sources: Vec<Result<String, String>>,
     pub excluded: Vec<String>,
     resolvers: Vec<[Resolver; 2]>,
     file_profile: Vec<usize>,
@@ -215,6 +217,17 @@ impl Project {
         let excluded_dirs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let excluded_dirs_cb = Arc::clone(&excluded_dirs);
         let root_cb = root.clone();
+        let subdir_count = fs::read_dir(&root)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_type().is_ok_and(|ft| ft.is_dir())
+                            && !SKIP.contains(&e.file_name().to_string_lossy().as_ref())
+                    })
+                    .take(4)
+                    .count()
+            })
+            .unwrap_or(0);
         let mut builder = WalkBuilder::new(&root);
         builder
             .hidden(false)
@@ -225,7 +238,6 @@ impl Project {
             .ignore(false)
             .require_git(in_git_repo)
             .parents(in_git_repo)
-            .sort_by_file_name(|a, b| a.cmp(b))
             .filter_entry(move |entry| {
                 if entry.depth() == 0 {
                     return true;
@@ -252,77 +264,229 @@ impl Project {
                 }
                 true
             });
-        for entry in builder.build() {
-            let entry = entry.map_err(|e| format!("Cannot enumerate source scope: {e}"))?;
-            if entry.depth() == 0 || !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                continue;
+        if subdir_count >= 2 {
+            let walk_threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+            builder.threads(walk_threads);
+            #[derive(Default)]
+            struct WalkBatch {
+                paths: Vec<String>,
+                excluded: Vec<String>,
+                nx_dirs: Vec<PathBuf>,
+                tsconfig_files: Vec<PathBuf>,
+                bundler_configs: Vec<PathBuf>,
+                config_dirs: Vec<PathBuf>,
+                manifests: Vec<PathBuf>,
+                include_matched: Vec<bool>,
+                exclude_matched: Vec<bool>,
+                err: Option<String>,
             }
-            let file = entry
-                .path()
-                .strip_prefix(&root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            let name = entry.file_name().to_string_lossy();
-            if nx_enabled && name == "project.json" {
-                nx_dirs.insert(Path::new(&file).parent().unwrap().to_owned());
-            }
-            if name.starts_with("tsconfig") && name.ends_with(".json") {
-                tsconfig_files.push(PathBuf::from(&file));
-            }
-            if name.starts_with("tsdown.config.")
-                && entry
-                    .path()
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| EXTENSIONS.contains(&e))
-            {
-                bundler_configs.push(PathBuf::from(&file));
-            }
-            if name == "tsconfig.json" {
-                config_dirs.insert(
-                    entry
-                        .path()
-                        .parent()
-                        .unwrap()
-                        .strip_prefix(&root)
-                        .unwrap()
-                        .to_owned(),
-                    0usize,
-                );
-            }
-            if name == "package.json" {
-                manifests.push(entry.path().to_owned());
-            }
-            if !EXTENSIONS.contains(
-                &entry
-                    .path()
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or(""),
-            ) {
-                continue;
-            }
-            let mut inc_ok = include.is_none();
-            if let Some(inc) = include.as_ref() {
-                for (idx, p) in inc.iter().enumerate() {
-                    if p.is_match(&file) {
-                        include_matched[idx] = true;
-                        inc_ok = true;
+            let merged = Mutex::new(Vec::<WalkBatch>::new());
+            let include_ref = &include;
+            let exclude_ref = &exclude;
+            let root_ref = &root;
+            let inc_len = include_matched.len();
+            let exc_len = exclude_matched.len();
+            builder.build_parallel().run(|| {
+                let local = WalkBatch {
+                    include_matched: vec![false; inc_len],
+                    exclude_matched: vec![false; exc_len],
+                    ..Default::default()
+                };
+                struct Flush<'a> {
+                    local: WalkBatch,
+                    merged: &'a Mutex<Vec<WalkBatch>>,
+                }
+                impl Drop for Flush<'_> {
+                    fn drop(&mut self) {
+                        self.merged
+                            .lock()
+                            .unwrap()
+                            .push(std::mem::take(&mut self.local));
                     }
                 }
-            }
-            let mut exc_hit = false;
-            for (idx, p) in exclude.iter().enumerate() {
-                if p.is_match(&file) {
-                    exclude_matched[idx] = true;
-                    exc_hit = true;
+                let mut guard = Flush {
+                    local,
+                    merged: &merged,
+                };
+                Box::new(move |res| {
+                    let entry = match res {
+                        Ok(e) => e,
+                        Err(e) => {
+                            guard.local.err = Some(format!("Cannot enumerate source scope: {e}"));
+                            return WalkState::Quit;
+                        }
+                    };
+                    if entry.depth() == 0 || !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                        return WalkState::Continue;
+                    }
+                    let file = entry
+                        .path()
+                        .strip_prefix(root_ref)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let name = entry.file_name().to_string_lossy();
+                    if nx_enabled && name == "project.json" {
+                        guard
+                            .local
+                            .nx_dirs
+                            .push(Path::new(&file).parent().unwrap().to_owned());
+                    }
+                    if name.starts_with("tsconfig") && name.ends_with(".json") {
+                        guard.local.tsconfig_files.push(PathBuf::from(&file));
+                    }
+                    if name.starts_with("tsdown.config.")
+                        && entry
+                            .path()
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| EXTENSIONS.contains(&e))
+                    {
+                        guard.local.bundler_configs.push(PathBuf::from(&file));
+                    }
+                    if name == "tsconfig.json" {
+                        guard.local.config_dirs.push(
+                            entry
+                                .path()
+                                .parent()
+                                .unwrap()
+                                .strip_prefix(root_ref)
+                                .unwrap()
+                                .to_owned(),
+                        );
+                    }
+                    if name == "package.json" {
+                        guard.local.manifests.push(entry.path().to_owned());
+                    }
+                    if !EXTENSIONS.contains(
+                        &entry
+                            .path()
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or(""),
+                    ) {
+                        return WalkState::Continue;
+                    }
+                    let mut inc_ok = include_ref.is_none();
+                    if let Some(inc) = include_ref.as_ref() {
+                        for (idx, p) in inc.iter().enumerate() {
+                            if p.is_match(&file) {
+                                guard.local.include_matched[idx] = true;
+                                inc_ok = true;
+                            }
+                        }
+                    }
+                    let mut exc_hit = false;
+                    for (idx, p) in exclude_ref.iter().enumerate() {
+                        if p.is_match(&file) {
+                            guard.local.exclude_matched[idx] = true;
+                            exc_hit = true;
+                        }
+                    }
+                    if inc_ok && !exc_hit {
+                        guard.local.paths.push(file);
+                    } else {
+                        guard.local.excluded.push(file);
+                    }
+                    WalkState::Continue
+                })
+            });
+            for batch in merged.into_inner().unwrap() {
+                if let Some(err) = batch.err {
+                    return Err(err);
+                }
+                paths.extend(batch.paths);
+                excluded.extend(batch.excluded);
+                nx_dirs.extend(batch.nx_dirs);
+                tsconfig_files.extend(batch.tsconfig_files);
+                bundler_configs.extend(batch.bundler_configs);
+                for d in batch.config_dirs {
+                    config_dirs.insert(d, 0usize);
+                }
+                manifests.extend(batch.manifests);
+                for (i, h) in batch.include_matched.into_iter().enumerate() {
+                    include_matched[i] |= h;
+                }
+                for (i, h) in batch.exclude_matched.into_iter().enumerate() {
+                    exclude_matched[i] |= h;
                 }
             }
-            if inc_ok && !exc_hit {
-                paths.push(file);
-            } else {
-                excluded.push(file);
+            tsconfig_files.sort();
+            bundler_configs.sort();
+        } else {
+            builder.sort_by_file_name(|a, b| a.cmp(b));
+            for entry in builder.build() {
+                let entry = entry.map_err(|e| format!("Cannot enumerate source scope: {e}"))?;
+                if entry.depth() == 0 || !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    continue;
+                }
+                let file = entry
+                    .path()
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let name = entry.file_name().to_string_lossy();
+                if nx_enabled && name == "project.json" {
+                    nx_dirs.insert(Path::new(&file).parent().unwrap().to_owned());
+                }
+                if name.starts_with("tsconfig") && name.ends_with(".json") {
+                    tsconfig_files.push(PathBuf::from(&file));
+                }
+                if name.starts_with("tsdown.config.")
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| EXTENSIONS.contains(&e))
+                {
+                    bundler_configs.push(PathBuf::from(&file));
+                }
+                if name == "tsconfig.json" {
+                    config_dirs.insert(
+                        entry
+                            .path()
+                            .parent()
+                            .unwrap()
+                            .strip_prefix(&root)
+                            .unwrap()
+                            .to_owned(),
+                        0usize,
+                    );
+                }
+                if name == "package.json" {
+                    manifests.push(entry.path().to_owned());
+                }
+                if !EXTENSIONS.contains(
+                    &entry
+                        .path()
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or(""),
+                ) {
+                    continue;
+                }
+                let mut inc_ok = include.is_none();
+                if let Some(inc) = include.as_ref() {
+                    for (idx, p) in inc.iter().enumerate() {
+                        if p.is_match(&file) {
+                            include_matched[idx] = true;
+                            inc_ok = true;
+                        }
+                    }
+                }
+                let mut exc_hit = false;
+                for (idx, p) in exclude.iter().enumerate() {
+                    if p.is_match(&file) {
+                        exclude_matched[idx] = true;
+                        exc_hit = true;
+                    }
+                }
+                if inc_ok && !exc_hit {
+                    paths.push(file);
+                } else {
+                    excluded.push(file);
+                }
             }
         }
         for (idx, hit) in exclude_hits.iter().enumerate() {
@@ -332,9 +496,23 @@ impl Project {
         }
         excluded.extend(std::mem::take(&mut *excluded_dirs.lock().unwrap()));
         excluded.sort();
+        // Read and parse every package.json once in parallel.
+        manifests.sort_by_key(|p| (p.components().count(), p.clone()));
+        let raw_manifests = crate::io::read_bytes_batch(&manifests);
+        let mut parsed_manifests: FxHashMap<PathBuf, Result<Value, String>> =
+            FxHashMap::with_capacity_and_hasher(manifests.len(), Default::default());
+        for (path, bytes) in manifests.iter().zip(raw_manifests) {
+            let parsed = bytes
+                .map_err(|e| format!("{}: {e}", path.display()))
+                .and_then(|b| {
+                    serde_json::from_slice::<Value>(&b)
+                        .map_err(|e| format!("{}: {e}", path.display()))
+                });
+            parsed_manifests.insert(path.clone(), parsed);
+        }
         let mut non_js_bins = BTreeSet::new();
         for manifest_path in &manifests {
-            let Ok(pkg) = json(manifest_path) else {
+            let Some(Ok(pkg)) = parsed_manifests.get(manifest_path) else {
                 continue;
             };
             let Some(dir) = manifest_path
@@ -450,10 +628,10 @@ impl Project {
         let file_profile = closest_directories(&paths, &config_dirs);
 
         let root_manifest = root.join("package.json");
-        let manifest = if manifests.contains(&root_manifest) {
-            json(&root_manifest)?
-        } else {
-            Value::Null
+        let manifest = match parsed_manifests.remove(&root_manifest) {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => return Err(e),
+            None => Value::Null,
         };
         // A workspace member can in turn declare workspaces relative to itself.
         // Register parents first and let the closest member own a source file.
@@ -476,7 +654,6 @@ impl Project {
         let mut packages = vec![(PathBuf::new(), manifest)];
         let mut directories = BTreeMap::from([(PathBuf::new(), 0)]);
         let mut workspaces = BTreeMap::new();
-        manifests.sort_by_key(|p| (p.components().count(), p.clone()));
         for path in manifests.into_iter().filter(|p| p != &root_manifest) {
             let dir = path.parent().unwrap();
             let rel = dir.strip_prefix(&root).unwrap();
@@ -486,7 +663,10 @@ impl Project {
                     .is_some_and(|globs| globs.matches(rel.strip_prefix(a).unwrap()))
             });
             if member || nx_dirs.contains(rel) {
-                let package = json(&path)?;
+                let package = match parsed_manifests.remove(&path) {
+                    Some(res) => res?,
+                    None => json(&path)?,
+                };
                 if let Some(name) = package["name"].as_str() {
                     let non_empty = |k: &str| {
                         package[k]
@@ -620,9 +800,11 @@ impl Project {
                 });
             }
         }
+        let sources = crate::io::read_files(&root, &paths);
         let mut project = Self {
             root,
             graph: Graph::new(paths),
+            sources,
             excluded,
             workspaces,
             roots: vec![],
@@ -1102,6 +1284,13 @@ impl Project {
             .get(ws_id)
             .map(PathBuf::as_path)
             .unwrap_or_else(|| Path::new(""))
+    }
+
+    pub fn source_text(&self, file: Id) -> Result<&str, &str> {
+        self.sources
+            .get(file)
+            .map(|r| r.as_deref().map_err(String::as_str))
+            .unwrap_or(Err("Source not loaded"))
     }
 
     pub fn is_multi_workspace(&self) -> bool {
