@@ -1693,6 +1693,7 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                             file_ext_symbols.insert(sym);
                         }
                     }
+                    react.register_loader(sym, init, scoping);
                     let paths = resolve_arg_paths(
                         init,
                         scoping,
@@ -2439,7 +2440,7 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                                 Expression::FunctionExpression(f) => Some(&f.params),
                                 _ => None,
                             };
-                            match params.and_then(|ps| ps.items.first().filter(|_| ps.items.len() == 1)) {
+                            match params.and_then(|ps| ps.items.first()) {
                                 Some(param) => match &param.pattern.kind {
                                     BindingPatternKind::ObjectPattern(pat) => {
                                         object_pattern_keys(pat).map_or(NsUse::Escape, NsUse::Props)
@@ -2477,18 +2478,27 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                 }
             }
             AstKind::TSImportType(imp) => {
-                if let TSType::TSLiteralType(lit) = &imp.argument
-                    && let TSLiteral::StringLiteral(s) = &lit.literal
-                {
+                let literal_spec = match &imp.argument {
+                    TSType::TSLiteralType(lit) => match &lit.literal {
+                        TSLiteral::StringLiteral(s) => Some((s.value.as_str(), s.span)),
+                        TSLiteral::TemplateLiteral(t)
+                            if t.expressions.is_empty() && t.quasis.len() == 1 =>
+                        {
+                            t.quasis[0]
+                                .value
+                                .cooked
+                                .as_ref()
+                                .map(|c| (c.as_str(), t.span))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((spec, spec_span)) = literal_spec {
                     for from in owner.sources(file) {
-                        if let Some(to) = out.target_with_mode(
-                            project,
-                            s.value.as_str(),
-                            s.span,
-                            Some(from),
-                            true,
-                            false,
-                        ) {
+                        if let Some(to) =
+                            out.target_with_mode(project, spec, spec_span, Some(from), true, false)
+                        {
                             out.edge(from, to, true, loc);
                             if let Some(prop) = imp.qualifier.as_ref().and_then(leftmost_type_name)
                             {
@@ -2500,39 +2510,74 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                         }
                     }
                 } else {
-                    out.gap(
+                    out.gap_scoped(
                         "unsupported-syntax",
                         Some(loc),
                         "This TypeScript module construct requires additional resolution.".into(),
+                        Some(owner.binding),
                         None,
-                        None,
+                        Some(vec![out.path.clone()]),
                     );
                 }
             }
             AstKind::TSImportEqualsDeclaration(decl) => {
-                if let TSModuleReference::ExternalModuleReference(ext) = &decl.module_reference {
-                    let is_type = decl.import_kind.is_type();
-                    if let Some(to) = out.target_with_mode(
-                        project,
-                        ext.expression.value.as_str(),
-                        ext.expression.span,
-                        None,
-                        is_type,
-                        true,
-                    ) {
-                        out.edge(file, to, is_type, loc);
-                        if let Some(sym) = decl.id.symbol_id.get() {
-                            symbol_namespaces.insert(sym, (to, is_type, true));
+                let is_type = declaration_file || decl.import_kind.is_type();
+                match &decl.module_reference {
+                    TSModuleReference::ExternalModuleReference(ext) => {
+                        if let Some(to) = out.target_with_mode(
+                            project,
+                            ext.expression.value.as_str(),
+                            ext.expression.span,
+                            None,
+                            is_type,
+                            true,
+                        ) {
+                            out.edge(file, to, is_type, loc);
+                            if let Some(sym) = decl.id.symbol_id.get() {
+                                symbol_namespaces.insert(sym, (to, is_type, true));
+                            }
                         }
                     }
-                } else {
-                    out.gap(
-                        "unsupported-syntax",
-                        Some(loc),
-                        "This TypeScript module construct requires additional resolution.".into(),
-                        None,
-                        None,
-                    );
+                    other => {
+                        // Internal TypeScript namespace alias (`import X = Namespace.Member`).
+                        let (root_ident, member) = match other {
+                            TSModuleReference::IdentifierReference(id) => (Some(id.as_ref()), None),
+                            TSModuleReference::QualifiedName(q) => {
+                                let mut cur = q.as_ref();
+                                let mut prop = cur.right.name.as_str();
+                                let found = loop {
+                                    match &cur.left {
+                                        TSTypeName::IdentifierReference(id) => break id.as_ref(),
+                                        TSTypeName::QualifiedName(inner) => {
+                                            prop = inner.right.name.as_str();
+                                            cur = inner.as_ref();
+                                        }
+                                    }
+                                };
+                                (Some(found), Some(prop))
+                            }
+                            TSModuleReference::ExternalModuleReference(_) => unreachable!(),
+                        };
+                        if let Some(id) = root_ident
+                            && let Some(ref_id) = id.reference_id.get()
+                            && let Some(sym) = scoping.get_reference(ref_id).symbol_id()
+                        {
+                            if let Some(&(to, type_import, is_cjs)) = symbol_namespaces.get(&sym) {
+                                let eff_type = is_type || type_import;
+                                if let Some(prop) = member {
+                                    for from in owner.sources(file) {
+                                        out.link_member(from, to, prop, prop, eff_type, loc);
+                                    }
+                                } else if let Some(alias_sym) = decl.id.symbol_id.get() {
+                                    symbol_namespaces.insert(alias_sym, (to, eff_type, is_cjs));
+                                }
+                            } else if let Some(&target_binding) = bindings.get(&sym) {
+                                for from in owner.sources(file) {
+                                    out.edge(from, target_binding, is_type, loc);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             AstKind::TSExportAssignment(exp) => {

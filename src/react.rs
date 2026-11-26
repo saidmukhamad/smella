@@ -35,6 +35,7 @@ impl Api {
 #[derive(Default)]
 pub struct ReactCalls<'a> {
     imports: HashMap<SymbolId, Api>,
+    loaders: HashMap<SymbolId, (u32, &'a str)>,
     initializers: HashSet<u32>,
     deferred: HashSet<u32>,
     members: HashMap<u32, &'a str>,
@@ -63,9 +64,16 @@ fn returned<'a>(callback: &'a Expression<'a>) -> Option<&'a Expression<'a>> {
 }
 
 fn lazy_member<'a>(loader: &'a Expression<'a>, scoping: &Scoping) -> Option<(u32, &'a str)> {
-    let value = returned(loader)?;
+    let mut value = returned(loader)?;
     if let Expression::ImportExpression(import) = value {
         return Some((import.span.start, "default"));
+    }
+    // Unwrap trailing `.catch(...)` / `.finally(...)` chained after `.then(...)`.
+    while let Expression::CallExpression(call) = value
+        && let Expression::StaticMemberExpression(method) = call.callee.get_inner_expression()
+        && matches!(method.property.name.as_str(), "catch" | "finally")
+    {
+        value = method.object.get_inner_expression();
     }
     // import("./ui").then(m => ({ default: m.Panel }))
     let Expression::CallExpression(then) = value else {
@@ -77,16 +85,17 @@ fn lazy_member<'a>(loader: &'a Expression<'a>, scoping: &Scoping) -> Option<(u32
     let Expression::ImportExpression(import) = method.object.get_inner_expression() else {
         return None;
     };
-    let [adapter] = &then.arguments[..] else {
-        return None;
+    let adapter = then
+        .arguments
+        .first()?
+        .as_expression()?
+        .get_inner_expression();
+    let params = match adapter {
+        Expression::ArrowFunctionExpression(arrow) => &arrow.params,
+        Expression::FunctionExpression(func) => &func.params,
+        _ => return None,
     };
-    let adapter = adapter.as_expression()?.get_inner_expression();
-    let Expression::ArrowFunctionExpression(arrow) = adapter else {
-        return None;
-    };
-    let [param] = &arrow.params.items[..] else {
-        return None;
-    };
+    let param = params.items.first()?;
     let Expression::ObjectExpression(object) = returned(adapter)? else {
         return None;
     };
@@ -148,15 +157,16 @@ impl<'a> ReactCalls<'a> {
     }
 
     pub fn initializer(&mut self, call: &CallExpression<'_>) {
-        if !self.imports.is_empty() {
-            self.initializers.insert(call.span.start);
+        self.initializers.insert(call.span.start);
+    }
+
+    pub fn register_loader(&mut self, sym: SymbolId, expr: &'a Expression<'a>, scoping: &Scoping) {
+        if let Some(pair) = lazy_member(expr, scoping) {
+            self.loaders.insert(sym, pair);
         }
     }
 
     pub fn observe(&mut self, call: &'a CallExpression<'a>, scoping: &Scoping) {
-        if self.imports.is_empty() {
-            return;
-        }
         let api = match call.callee.get_inner_expression() {
             Expression::Identifier(id) => {
                 symbol(scoping, id).and_then(|s| self.imports.get(&s).copied())
@@ -165,7 +175,11 @@ impl<'a> ReactCalls<'a> {
                 let Expression::Identifier(id) = member.object.get_inner_expression() else {
                     return;
                 };
-                if symbol(scoping, id).and_then(|s| self.imports.get(&s)) != Some(&Api::Namespace) {
+                let is_react_ns = match symbol(scoping, id) {
+                    Some(s) => self.imports.get(&s) == Some(&Api::Namespace),
+                    None => id.name == "React",
+                };
+                if !is_react_ns {
                     return;
                 }
                 Api::named(member.property.name.as_str())
@@ -177,9 +191,14 @@ impl<'a> ReactCalls<'a> {
         };
         if let Some(callback) = call.arguments.first().and_then(|arg| arg.as_expression())
             && api == Api::Lazy
-            && let Some((pos, member)) = lazy_member(callback, scoping)
         {
-            self.members.insert(pos, member);
+            if let Some((pos, member)) = lazy_member(callback, scoping) {
+                self.members.insert(pos, member);
+            } else if let Expression::Identifier(id) = callback.get_inner_expression()
+                && let Some(&(pos, member)) = symbol(scoping, id).and_then(|s| self.loaders.get(&s))
+            {
+                self.members.insert(pos, member);
+            }
         }
         if self.initializers.remove(&call.span.start) {
             if api == Api::Memo

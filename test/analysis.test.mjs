@@ -1413,3 +1413,34 @@ test('git-ignored build outputs are skipped while workspace source mapping still
   assert.deepEqual(subject(r, 'packages/core/src/index.ts', 'greet').usage.value, ['runtime']);
   assert.deepEqual(r.findings(), []);
 });
+
+test('declaration namespace import aliases, export assignments, and global or helper React.lazy resolve without global gaps', async t => {
+  const root = await fixture(t, {
+    'package.json': JSON.stringify({ name: 'dts-lazy-demo', type: 'module', bin: { app: './src/app.tsx' } }),
+    'src/types.d.ts': [
+      'declare namespace InternalUI {',
+      '  export interface ModalProps { open: boolean; }',
+      '}',
+      'import ModalProps = InternalUI.ModalProps;',
+      'declare class Modal { props: ModalProps; }',
+      'export = Modal;',
+    ].join('\n'),
+    'src/ambient.d.ts': 'declare module "virtual:widget" { export const ready: boolean; }',
+    'src/panel.tsx': 'export function SettingsPanel() { return null; }',
+    'src/modal.tsx': 'export default function ModalView() { return null; }',
+    'src/app.tsx': [
+      'import type Modal from "./types";',
+      'const loadPanel = () => import("./panel").then(m => ({ default: m.SettingsPanel })).catch(() => ({ default: () => null }));',
+      'const LazyPanel = React.lazy(loadPanel);',
+      'const LazyModal = React.lazy(() => import("./modal"));',
+      'export function App(m: Modal) { return [m, <LazyPanel />, <LazyModal />]; }',
+      'App({} as Modal);',
+    ].join('\n'),
+  });
+  const r = await inspect(t, root);
+  assert.equal(r.coverage.status, 'complete');
+  assert.equal(r.coverage.gaps.length, 0);
+  assert.deepEqual(subject(r, 'src/panel.tsx', 'SettingsPanel').usage.value, ['runtime']);
+  assert.deepEqual(subject(r, 'src/modal.tsx', 'default').usage.value, ['runtime']);
+  assert.deepEqual(r.findings(), []);
+});
