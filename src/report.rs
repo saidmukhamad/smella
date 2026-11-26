@@ -1,6 +1,6 @@
 use oxc_allocator::Allocator;
 use rayon::prelude::*;
-use std::{path::Path, sync::OnceLock};
+use std::path::Path;
 
 use crate::evidence::Evidence;
 use serde::{Serialize, Serializer};
@@ -38,10 +38,33 @@ struct Subject {
     kind: Option<&'static str>,
 }
 
+struct SubjectId(usize);
+
+impl Serialize for SubjectId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut buf = [0u8; 24];
+        let mut n = self.0;
+        let mut pos = buf.len();
+        loop {
+            pos -= 1;
+            buf[pos] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        pos -= 1;
+        buf[pos] = b's';
+        // SAFETY: buf[pos..] contains only ASCII 's' and '0'..='9'.
+        let s = std::str::from_utf8(&buf[pos..]).expect("ASCII subject id");
+        serializer.serialize_str(s)
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Record<'a> {
-    id: String,
+    id: SubjectId,
     kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_gap: Option<&'a str>,
@@ -125,23 +148,23 @@ fn is_test_support_file(path: &str, is_test_root: bool) -> bool {
     if parts.any(|dir| TEST_SUPPORT_DIRS.contains(&dir)) {
         return true;
     }
-    let lower = file_name.to_ascii_lowercase();
-    TEST_SUPPORT_MARKERS.iter().any(|m| lower.contains(m))
-        || TEST_SETUP_PREFIXES.iter().any(|p| lower.starts_with(p))
+    if file_name.bytes().any(|b| b.is_ascii_uppercase()) {
+        let lower = file_name.to_ascii_lowercase();
+        TEST_SUPPORT_MARKERS.iter().any(|m| lower.contains(m))
+            || TEST_SETUP_PREFIXES.iter().any(|p| lower.starts_with(p))
+    } else {
+        TEST_SUPPORT_MARKERS.iter().any(|m| file_name.contains(m))
+            || TEST_SETUP_PREFIXES.iter().any(|p| file_name.starts_with(p))
+    }
 }
 
-fn classification(lanes: &[Option<Visit>; 8]) -> Option<&'static str> {
-    let used = |role: Role| {
-        lanes[role as usize * 2..role as usize * 2 + 2]
-            .iter()
-            .any(Option::is_some)
-    };
-    match (
-        used(Role::Runtime),
-        used(Role::Test),
-        used(Role::Tooling),
-        used(Role::Public),
-    ) {
+#[inline]
+fn classification(mask: u8) -> Option<&'static str> {
+    let runtime = (mask & 0b0000_0011) != 0;
+    let test = (mask & 0b0000_1100) != 0;
+    let tooling = (mask & 0b0011_0000) != 0;
+    let public = (mask & 0b1100_0000) != 0;
+    match (runtime, test, tooling, public) {
         (false, false, false, false) => Some("unused-export"),
         (false, true, false, false) => Some("test-only-export"),
         (false, false, true, false) => Some("tooling-only-export"),
@@ -166,7 +189,10 @@ pub struct Report {
 
 impl Report {
     pub fn build(root: &Path, config: Config) -> Result<Self, String> {
+        let profile = std::env::var_os("SMELLA_PROFILE").is_some();
+        let t_start = std::time::Instant::now();
         let mut project = Project::open(root, config)?;
+        let t_open = std::time::Instant::now();
         let file_count = project.graph.paths.len();
         let mut roles = vec![0u8; file_count];
         let mut entry_exports_used = vec![false; file_count];
@@ -177,43 +203,70 @@ impl Report {
                 entry_exports_used[file] = true;
             }
         }
-        // Reuse workers across concurrent snapshots, and arenas across files.
-        static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-        let read = |arena: &mut Allocator, file| {
+        let read = |(arena, buf): &mut (Allocator, Vec<u8>), file| {
             summarize(
                 &project,
                 file,
                 roles[file] & !(1 << Role::Public as usize) != 0,
                 arena,
+                buf,
             )
         };
-        let pool = (file_count >= 32)
-            .then(|| {
-                POOL.get_or_init(|| {
-                    let threads = std::thread::available_parallelism().ok()?.get().min(4);
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(threads)
-                        .build()
-                        .ok()
-                })
-            })
-            .and_then(Option::as_ref);
-        let summaries: Vec<_> = if let Some(pool) = pool {
+        let mut summaries: Vec<_> = if file_count >= 32
+            && let Some(pool) = crate::io::pool()
+        {
             pool.install(|| {
                 (0..file_count)
                     .into_par_iter()
-                    .map_init(Allocator::default, read)
+                    .map_init(
+                        || (Allocator::default(), Vec::with_capacity(16 * 1024)),
+                        read,
+                    )
                     .collect()
             })
         } else {
-            let mut arena = Allocator::default();
-            (0..file_count).map(|file| read(&mut arena, file)).collect()
+            let mut state = (Allocator::default(), Vec::with_capacity(16 * 1024));
+            (0..file_count).map(|file| read(&mut state, file)).collect()
         };
+        project.sources = Vec::new();
+        let t_extract = std::time::Instant::now();
         let usable = summaries
             .iter()
             .enumerate()
             .any(|(file, summary)| roles[file] != 0 && summary.parsed);
-        let mut package_refs = Vec::new();
+        let mut node_offsets = Vec::with_capacity(file_count);
+        let mut extra_nodes = 0usize;
+        let mut total_edges = 0usize;
+        let mut total_links = 0usize;
+        let mut total_gaps = 0usize;
+        let mut total_pkg_refs = 0usize;
+        for summary in &summaries {
+            node_offsets.push(extra_nodes);
+            extra_nodes += summary.node_count();
+            total_edges += summary.edge_count();
+            total_links += summary.link_count();
+            total_gaps += summary.gap_count();
+            total_pkg_refs += summary.package_refs.len();
+        }
+        if extra_nodes >= 10_000
+            && let Some(pool) = crate::io::pool()
+        {
+            pool.install(|| {
+                summaries
+                    .par_iter_mut()
+                    .zip(node_offsets.par_iter())
+                    .for_each(|(summary, &offset)| summary.relocate(offset));
+            });
+        } else {
+            for (summary, &offset) in summaries.iter_mut().zip(&node_offsets) {
+                summary.relocate(offset);
+            }
+        }
+        project.graph.nodes.reserve_exact(extra_nodes);
+        project.graph.pending_edges.reserve_exact(total_edges);
+        project.graph.links.reserve_exact(total_links);
+        project.graph.gaps.reserve_exact(total_gaps);
+        let mut package_refs = Vec::with_capacity(total_pkg_refs);
         let mut inline_suppressions = Vec::new();
         let mut stale_config = std::mem::take(&mut project.stale_config);
         let mut dynamic_import_files_used = std::collections::BTreeSet::new();
@@ -224,7 +277,7 @@ impl Report {
             package_refs.append(&mut summary.package_refs);
             inline_suppressions.append(&mut summary.inline_suppressions);
             stale_config.append(&mut summary.invalid_suppressions);
-            summary.append(&mut project.graph);
+            summary.move_into(&mut project.graph);
         }
         for file_key in project.dynamic_imports.keys() {
             if !dynamic_import_files_used.contains(file_key) {
@@ -259,9 +312,13 @@ impl Report {
             ));
         }
         let multi_workspace = project.is_multi_workspace();
+        let t_append = std::time::Instant::now();
         project.graph.link();
+        let t_link = std::time::Instant::now();
         let reach = Reach::compute(&project.graph, &project.roots);
+        let t_reach = std::time::Instant::now();
         let dependencies = analyze_dependencies(&project, &reach, &package_refs);
+        let t_deps = std::time::Instant::now();
         let mut graph = project.graph;
         let mut workspace_gaps = Vec::new();
         let evidence = Evidence::build(
@@ -271,6 +328,7 @@ impl Report {
             &project.workspace_for_file,
             &mut workspace_gaps,
         );
+        let t_evidence = std::time::Instant::now();
         let mut gaps = reach.gaps(
             &graph,
             |id| evidence.gap_for(id).is_some(),
@@ -278,24 +336,43 @@ impl Report {
             multi_workspace,
         );
         gaps.append(&mut workspace_gaps);
+        let t_gaps = std::time::Instant::now();
         let mut exported = vec![false; graph.nodes.len()];
-        for e in graph.modules.iter().flat_map(|m| m.exports.values()) {
-            exported[e.binding] = true;
-        }
-        let mut private = vec![vec![]; file_count];
-        for (id, n) in graph.nodes.iter().enumerate() {
-            if n.kind == "binding" && !exported[id] {
-                private[n.file].push(id);
+        let mut export_count = 0usize;
+        for m in &graph.modules {
+            export_count += m.exports.len();
+            for e in m.exports.values() {
+                exported[e.binding] = true;
             }
         }
-        let mut subjects = vec![];
+        let mut private_offsets = vec![0u32; file_count + 1];
+        for (id, n) in graph.nodes.iter().enumerate() {
+            if n.kind == "binding" && !exported[id] {
+                private_offsets[n.file + 1] += 1;
+            }
+        }
+        for i in 1..=file_count {
+            private_offsets[i] += private_offsets[i - 1];
+        }
+        let private_count = private_offsets[file_count] as usize;
+        let mut private_cursor = private_offsets[..file_count].to_vec();
+        let mut private_ids = vec![0u32; private_count];
+        for (id, n) in graph.nodes.iter().enumerate() {
+            if n.kind == "binding" && !exported[id] {
+                let slot = private_cursor[n.file] as usize;
+                private_ids[slot] = id as u32;
+                private_cursor[n.file] += 1;
+            }
+        }
+        drop(exported);
+        drop(private_cursor);
+        let mut subjects = Vec::with_capacity(file_count + export_count + private_count);
         for (file, module) in graph.modules.iter().enumerate() {
             let test_support = is_test_support_file(
                 &graph.paths[file],
                 roles[file] & (1 << Role::Test as usize) != 0,
             );
-            let kind =
-                (!reach.visited[file].iter().any(Option::is_some)).then_some("unreferenced-module");
+            let kind = (!reach.any(file)).then_some("unreferenced-module");
             subjects.push(Subject {
                 file,
                 surface: file,
@@ -307,7 +384,7 @@ impl Report {
                 let kind = if entry_exports_used[file] {
                     None
                 } else {
-                    match classification(&reach.visited[e.binding]) {
+                    match classification(reach.mask(e.binding)) {
                         Some("test-only-export") if test_support => None,
                         other => other,
                     }
@@ -320,10 +397,19 @@ impl Report {
                     kind,
                 });
             }
-            private[file].sort_by(|&a, &b| graph.nodes[a].name.cmp(&graph.nodes[b].name));
-            for &binding in &private[file] {
+            let p_start = private_offsets[file] as usize;
+            let p_end = private_offsets[file + 1] as usize;
+            if p_end - p_start > 1 {
+                private_ids[p_start..p_end].sort_by(|&a, &b| {
+                    graph.nodes[a as usize]
+                        .name
+                        .cmp(&graph.nodes[b as usize].name)
+                });
+            }
+            for &binding_u32 in &private_ids[p_start..p_end] {
+                let binding = binding_u32 as usize;
                 let test_only = !test_support
-                    && classification(&reach.visited[binding]) == Some("test-only-export");
+                    && classification(reach.mask(binding)) == Some("test-only-export");
                 subjects.push(Subject {
                     file,
                     surface: binding,
@@ -335,62 +421,78 @@ impl Report {
         }
         // Apply per-symbol suppressions (config + JSDoc) and detect stale suppressions.
         let mut config_supp_used = vec![false; project.suppressions.len()];
-        let mut config_supp_map: std::collections::HashMap<(String, String), usize> =
-            std::collections::HashMap::new();
+        let mut config_supp_map: rustc_hash::FxHashMap<(String, String), usize> =
+            rustc_hash::FxHashMap::default();
         for (idx, rule) in project.suppressions.iter().enumerate() {
             let file_norm = rule.file.trim().trim_start_matches("./").replace('\\', "/");
             config_supp_map.insert((file_norm, rule.symbol.trim().to_owned()), idx);
         }
         let mut inline_supp_used = vec![false; inline_suppressions.len()];
-        let mut inline_supp_map: std::collections::HashMap<(Id, String), usize> =
-            std::collections::HashMap::new();
+        let mut inline_supp_map: rustc_hash::FxHashMap<(Id, String), usize> =
+            rustc_hash::FxHashMap::default();
         for (idx, s) in inline_suppressions.iter().enumerate() {
             inline_supp_map.insert((s.file, s.symbol.clone()), idx);
         }
         let mut suppressed = Vec::new();
-        for subj in &mut subjects {
-            if subj.form == Form::Module {
-                continue;
-            }
-            let Some(kind) = subj.kind else {
-                continue;
-            };
-            let file_path = &graph.paths[subj.file];
-            let sym_name = &graph.nodes[subj.surface].name;
-            let ws_id = project
-                .workspace_for_file
-                .get(subj.file)
-                .copied()
-                .unwrap_or(0);
-            let workspace = project
-                .workspace_infos
-                .get(ws_id)
-                .map_or(".", |w| w.dir.as_str())
-                .to_owned();
-            if let Some(&idx) = inline_supp_map.get(&(subj.file, sym_name.clone())) {
-                inline_supp_used[idx] = true;
-                suppressed.push(SuppressedFinding {
-                    workspace,
-                    file: file_path.clone(),
-                    symbol: sym_name.clone(),
-                    kind,
-                    reason: inline_suppressions[idx].reason.clone(),
-                    source: "jsdoc",
-                    location: graph.nodes[subj.surface].loc,
-                });
-                subj.kind = None;
-            } else if let Some(&idx) = config_supp_map.get(&(file_path.clone(), sym_name.clone())) {
-                config_supp_used[idx] = true;
-                suppressed.push(SuppressedFinding {
-                    workspace,
-                    file: file_path.clone(),
-                    symbol: sym_name.clone(),
-                    kind,
-                    reason: project.suppressions[idx].reason.trim().to_owned(),
-                    source: "config",
-                    location: graph.nodes[subj.surface].loc,
-                });
-                subj.kind = None;
+        if !inline_supp_map.is_empty() || !config_supp_map.is_empty() {
+            for subj in &mut subjects {
+                if subj.form == Form::Module {
+                    continue;
+                }
+                let Some(kind) = subj.kind else {
+                    continue;
+                };
+                let sym_name = &graph.nodes[subj.surface].name;
+                if !inline_supp_map.is_empty()
+                    && let Some(&idx) = inline_supp_map.get(&(subj.file, sym_name.clone()))
+                {
+                    let ws_id = project
+                        .workspace_for_file
+                        .get(subj.file)
+                        .copied()
+                        .unwrap_or(0);
+                    let workspace = project
+                        .workspace_infos
+                        .get(ws_id)
+                        .map_or(".", |w| w.dir.as_str())
+                        .to_owned();
+                    inline_supp_used[idx] = true;
+                    suppressed.push(SuppressedFinding {
+                        workspace,
+                        file: graph.paths[subj.file].clone(),
+                        symbol: sym_name.clone(),
+                        kind,
+                        reason: inline_suppressions[idx].reason.clone(),
+                        source: "jsdoc",
+                        location: graph.nodes[subj.surface].loc,
+                    });
+                    subj.kind = None;
+                } else if !config_supp_map.is_empty()
+                    && let Some(&idx) =
+                        config_supp_map.get(&(graph.paths[subj.file].clone(), sym_name.clone()))
+                {
+                    let ws_id = project
+                        .workspace_for_file
+                        .get(subj.file)
+                        .copied()
+                        .unwrap_or(0);
+                    let workspace = project
+                        .workspace_infos
+                        .get(ws_id)
+                        .map_or(".", |w| w.dir.as_str())
+                        .to_owned();
+                    config_supp_used[idx] = true;
+                    suppressed.push(SuppressedFinding {
+                        workspace,
+                        file: graph.paths[subj.file].clone(),
+                        symbol: sym_name.clone(),
+                        kind,
+                        reason: project.suppressions[idx].reason.trim().to_owned(),
+                        source: "config",
+                        location: graph.nodes[subj.surface].loc,
+                    });
+                    subj.kind = None;
+                }
             }
         }
         for (rule, used) in project.suppressions.iter().zip(config_supp_used) {
@@ -432,11 +534,34 @@ impl Report {
         });
         // Queries need the predecessor forest and source labels. Drop build-time
         // adjacency lists and module tables before handing the snapshot to JS.
-        for node in &mut graph.nodes {
-            node.edges = Vec::new();
+        graph.clear_edges();
+        let modules = std::mem::take(&mut graph.modules);
+        if modules.len() >= 1024
+            && let Some(pool) = crate::io::pool()
+        {
+            pool.install(|| modules.into_par_iter().for_each(drop));
         }
-        graph.modules = Vec::new();
         graph.gaps = Vec::new();
+        if profile {
+            let t_end = std::time::Instant::now();
+            let ms = |a: std::time::Instant, b: std::time::Instant| {
+                b.duration_since(a).as_secs_f64() * 1000.0
+            };
+            eprintln!(
+                "[profile] files={file_count} nodes={} total={:.2}ms | open={:.2}ms extract={:.2}ms append={:.2}ms link={:.2}ms reach={:.2}ms deps={:.2}ms evidence={:.2}ms gaps={:.2}ms finalize={:.2}ms",
+                graph.nodes.len(),
+                ms(t_start, t_end),
+                ms(t_start, t_open),
+                ms(t_open, t_extract),
+                ms(t_extract, t_append),
+                ms(t_append, t_link),
+                ms(t_link, t_reach),
+                ms(t_reach, t_deps),
+                ms(t_deps, t_evidence),
+                ms(t_evidence, t_gaps),
+                ms(t_gaps, t_end),
+            );
+        }
         Ok(Self {
             graph,
             reach,
@@ -487,17 +612,26 @@ impl Report {
         })
     }
     fn record(&self, index: usize, s: &Subject) -> Record<'_> {
-        let visits = &self.reach.visited[s.binding];
-        let contexts = |lanes: &[Option<Visit>; 8], phase: usize| {
-            Contexts((0usize..3).fold(0, |mask, role| {
-                mask | (u8::from(lanes[2 * role + phase].is_some()) << role)
-            }))
+        let binding_mask = self.reach.mask(s.binding);
+        let file_mask = self.reach.mask(s.file);
+        let contexts = |mask: u8, phase: u8| {
+            let mut out = 0u8;
+            if (mask & (1u8 << phase)) != 0 {
+                out |= 1;
+            }
+            if (mask & (1u8 << (2 + phase))) != 0 {
+                out |= 2;
+            }
+            if (mask & (1u8 << (4 + phase))) != 0 {
+                out |= 4;
+            }
+            Contexts(out)
         };
         let node = &self.graph.nodes[s.surface];
         let ws_id = self.workspace_for_file.get(s.file).copied().unwrap_or(0);
         let workspace = self.workspaces.get(ws_id).map_or(".", |w| w.dir.as_str());
         Record {
-            id: format!("s{index}"),
+            id: SubjectId(index),
             workspace_gap: self.evidence.gap_for(s.binding),
             kind: s.kind,
             workspace,
@@ -509,23 +643,28 @@ impl Report {
                 value: if s.form == Form::Module {
                     Contexts(0)
                 } else {
-                    contexts(visits, 0)
+                    contexts(binding_mask, 0)
                 },
-                types: contexts(visits, 1),
-                contract: visits[6..].iter().any(Option::is_some),
-                evaluation: contexts(&self.reach.visited[s.file], 0),
+                types: contexts(binding_mask, 1),
+                contract: (binding_mask & 0b1100_0000) != 0,
+                evaluation: contexts(file_mask, 0),
             },
         }
     }
 
     pub fn findings(&self, kind: Option<&str>) -> Result<String, serde_json::Error> {
+        let count = self
+            .subjects
+            .iter()
+            .filter(|s| s.kind.is_some() && (kind.is_none() || s.kind == kind))
+            .count();
         let records = self
             .subjects
             .iter()
             .enumerate()
             .filter(|(_, s)| s.kind.is_some() && (kind.is_none() || s.kind == kind))
             .map(|(i, s)| self.record(i, s));
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(count.saturating_mul(220).max(256));
         serde_json::Serializer::new(&mut output).collect_seq(records)?;
         Ok(String::from_utf8(output).expect("JSON is UTF-8"))
     }
@@ -535,7 +674,7 @@ impl Report {
     fn witness(&self, mut id: Id, mut lane: usize) -> Value {
         let mut path = vec![];
         loop {
-            let visit = self.reach.visited[id][lane].unwrap();
+            let visit = self.reach.visit(id, lane).unwrap();
             let via = match visit {
                 Visit::Root => None,
                 Visit::From {
@@ -592,7 +731,7 @@ impl Report {
         for role in ROLES {
             for phase in 0..2 {
                 let lane = (role as usize) * 2 + phase;
-                if self.reach.visited[s.binding][lane].is_some() {
+                if self.reach.has(s.binding, lane) {
                     let fact = if role == Role::Public {
                         "contract"
                     } else if phase == 1 {
@@ -607,7 +746,7 @@ impl Report {
                 }
             }
             let lane = (role as usize) * 2;
-            if s.form != Form::Module && self.reach.visited[s.file][lane].is_some() {
+            if s.form != Form::Module && self.reach.has(s.file, lane) {
                 witnesses.push(
                     json!({"role":role,"fact":"evaluation","path":self.witness(s.file,lane)}),
                 );
@@ -625,7 +764,7 @@ impl Report {
             Some("unreferenced-module") => "No evaluation, type, or public-contract path from the effective roots.",
             Some("test-only-export" | "test-only-binding") => "Only test roots have known retaining references.",
             Some("tooling-only-export") => "Only tooling roots have known retaining references.",
-            None if self.reach.visited[s.binding].iter().all(Option::is_none) => "No effective root reaches this binding.",
+            None if !self.reach.any(s.binding) => "No effective root reaches this binding.",
             _ => "The effective roots retain this subject."
         }.into();
         Ok(result)

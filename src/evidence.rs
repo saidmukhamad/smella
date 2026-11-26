@@ -1,31 +1,34 @@
 //! Reverse reachability for questions about a single binding. Keep only states
 //! reached by tests or by a concrete read in an unrooted workspace consumer.
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
+use rustc_hash::FxHashMap;
 use serde_json::{Value, json};
 
-use crate::graph::{Gap, Graph, Id, Loc, Reach, Role};
+use crate::graph::{Gap, GapScope, Graph, Id, Loc, Reach, Role};
 
 #[derive(Clone, Copy, Default)]
 struct Step {
-    state: usize,
+    state: u32,
     loc: Loc,
 }
 
 #[derive(Default)]
 pub struct Evidence {
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     incoming: Vec<Step>,
     test_files: Vec<bool>,
-    reads: HashMap<usize, Vec<Step>>,
+    reads: FxHashMap<usize, Vec<Step>>,
     uncertain: Vec<bool>,
     gap_id: Option<String>,
 }
 
+#[inline]
 fn state(node: Id, phase: usize) -> usize {
     node * 2 + phase
 }
 
+#[inline]
 fn transitions(graph: &Graph, source: usize, mut visit: impl FnMut(usize, Loc)) {
     let id = source / 2;
     let phase = source % 2;
@@ -36,9 +39,9 @@ fn transitions(graph: &Graph, source: usize, mut visit: impl FnMut(usize, Loc)) 
         }
         visit(state(node.file, 1), node.loc);
     }
-    for edge in &node.edges {
+    for edge in graph.edges(id) {
         visit(
-            state(edge.target, phase | usize::from(edge.type_only)),
+            state(edge.target(), phase | usize::from(edge.type_only())),
             edge.loc,
         );
     }
@@ -47,29 +50,59 @@ fn transitions(graph: &Graph, source: usize, mut visit: impl FnMut(usize, Loc)) 
 // Follow forwarding edges so that a local barrel in front of a workspace
 // boundary has the same meaning as a direct cross-package import.
 fn crossing_imports(graph: &Graph, workspace: &[usize]) -> Vec<bool> {
-    let mut crossing = vec![false; graph.nodes.len()];
-    let mut incoming = vec![Vec::new(); graph.nodes.len()];
-    let mut queue = VecDeque::new();
+    let n = graph.nodes.len();
+    let mut crossing = vec![false; n];
+    let mut queue: Vec<u32> = Vec::new();
+    let mut in_offsets = vec![0u32; n + 1];
     for (id, node) in graph.nodes.iter().enumerate() {
         if !matches!(node.kind, "import" | "export" | "re-export") {
             continue;
         }
-        for edge in &node.edges {
-            if workspace[node.file] != workspace[graph.nodes[edge.target].file] {
+        let ws = workspace[node.file];
+        for edge in graph.edges(id) {
+            let target = edge.target();
+            if ws != workspace[graph.nodes[target].file] {
                 if !crossing[id] {
                     crossing[id] = true;
-                    queue.push_back(id);
+                    queue.push(id as u32);
                 }
             } else {
-                incoming[edge.target].push(id);
+                in_offsets[target + 1] += 1;
             }
         }
     }
-    while let Some(target) = queue.pop_front() {
-        for &id in &incoming[target] {
+    if queue.is_empty() {
+        return crossing;
+    }
+    for i in 1..=n {
+        in_offsets[i] += in_offsets[i - 1];
+    }
+    let mut cursor = in_offsets[..n].to_vec();
+    let mut incoming = vec![0u32; in_offsets[n] as usize];
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if !matches!(node.kind, "import" | "export" | "re-export") {
+            continue;
+        }
+        let ws = workspace[node.file];
+        for edge in graph.edges(id) {
+            let target = edge.target();
+            if ws == workspace[graph.nodes[target].file] {
+                let slot = cursor[target] as usize;
+                incoming[slot] = id as u32;
+                cursor[target] += 1;
+            }
+        }
+    }
+    let mut head = 0;
+    while head < queue.len() {
+        let target = queue[head] as usize;
+        head += 1;
+        let range = in_offsets[target] as usize..in_offsets[target + 1] as usize;
+        for &id_u32 in &incoming[range] {
+            let id = id_u32 as usize;
             if !crossing[id] {
                 crossing[id] = true;
-                queue.push_back(id);
+                queue.push(id as u32);
             }
         }
     }
@@ -96,8 +129,8 @@ impl WorkspacePaths {
         &mut self,
         graph: &Graph,
         start: usize,
-        next: &HashMap<usize, Option<Step>>,
-        known: &mut HashMap<usize, usize>,
+        next: &FxHashMap<usize, Option<Step>>,
+        known: &mut FxHashMap<usize, usize>,
     ) -> usize {
         let mut missing = Vec::new();
         let mut current = start;
@@ -106,10 +139,10 @@ impl WorkspacePaths {
             let Some(step) = next[&current] else {
                 break;
             };
-            current = step.state;
+            current = step.state as usize;
         }
         for state in missing.into_iter().rev() {
-            let tail = next[&state].map(|step| (known[&step.state], step.loc));
+            let tail = next[&state].map(|step| (known[&(step.state as usize)], step.loc));
             known.insert(state, self.push(graph, state / 2, tail));
         }
         known[&start]
@@ -126,30 +159,35 @@ impl Evidence {
     ) -> Self {
         let mut result = Self::default();
         let mut queue = VecDeque::new();
-        let mut possible = vec![false; graph.nodes.len() * 2];
+        let states = graph.nodes.len() * 2;
+        let mut possible: Vec<bool> = Vec::new();
         let mut location = None;
         if workspace.iter().any(|&id| id != 0) {
             let crossing = crossing_imports(graph, workspace);
             for (id, node) in graph.nodes.iter().enumerate() {
-                if reach.visited[node.file].iter().any(Option::is_some)
+                if reach.any(node.file)
                     || !matches!(node.kind, "binding" | "module" | "declaration" | "export")
                 {
                     continue;
                 }
-                for edge in &node.edges {
-                    let target_node = &graph.nodes[edge.target];
-                    let imports_binding = target_node.kind == "import" && crossing[edge.target];
+                for edge in graph.edges(id) {
+                    let edge_target = edge.target();
+                    let target_node = &graph.nodes[edge_target];
+                    let imports_binding = target_node.kind == "import" && crossing[edge_target];
                     let loads_module = target_node.kind == "module"
                         && workspace[node.file] != workspace[target_node.file];
                     if !imports_binding && !loads_module {
                         continue;
                     }
-                    let target = state(edge.target, usize::from(edge.type_only));
+                    let target = state(edge_target, usize::from(edge.type_only()));
                     result.reads.entry(target).or_default().push(Step {
-                        state: state(id, 0),
+                        state: state(id, 0) as u32,
                         loc: edge.loc,
                     });
                     location.get_or_insert((node.file, edge.loc));
+                    if possible.is_empty() {
+                        possible.resize(states, false);
+                    }
                     if !possible[target] {
                         possible[target] = true;
                         queue.push_back(target);
@@ -179,19 +217,18 @@ impl Evidence {
             }
             let id = "unrooted-workspace".to_string();
             result.gap_id = Some(id.clone());
-            let files = graph
-                .paths
+            let files: Vec<u32> = affected
                 .iter()
-                .zip(affected)
-                .filter(|(_, found)| *found)
-                .map(|(p, _)| p.clone())
+                .enumerate()
+                .filter(|(_, found)| **found)
+                .map(|(idx, _)| idx as u32)
                 .collect();
             gaps.push(Gap {
                 id,
                 code: "unrooted-workspace-reference",
                 file: Some(graph.paths[file].clone()),
                 location: Some(loc),
-                affected_files: Some(files),
+                scope: GapScope::Files(files),
                 message: concat!(
                     "Cross-workspace references originate in files with no effective root path. ",
                     "Supply the callers' entry roles. Explanations identify the source locations."
@@ -204,27 +241,48 @@ impl Evidence {
             .iter()
             .map(|r| r & (1 << Role::Test as usize) != 0)
             .collect();
-        if result.reads.is_empty() && !result.test_files.iter().any(|v| *v) {
+        let has_test_reach = reach.lane_used(Role::Test as usize * 2)
+            || reach.lane_used(Role::Test as usize * 2 + 1);
+        if result.reads.is_empty() && !has_test_reach {
             return result;
         }
         // Compressed sparse row storage avoids one allocation per incoming list.
-        let states = possible.len();
+        let test_val_lane = Role::Test as usize * 2;
+        let test_type_lane = test_val_lane + 1;
         let each_edge = |emit: &mut dyn FnMut(usize, usize, Loc)| {
-            for (s, &unknown) in possible.iter().enumerate() {
-                if unknown || reach.visited[s / 2][Role::Test as usize * 2 + s % 2].is_some() {
-                    transitions(graph, s, |target, loc| emit(s, target, loc));
+            if possible.is_empty() {
+                for id in 0..graph.nodes.len() {
+                    let mask = reach.mask(id);
+                    if (mask & (1u8 << test_val_lane)) != 0 {
+                        let s = state(id, 0);
+                        transitions(graph, s, |target, loc| emit(s, target, loc));
+                    }
+                    if (mask & (1u8 << test_type_lane)) != 0 {
+                        let s = state(id, 1);
+                        transitions(graph, s, |target, loc| emit(s, target, loc));
+                    }
+                }
+            } else {
+                for (s, &unknown) in possible.iter().enumerate() {
+                    if unknown || reach.has(s / 2, test_val_lane + s % 2) {
+                        transitions(graph, s, |target, loc| emit(s, target, loc));
+                    }
                 }
             }
         };
-        let mut offsets = vec![0; states + 1];
+        let mut offsets = vec![0u32; states + 1];
         each_edge(&mut |_, to, _| offsets[to + 1] += 1);
         for i in 1..offsets.len() {
             offsets[i] += offsets[i - 1];
         }
         let mut cursor = offsets[..states].to_vec();
-        let mut incoming = vec![Step::default(); offsets[states]];
+        let mut incoming = vec![Step::default(); offsets[states] as usize];
         each_edge(&mut |from, to, loc| {
-            incoming[cursor[to]] = Step { state: from, loc };
+            let slot = cursor[to] as usize;
+            incoming[slot] = Step {
+                state: from as u32,
+                loc,
+            };
             cursor[to] += 1;
         });
         result.offsets = offsets;
@@ -260,9 +318,10 @@ impl Evidence {
             } else {
                 "value"
             };
-            let mut known = HashMap::new();
+            let mut known = FxHashMap::default();
             let start = state(binding, phase);
-            let mut next = HashMap::from([(start, None)]);
+            let mut next = FxHashMap::default();
+            next.insert(start, None);
             let mut queue = VecDeque::from([start]);
             while let Some(s) = queue.pop_front() {
                 if s % 2 == 0 && self.test_files.get(s / 2) == Some(&true) {
@@ -270,11 +329,12 @@ impl Evidence {
                 }
                 if let Some(reads) = self.reads.get(&s) {
                     for read in reads {
-                        let owner = &graph.nodes[read.state / 2];
+                        let owner_id = read.state as usize / 2;
+                        let owner = &graph.nodes[owner_id];
                         let key = (owner.file, read.loc.start, read.loc.end, phase);
                         sources.entry(key).or_insert_with(|| {
                             let suffix = paths.intern(graph, s, &next, &mut known);
-                            let first = paths.push(graph, read.state / 2, Some((suffix, read.loc)));
+                            let first = paths.push(graph, owner_id, Some((suffix, read.loc)));
                             json!({
                                 "file": graph.paths[owner.file], "location": read.loc,
                                 "fact": fact, "first": first
@@ -282,15 +342,17 @@ impl Evidence {
                         });
                     }
                 }
-                for parent in &self.incoming[self.offsets[s]..self.offsets[s + 1]] {
+                for parent in &self.incoming[self.offsets[s] as usize..self.offsets[s + 1] as usize]
+                {
+                    let parent_state = parent.state as usize;
                     if let std::collections::hash_map::Entry::Vacant(entry) =
-                        next.entry(parent.state)
+                        next.entry(parent_state)
                     {
                         entry.insert(Some(Step {
-                            state: s,
+                            state: s as u32,
                             loc: parent.loc,
                         }));
-                        queue.push_back(parent.state);
+                        queue.push_back(parent_state);
                     }
                 }
             }

@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { collectGitDiff, extractGitArchive, linkNodeModules } from './git.ts';
 import type {
@@ -44,12 +44,34 @@ interface NativeBinding {
   analyzeNative(root: string, options: string): Promise<NativeSnapshot>;
 }
 
+type RawGapScope =
+  | 'global'
+  | { range: [number, number] }
+  | { rangePlus: [number, number, number] }
+  | { files: number[] };
+
+interface RawGap {
+  id: string;
+  code: string;
+  file: string | null;
+  location: Location | null;
+  message: string;
+  affectedScope?: RawGapScope;
+  affectedFiles?: string[] | null;
+  testOnly?: boolean;
+}
+
 interface RawMetadata {
   roots: Root[];
   workspaces: WorkspaceInfo[];
   suppressed: SuppressedFinding[];
   staleConfig: StaleConfigItem[];
-  coverage: Coverage;
+  coverage: {
+    status: 'complete' | 'partial';
+    files: string[];
+    excluded: string[];
+    gaps: RawGap[];
+  };
 }
 
 interface RawSubjectRecord extends Omit<Finding, 'status' | 'gapIds' | 'primaryGaps' | 'kind'> {
@@ -93,7 +115,11 @@ interface DiffContext {
   summary: DiffSummary;
 }
 
-const require = createRequire(import.meta.url);
+const metaUrl =
+  typeof import.meta?.url === 'string' && import.meta.url.startsWith('file:')
+    ? import.meta.url
+    : undefined;
+const nativeRequire = createRequire(metaUrl ?? process.execPath);
 let native: NativeBinding | undefined;
 
 export class AnalysisError extends Error {
@@ -108,12 +134,19 @@ export class AnalysisError extends Error {
 
 function load(): NativeBinding {
   try {
-    const parentAddon = fileURLToPath(new URL('../smella.node', import.meta.url));
-    if (existsSync(parentAddon)) return require(parentAddon) as NativeBinding;
-    const siblingAddon = fileURLToPath(new URL('./smella.node', import.meta.url));
-    if (existsSync(siblingAddon)) return require(siblingAddon) as NativeBinding;
+    if (metaUrl && !metaUrl.includes('/$bunfs/')) {
+      const parentAddon = fileURLToPath(new URL('../smella.node', import.meta.url));
+      if (existsSync(parentAddon)) return nativeRequire(parentAddon) as NativeBinding;
+      const siblingAddon = fileURLToPath(new URL('./smella.node', import.meta.url));
+      if (existsSync(siblingAddon)) return nativeRequire(siblingAddon) as NativeBinding;
+    }
+    const dir = dirname(process.execPath);
+    const execSibling = join(dir, 'smella.node');
+    if (existsSync(execSibling)) return nativeRequire(execSibling) as NativeBinding;
+    const execParent = join(dir, '../smella.node');
+    if (existsSync(execParent)) return nativeRequire(execParent) as NativeBinding;
     if (process.platform === 'linux' && process.arch === 'x64') {
-      return require('smella-linux-x64-gnu') as NativeBinding;
+      return nativeRequire('smella-linux-x64-gnu') as NativeBinding;
     }
     throw new Error(`No packaged native build for ${process.platform}-${process.arch}`);
   } catch (cause) {
@@ -126,11 +159,93 @@ function load(): NativeBinding {
 }
 
 function freeze<T>(value: T): T {
-  if (value && typeof value === 'object') {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
     for (const item of Object.values(value as Record<string, unknown>)) freeze(item);
     Object.freeze(value);
   }
   return value;
+}
+
+function hydrateMetadata(raw: RawMetadata): {
+  metadata: {
+    roots: readonly Root[];
+    workspaces: readonly WorkspaceInfo[];
+    suppressed: readonly SuppressedFinding[];
+    staleConfig: readonly StaleConfigItem[];
+    coverage: Coverage;
+  };
+  scopes: readonly (RawGapScope | undefined)[];
+} {
+  const files = raw.coverage.files;
+  const rangeCache = new Map<string, readonly string[]>();
+  const getRange = (start: number, end: number): readonly string[] => {
+    const key = `${start}:${end}`;
+    let cached = rangeCache.get(key);
+    if (!cached) {
+      cached = Object.freeze(files.slice(start, end));
+      rangeCache.set(key, cached);
+    }
+    return cached;
+  };
+  const scopes: (RawGapScope | undefined)[] = new Array(raw.coverage.gaps.length);
+  const gaps: Gap[] = raw.coverage.gaps.map((g, idx) => {
+    const s = g.affectedScope;
+    scopes[idx] = s;
+    const base = {
+      id: g.id,
+      code: g.code,
+      file: g.file,
+      location: g.location ? Object.freeze(g.location) : null,
+      message: g.message,
+      ...(g.testOnly ? { testOnly: true } : {}),
+    } as Gap;
+
+    if (s === undefined) {
+      base.affectedFiles = g.affectedFiles ? (Object.freeze(g.affectedFiles) as string[]) : null;
+    } else if (s === 'global') {
+      base.affectedFiles = null;
+    } else {
+      let materialized: readonly string[] | undefined;
+      Object.defineProperty(base, 'affectedFiles', {
+        enumerable: true,
+        configurable: false,
+        get(): string[] {
+          if (materialized !== undefined) return materialized as string[];
+          if ('range' in s) {
+            materialized = getRange(s.range[0], s.range[1]);
+          } else if ('rangePlus' in s) {
+            const [start, end, extra] = s.rangePlus;
+            const list = files.slice(start, end);
+            const extraPath = files[extra];
+            if (extraPath !== undefined) {
+              if (extra < start) list.unshift(extraPath);
+              else if (extra >= end) list.push(extraPath);
+            }
+            materialized = Object.freeze(list);
+          } else {
+            materialized = Object.freeze(s.files.map(id => files[id]));
+          }
+          return materialized as string[];
+        },
+      });
+    }
+    return Object.freeze(base);
+  });
+  Object.freeze(files);
+  Object.freeze(gaps);
+  const metadata = freeze({
+    roots: raw.roots,
+    workspaces: raw.workspaces,
+    suppressed: raw.suppressed,
+    staleConfig: raw.staleConfig,
+    coverage: {
+      status: raw.coverage.status,
+      files,
+      excluded: raw.coverage.excluded,
+      gaps,
+    },
+  });
+  return { metadata, scopes };
 }
 
 const DEP_KINDS = new Set<string>([
@@ -180,25 +295,142 @@ function packageKey(file: string | null): string {
   return parts[0];
 }
 
-// Every subject in a file shares its uncertainty. Repeating thousands of project-wide
-// gap IDs in the native JSON for every finding can exceed the JS string size limit.
-function indexGaps(gaps: readonly Gap[]) {
-  const globalIds: string[] = [];
-  const local = new Map<string, readonly string[]>();
-  const localRaw = new Map<string, string[]>();
+// Every subject in a file shares its uncertainty. Index gaps by compact file ranges and
+// direct file IDs so large repositories with thousands of scoped gaps never expand O(G * F) arrays.
+function indexGaps(
+  gaps: readonly Gap[],
+  files: readonly string[],
+  scopes: readonly (RawGapScope | undefined)[],
+) {
+  const fileIndex = new Map<string, number>();
+  for (let i = 0; i < files.length; i++) fileIndex.set(files[i], i);
+
   const byId = new Map<string, Gap>();
   const inlineById = new Map<string, InlineGap>();
   const globalByPkg = new Map<string, Gap[]>();
   const globalByFile = new Map<string, Gap[]>();
   const topGlobal: Gap[] = [];
 
-  for (const gap of gaps) {
+  const gapPriority = (gap: Gap): number => GAP_CODE_RANK.get(gap.code) ?? 50;
+  const sortGaps = (list: Gap[]): Gap[] => list.sort((a, b) => gapPriority(a) - gapPriority(b));
+
+  const pickTwo = (candidates: readonly Gap[], picked: Gap[] = []): Gap[] => {
+    for (const gap of candidates) {
+      if (picked.length >= 2) break;
+      if (picked.some(g => g.id === gap.id)) continue;
+      if (picked.length === 1 && picked[0].code === gap.code) continue;
+      picked.push(gap);
+    }
+    if (picked.length < 2) {
+      for (const gap of candidates) {
+        if (picked.length >= 2) break;
+        if (picked.some(g => g.id === gap.id)) continue;
+        picked.push(gap);
+      }
+    }
+    return picked;
+  };
+
+  interface Bucket {
+    ids: string[];
+    top: Gap[];
+  }
+  const addToBucket = (bucket: Bucket, gap: Gap) => {
+    bucket.ids.push(gap.id);
+    if (bucket.top.length < 2) {
+      bucket.top.push(gap);
+      if (bucket.top.length === 2) sortGaps(bucket.top);
+      return;
+    }
+    const prio = gapPriority(gap);
+    const p0 = gapPriority(bucket.top[0]);
+    const p1 = gapPriority(bucket.top[1]);
+    if (prio < p0) {
+      if (gap.code !== bucket.top[0].code) bucket.top[1] = bucket.top[0];
+      bucket.top[0] = gap;
+    } else if (prio < p1 && gap.code !== bucket.top[0].code) {
+      bucket.top[1] = gap;
+    } else if (bucket.top[0].code === bucket.top[1].code && gap.code !== bucket.top[0].code) {
+      bucket.top[1] = gap;
+      sortGaps(bucket.top);
+    }
+  };
+
+  interface RangeBucket extends Bucket {
+    start: number;
+    end: number;
+  }
+
+  interface LaneIndex {
+    globalIds: string[];
+    ranges: RangeBucket[];
+    rangeMap: Map<string, RangeBucket>;
+    direct: Map<number, Bucket>;
+    fileCache: Map<string, { ids: readonly string[]; localTop: readonly Gap[] }>;
+    comboCache: Map<string, readonly string[]>;
+  }
+  const makeLane = (): LaneIndex => ({
+    globalIds: [],
+    ranges: [],
+    rangeMap: new Map(),
+    direct: new Map(),
+    fileCache: new Map(),
+    comboCache: new Map(),
+  });
+  const allLane = makeLane();
+  const nonTestLane = makeLane();
+
+  const addToLane = (lane: LaneIndex, gap: Gap, scope: RawGapScope | undefined) => {
+    const addRange = (start: number, end: number) => {
+      if (start >= end) return;
+      const key = `${start}:${end}`;
+      let b = lane.rangeMap.get(key);
+      if (!b) {
+        b = { start, end, ids: [], top: [] };
+        lane.rangeMap.set(key, b);
+        lane.ranges.push(b);
+      }
+      addToBucket(b, gap);
+    };
+    const addDirect = (fid: number) => {
+      let b = lane.direct.get(fid);
+      if (!b) {
+        b = { ids: [], top: [] };
+        lane.direct.set(fid, b);
+      }
+      addToBucket(b, gap);
+    };
+    if (scope === undefined) {
+      const af = gap.affectedFiles;
+      if (af === null) {
+        lane.globalIds.push(gap.id);
+      } else {
+        for (const f of af) {
+          const fid = fileIndex.get(f);
+          if (fid !== undefined) addDirect(fid);
+        }
+      }
+    } else if (scope === 'global') {
+      lane.globalIds.push(gap.id);
+    } else if ('range' in scope) {
+      addRange(scope.range[0], scope.range[1]);
+    } else if ('rangePlus' in scope) {
+      addRange(scope.rangePlus[0], scope.rangePlus[1]);
+      addDirect(scope.rangePlus[2]);
+    } else {
+      for (const fid of scope.files) addDirect(fid);
+    }
+  };
+
+  for (let i = 0; i < gaps.length; i++) {
+    const gap = gaps[i];
+    const scope = scopes[i];
     byId.set(gap.id, gap);
     inlineById.set(gap.id, toInlineGap(gap));
     // The native graph qualifies individual subjects for unrooted workspace reads.
     if (gap.code === 'unrooted-workspace-reference') continue;
-    if (gap.affectedFiles === null) {
-      globalIds.push(gap.id);
+    const isGlobal = scope !== undefined ? scope === 'global' : gap.affectedFiles === null;
+    if (isGlobal) {
       if (gap.file) {
         let byFile = globalByFile.get(gap.file);
         if (!byFile) {
@@ -217,84 +449,73 @@ function indexGaps(gaps: readonly Gap[]) {
         }
       }
       topGlobal.push(gap);
-    } else {
-      for (const file of gap.affectedFiles) {
-        let list = localRaw.get(file);
-        if (!list) {
-          list = [];
-          localRaw.set(file, list);
-        }
-        list.push(gap.id);
-      }
     }
+    addToLane(allLane, gap, scope);
+    if (!gap.testOnly) addToLane(nonTestLane, gap, scope);
   }
 
-  const gapPriority = (gap: Gap): number => GAP_CODE_RANK.get(gap.code) ?? 50;
-  const sortGaps = (list: Gap[]): Gap[] => list.sort((a, b) => gapPriority(a) - gapPriority(b));
   sortGaps(topGlobal);
   for (const list of globalByFile.values()) sortGaps(list);
   for (const list of globalByPkg.values()) sortGaps(list);
-
-  const pickTwo = (candidates: readonly Gap[], picked: Gap[] = []): Gap[] => {
-    for (const gap of candidates) {
-      if (picked.length >= 2) break;
-      if (picked.some(g => g.id === gap.id)) continue;
-      if (picked.length === 1 && picked[0].code === gap.code) continue;
-      picked.push(gap);
-    }
-    if (picked.length < 2) {
-      for (const gap of candidates) {
-        if (picked.length >= 2) break;
-        if (picked.some(g => g.id === gap.id)) continue;
-        picked.push(gap);
-      }
-    }
-    return picked;
-  };
   const fallbackGlobal = pickTwo(topGlobal);
 
-  const frozenGlobal: readonly string[] = Object.freeze(globalIds);
-  const byCombination = new Map<string, readonly string[]>();
-  for (const [file, ids] of localRaw) {
-    const key = ids.join(',');
-    let combo = byCombination.get(key);
-    if (!combo) {
-      combo = Object.freeze(frozenGlobal.concat(ids));
-      byCombination.set(key, combo);
-    }
-    local.set(file, combo);
-  }
+  const frozenAllGlobal: readonly string[] = Object.freeze(allLane.globalIds);
+  const frozenNonTestGlobal: readonly string[] = Object.freeze(nonTestLane.globalIds);
+  const emptyTop: readonly Gap[] = Object.freeze([]);
 
-  // Separate test-only gaps (which can never establish runtime usage, so they cannot
-  // make test-only-export / test-only-binding / tooling-only-export findings conditional).
-  const localNonTestRaw = new Map<string, string[]>();
-  const globalNonTestRaw: string[] = [];
-  for (const gap of gaps) {
-    if (gap.code === 'unrooted-workspace-reference' || gap.testOnly) continue;
-    if (gap.affectedFiles === null) {
-      globalNonTestRaw.push(gap.id);
-    } else {
-      for (const file of gap.affectedFiles) {
-        let list = localNonTestRaw.get(file);
-        if (!list) {
-          list = [];
-          localNonTestRaw.set(file, list);
-        }
-        list.push(gap.id);
+  function resolveLane(
+    lane: LaneIndex,
+    frozenGlobal: readonly string[],
+    file: string,
+  ): { ids: readonly string[]; localTop: readonly Gap[] } {
+    const cached = lane.fileCache.get(file);
+    if (cached) return cached;
+    const fid = fileIndex.get(file);
+    if (fid === undefined) {
+      const res = { ids: frozenGlobal, localTop: emptyTop };
+      lane.fileCache.set(file, res);
+      return res;
+    }
+    const matchedRanges: RangeBucket[] = [];
+    for (const rb of lane.ranges) {
+      if (fid >= rb.start && fid < rb.end) matchedRanges.push(rb);
+    }
+    const direct = lane.direct.get(fid);
+    if (matchedRanges.length === 0 && !direct) {
+      const res = { ids: frozenGlobal, localTop: emptyTop };
+      lane.fileCache.set(file, res);
+      return res;
+    }
+    // Share frozen gapIds arrays across files matching the exact same ranges (with no direct gaps).
+    const comboKey = !direct
+      ? matchedRanges.map(r => `${r.start}:${r.end}`).join('|')
+      : matchedRanges.length === 0
+        ? `d:${direct.ids.join(',')}`
+        : `${matchedRanges.map(r => `${r.start}:${r.end}`).join('|')}|d:${direct.ids.join(',')}`;
+    let ids = lane.comboCache.get(comboKey);
+    if (!ids) {
+      const out = frozenGlobal.slice();
+      for (const rb of matchedRanges) {
+        for (const id of rb.ids) out.push(id);
       }
+      if (direct) {
+        for (const id of direct.ids) out.push(id);
+      }
+      ids = Object.freeze(out);
+      lane.comboCache.set(comboKey, ids);
     }
-  }
-  const frozenGlobalNonTest: readonly string[] = Object.freeze(globalNonTestRaw);
-  const localNonTest = new Map<string, readonly string[]>();
-  const byNonTestCombo = new Map<string, readonly string[]>();
-  for (const [file, ids] of localNonTestRaw) {
-    const key = ids.join(',');
-    let combo = byNonTestCombo.get(key);
-    if (!combo) {
-      combo = Object.freeze(frozenGlobalNonTest.concat(ids));
-      byNonTestCombo.set(key, combo);
+    const topCandidates: Gap[] = [];
+    for (const rb of matchedRanges) {
+      for (const g of rb.top) topCandidates.push(g);
     }
-    localNonTest.set(file, combo);
+    if (direct) {
+      for (const g of direct.top) topCandidates.push(g);
+    }
+    sortGaps(topCandidates);
+    const localTop = Object.freeze(pickTwo(topCandidates));
+    const res = { ids, localTop };
+    lane.fileCache.set(file, res);
+    return res;
   }
 
   const withWorkspace = new Map<readonly string[], readonly string[]>();
@@ -303,10 +524,11 @@ function indexGaps(gaps: readonly Gap[]) {
 
   function primaryFor(
     file: string,
-    localIds: readonly string[] | undefined,
+    localTop: readonly Gap[],
     workspaceGapId: string | null,
+    nonTest: boolean,
   ): readonly InlineGap[] {
-    const cacheKey = `${file}\0${workspaceGapId ?? ''}\0${localIds?.length ?? 0}`;
+    const cacheKey = `${file}\0${workspaceGapId ?? ''}\0${nonTest ? 1 : 0}`;
     const existing = primaryCache.get(cacheKey);
     if (existing) return existing;
     const picked: Gap[] = [];
@@ -314,12 +536,8 @@ function indexGaps(gaps: readonly Gap[]) {
       const wg = byId.get(workspaceGapId);
       if (wg) picked.push(wg);
     }
-    if (picked.length < 2 && localIds) {
-      const scoped = localIds
-        .map(id => byId.get(id))
-        .filter((g): g is Gap => g !== undefined);
-      sortGaps(scoped);
-      pickTwo(scoped, picked);
+    if (picked.length < 2 && localTop.length) {
+      pickTwo(localTop, picked);
     }
     if (picked.length < 2) {
       const sameFile = globalByFile.get(file);
@@ -344,9 +562,10 @@ function indexGaps(gaps: readonly Gap[]) {
       record.kind === 'test-only-export' ||
       record.kind === 'test-only-binding' ||
       record.kind === 'tooling-only-export';
-    let ids = isTestOrToolingFinding
-      ? (localNonTest.get(record.file) ?? frozenGlobalNonTest)
-      : (local.get(record.file) ?? frozenGlobal);
+    const resolved = isTestOrToolingFinding
+      ? resolveLane(nonTestLane, frozenNonTestGlobal, record.file)
+      : resolveLane(allLane, frozenAllGlobal, record.file);
+    let ids = resolved.ids;
     const workspaceGap = record.workspaceGap ?? null;
     if (workspaceGap) {
       let extended = withWorkspace.get(ids);
@@ -360,11 +579,7 @@ function indexGaps(gaps: readonly Gap[]) {
     record.gapIds = ids;
     record.status = record.gapIds.length ? 'conditional' : 'complete';
     record.primaryGaps = record.gapIds.length
-      ? primaryFor(
-          record.file,
-          isTestOrToolingFinding ? localNonTestRaw.get(record.file) : localRaw.get(record.file),
-          workspaceGap,
-        )
+      ? primaryFor(record.file, resolved.localTop, workspaceGap, isTestOrToolingFinding)
       : emptyPrimary;
     return record;
   };
@@ -524,9 +739,20 @@ export async function analyze({
     }
   }
 
-  let metadata: RawMetadata | undefined = freeze(JSON.parse(snapshot.metadata()) as RawMetadata);
+  const hydrated = hydrateMetadata(JSON.parse(snapshot.metadata()) as RawMetadata);
+  let metadata:
+    | {
+        roots: readonly Root[];
+        workspaces: readonly WorkspaceInfo[];
+        suppressed: readonly SuppressedFinding[];
+        staleConfig: readonly StaleConfigItem[];
+        coverage: Coverage;
+      }
+    | undefined = hydrated.metadata;
   let withGaps: (<T extends RawSubjectRecord>(record: T) => T) | undefined = indexGaps(
     metadata.coverage.gaps,
+    metadata.coverage.files,
+    hydrated.scopes,
   );
 
   function live(): NativeSnapshot {

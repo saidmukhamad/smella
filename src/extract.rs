@@ -1,6 +1,9 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
+
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use oxc_allocator::Allocator;
 use oxc_ast::{
@@ -20,7 +23,9 @@ use oxc_syntax::node::NodeId;
 use oxc_syntax::symbol::SymbolId;
 
 use crate::deps::{PackageRef, extract_dep_package};
-use crate::graph::{Edge, Export, Gap, Graph, Id, Link, Loc, Module, Node, PendingGap};
+use crate::graph::{
+    Edge, Export, Gap, GapScope, Graph, Id, Link, Loc, Module, Node, PendingGap, RawEdge,
+};
 use crate::project::{Project, StaleConfigItem};
 
 #[derive(Clone, Debug)]
@@ -45,13 +50,13 @@ impl Owner {
 }
 
 /// File IDs occupy the prefix shared by all workers. Binding IDs are local to
-/// a summary until it is appended in file order.
+/// a summary until it is relocated and moved into the graph in file order.
 pub struct FileSummary {
     file: Id,
     base: usize,
     path: String,
     nodes: Vec<Node>,
-    evaluation: Vec<Edge>,
+    edges: Vec<RawEdge>,
     module: Module,
     links: Vec<Link>,
     gaps: Vec<PendingGap>,
@@ -70,21 +75,12 @@ impl FileSummary {
             kind,
             name: name.into(),
             loc,
-            edges: vec![],
         });
         id
     }
+    #[inline]
     fn edge(&mut self, from: Id, target: Id, type_only: bool, loc: Loc) {
-        let edges = if from == self.file {
-            &mut self.evaluation
-        } else {
-            &mut self.nodes[from - self.base].edges
-        };
-        edges.push(Edge {
-            target,
-            type_only,
-            loc,
-        });
+        self.edges.push(RawEdge::new(from, target, type_only, loc));
     }
     fn gap(
         &mut self,
@@ -94,7 +90,7 @@ impl FileSummary {
         guard: Option<Id>,
         target_file: Option<Id>,
     ) {
-        self.gap_scoped(code, loc, message, guard, target_file, None);
+        self.gap_scoped(code, loc, message, guard, target_file, GapScope::Global);
     }
     fn gap_scoped(
         &mut self,
@@ -103,7 +99,7 @@ impl FileSummary {
         message: String,
         guard: Option<Id>,
         target_file: Option<Id>,
-        affected_files: Option<Vec<String>>,
+        scope: GapScope,
     ) {
         self.gaps.push(PendingGap {
             record: Gap {
@@ -111,7 +107,7 @@ impl FileSummary {
                 file: Some(self.path.clone()),
                 location: loc,
                 message,
-                affected_files,
+                scope,
                 id: String::new(),
                 test_only: false,
             },
@@ -174,29 +170,50 @@ impl FileSummary {
         self.links.push((access, to, prop.into(), type_only, loc));
     }
 
-    pub fn append(mut self, graph: &mut Graph) {
-        let offset = graph.nodes.len() - self.base;
-        let relocate = |id: Id| if id >= self.base { id + offset } else { id };
-        for edges in
-            std::iter::once(&mut self.evaluation).chain(self.nodes.iter_mut().map(|n| &mut n.edges))
-        {
-            for edge in edges {
-                edge.target = relocate(edge.target);
-            }
+    #[inline]
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+    #[inline]
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+    #[inline]
+    pub fn link_count(&self) -> usize {
+        self.links.len()
+    }
+    #[inline]
+    pub fn gap_count(&self) -> usize {
+        self.gaps.len()
+    }
+
+    pub fn relocate(&mut self, offset: usize) {
+        if offset == 0 {
+            return;
+        }
+        let base = self.base;
+        let base_u32 = base as u32;
+        let offset_u32 = offset as u32;
+        let reloc = |id: Id| if id >= base { id + offset } else { id };
+        for edge in &mut self.edges {
+            edge.relocate(base_u32, offset_u32);
         }
         for export in self.module.exports.values_mut() {
-            export.binding = relocate(export.binding);
-            export.surface = relocate(export.surface);
+            export.binding = reloc(export.binding);
+            export.surface = reloc(export.surface);
         }
         for (from, ..) in &mut self.links {
-            *from = relocate(*from);
+            *from = reloc(*from);
         }
         for gap in &mut self.gaps {
-            gap.guard = gap.guard.map(relocate);
+            gap.guard = gap.guard.map(reloc);
         }
-        graph.nodes[self.file].edges = self.evaluation;
+    }
+
+    pub fn move_into(mut self, graph: &mut Graph) {
         graph.modules[self.file] = self.module;
         graph.nodes.append(&mut self.nodes);
+        graph.pending_edges.append(&mut self.edges);
         graph.links.append(&mut self.links);
         graph.gaps.append(&mut self.gaps);
     }
@@ -567,29 +584,29 @@ fn is_json_dynamic_spec(expr: &Expression<'_>) -> bool {
     }
 }
 
-fn relative_template_scope(
-    project: &Project,
-    file: Id,
-    expr: &Expression<'_>,
-) -> Option<Vec<String>> {
+fn relative_template_scope(project: &Project, file: Id, expr: &Expression<'_>) -> GapScope {
     let Expression::TemplateLiteral(t) = expr.get_inner_expression() else {
-        return None;
+        return GapScope::Global;
     };
-    let first = t.quasis.first()?.value.cooked.as_ref()?.as_str();
+    let Some(first) = t
+        .quasis
+        .first()
+        .and_then(|q| q.value.cooked.as_ref())
+        .map(|s| s.as_str())
+    else {
+        return GapScope::Global;
+    };
     if !(first.starts_with("./") || first.starts_with("../")) {
-        return None;
+        return GapScope::Global;
     }
     let dir_part = first.rsplit_once('/').map_or(".", |(d, _)| d);
     let file_dir = Path::new(&project.graph.paths[file])
         .parent()
         .unwrap_or_else(|| Path::new(""));
-    let norm = crate::source_map::normalize_rel(&file_dir.join(dir_part))?;
-    let mut files = project.files_in_dir(&norm);
-    if !files.contains(&project.graph.paths[file]) {
-        files.push(project.graph.paths[file].clone());
-        files.sort();
-    }
-    Some(files)
+    let Some(norm) = crate::source_map::normalize_rel(&file_dir.join(dir_part)) else {
+        return GapScope::Global;
+    };
+    GapScope::from_range_and_file(project.files_in_dir_range(&norm), file)
 }
 
 fn cjs_exports_target(scoping: &Scoping, expr: &Expression<'_>) -> Option<Span> {
@@ -1269,6 +1286,7 @@ pub fn summarize(
     file: Id,
     entry_file: bool,
     arena: &mut Allocator,
+    read_buf: &mut Vec<u8>,
 ) -> FileSummary {
     arena.reset();
     let mut summary = FileSummary {
@@ -1276,7 +1294,7 @@ pub fn summarize(
         path: project.graph.paths[file].clone(),
         base: project.graph.paths.len(),
         nodes: vec![],
-        evaluation: vec![],
+        edges: vec![],
         module: Module::default(),
         links: vec![],
         gaps: vec![],
@@ -1286,18 +1304,47 @@ pub fn summarize(
         used_dynamic_imports: false,
         parsed: false,
     };
-    summary.parsed = extract(project, &mut summary, arena, entry_file);
+    summary.parsed = extract(project, &mut summary, arena, read_buf, entry_file);
     summary
 }
 
-fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_file: bool) -> bool {
+fn extract(
+    project: &Project,
+    out: &mut FileSummary,
+    arena: &Allocator,
+    read_buf: &mut Vec<u8>,
+    entry_file: bool,
+) -> bool {
     let file = out.file;
     let path = project.root.join(&project.graph.paths[file]);
-    let source = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) => {
-            out.gap("read-error", None, e.to_string(), None, None);
+    let source: &str = match project.source_text(file) {
+        Some(Ok(text)) => text,
+        Some(Err(e)) => {
+            out.gap("read-error", None, e.to_owned(), None, None);
             return false;
+        }
+        None => {
+            read_buf.clear();
+            let res = File::open(&path).and_then(|mut f| {
+                if let Ok(meta) = f.metadata() {
+                    let len = meta.len() as usize;
+                    if len > read_buf.capacity() {
+                        read_buf.reserve(len - read_buf.capacity());
+                    }
+                }
+                f.read_to_end(read_buf)
+            });
+            if let Err(e) = res {
+                out.gap("read-error", None, e.to_string(), None, None);
+                return false;
+            }
+            match std::str::from_utf8(read_buf) {
+                Ok(s) => s,
+                Err(e) => {
+                    out.gap("read-error", None, e.to_string(), None, None);
+                    return false;
+                }
+            }
         }
     };
 
@@ -1306,7 +1353,7 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
     if path.extension().is_some_and(|ext| ext == "js") {
         source_type = source_type.with_jsx(true);
     }
-    let mut parsed = Parser::new(arena, &source, source_type).parse();
+    let mut parsed = Parser::new(arena, source, source_type).parse();
     let declaration_file = parsed.program.source_type.is_typescript_definition();
     if declaration_file {
         parsed.program.source_type = parsed.program.source_type.with_typescript(true);
@@ -1321,7 +1368,11 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
             start: s.offset() as u32,
             end: (s.offset() + s.len()) as u32,
         });
-        let scope = project.is_multi_workspace().then(|| vec![out.path.clone()]);
+        let scope = if project.is_multi_workspace() {
+            GapScope::Files(vec![file as u32])
+        } else {
+            GapScope::Global
+        };
         out.gap_scoped(
             "parse-error",
             loc,
@@ -1334,13 +1385,13 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
     if parsed.panicked {
         return false;
     }
-    extract_inline_suppressions(&source, &parsed.program, out);
+    extract_inline_suppressions(source, &parsed.program, out);
     let sem = built.semantic;
     let nodes = sem.nodes();
     let scoping = sem.scoping();
     let record = parsed.module_record;
-    let mut bindings = HashMap::new();
-    let mut declarations: HashMap<NodeId, Vec<Id>> = HashMap::new();
+    let mut bindings = HashMap::default();
+    let mut declarations: HashMap<NodeId, Vec<Id>> = HashMap::default();
     for symbol in scoping
         .symbol_ids()
         .filter(|&s| scoping.symbol_scope_id(s) == scoping.root_scope_id())
@@ -1370,7 +1421,7 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
             .and_then(|s| bindings.get(&s).copied())
     };
 
-    let mut import_phases = HashMap::new();
+    let mut import_phases = HashMap::default();
     for import in &record.import_entries {
         *import_phases
             .entry(import.statement_span.start)
@@ -1409,13 +1460,13 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
         .and_then(|e| e.to_str())
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
-    let mut namespaces = HashMap::new();
-    let mut symbol_namespaces: HashMap<SymbolId, (Id, bool, bool)> = HashMap::new();
-    let mut require_symbols: HashSet<SymbolId> = HashSet::new();
-    let mut file_ext_symbols: HashSet<SymbolId> = HashSet::new();
-    let mut local_paths: HashMap<SymbolId, Vec<(String, Span)>> = HashMap::new();
-    let mut handled_cjs_idents: HashSet<u32> = HashSet::new();
-    let mut owner_overrides: HashMap<u32, Owner> = HashMap::new();
+    let mut namespaces = HashMap::default();
+    let mut symbol_namespaces: HashMap<SymbolId, (Id, bool, bool)> = HashMap::default();
+    let mut require_symbols: HashSet<SymbolId> = HashSet::default();
+    let mut file_ext_symbols: HashSet<SymbolId> = HashSet::default();
+    let mut local_paths: HashMap<SymbolId, Vec<(String, Span)>> = HashMap::default();
+    let mut handled_cjs_idents: HashSet<u32> = HashSet::default();
+    let mut owner_overrides: HashMap<u32, Owner> = HashMap::default();
     let mut react = crate::react::ReactCalls::default();
 
     for import in &record.import_entries {
@@ -1939,14 +1990,15 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                     )
                 {
                     let scope = if ident.name == "require" && !project.is_multi_workspace() {
-                        None
+                        GapScope::Global
                     } else if ident.name == "require" {
                         let dir = Path::new(&out.path)
                             .parent()
                             .unwrap_or_else(|| Path::new(""));
-                        Some(project.files_in_dir(dir))
+                        let (s, e) = project.files_in_dir_range(dir);
+                        GapScope::Range(s, e)
                     } else {
-                        Some(vec![out.path.clone()])
+                        GapScope::Files(vec![file as u32])
                     };
                     for from in owner.sources(file) {
                         out.gap_scoped(
@@ -2057,8 +2109,9 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                         }
                         if specs.is_empty() && glob_targets.is_empty() {
                             if !req_arg.is_some_and(is_json_dynamic_spec) {
-                                let scope =
-                                    req_arg.and_then(|a| relative_template_scope(project, file, a));
+                                let scope = req_arg.map_or(GapScope::Global, |a| {
+                                    relative_template_scope(project, file, a)
+                                });
                                 for from in owner.sources(file) {
                                     out.gap_scoped(
                                         "computed-import",
@@ -2579,7 +2632,7 @@ fn extract(project: &Project, out: &mut FileSummary, arena: &Allocator, entry_fi
                         "This TypeScript module construct requires additional resolution.".into(),
                         Some(owner.binding),
                         None,
-                        Some(vec![out.path.clone()]),
+                        GapScope::Files(vec![file as u32]),
                     );
                 }
             }

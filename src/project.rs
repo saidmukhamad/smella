@@ -5,17 +5,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use globset::{GlobBuilder, GlobMatcher};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use oxc_resolver::{
     ResolveError, ResolveOptions, Resolver, TsconfigDiscovery, TsconfigOptions, TsconfigReferences,
 };
+use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::deps::{
     WorkspaceManifest, manifest_bins, manifest_dep_set, manifest_path_for, manifest_scripts,
 };
-use crate::graph::{Graph, Id, ROLES, Role, Root, RootEntryMode};
+use crate::graph::{GapScope, Graph, Id, ROLES, Role, Root, RootEntryMode};
 use crate::source_map::{
     SourceMapper, is_non_code_export, normalize_rel, resolve_exports_targets, to_slash,
 };
@@ -130,6 +131,7 @@ pub struct Project {
     pub root: PathBuf,
     pub roots: Vec<Root>,
     pub graph: Graph,
+    pub sources: Vec<Result<String, String>>,
     pub excluded: Vec<String>,
     resolvers: Vec<[Resolver; 2]>,
     file_profile: Vec<usize>,
@@ -147,6 +149,8 @@ pub struct Project {
 
 impl Project {
     pub fn open(root: &Path, input: Config) -> Result<Self, String> {
+        let profile = std::env::var_os("SMELLA_PROFILE").is_some();
+        let t0 = std::time::Instant::now();
         let root = fs::canonicalize(root)
             .map_err(|e| format!("Cannot open repository {}: {e}", root.display()))?;
         if !root.is_dir() {
@@ -215,6 +219,39 @@ impl Project {
         let excluded_dirs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let excluded_dirs_cb = Arc::clone(&excluded_dirs);
         let root_cb = root.clone();
+        // `ignore::WalkParallel` spawns fresh OS threads per call (~1.5 ms overhead),
+        // so only engage it when a quick 2-level directory probe finds a large tree.
+        let use_parallel_walk = fs::read_dir(&root)
+            .map(|rd| {
+                let mut dir_count = 0usize;
+                for entry in rd.filter_map(Result::ok) {
+                    if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                        continue;
+                    }
+                    let name = entry.file_name();
+                    if SKIP.contains(&name.to_string_lossy().as_ref()) {
+                        continue;
+                    }
+                    dir_count += 1;
+                    if dir_count >= 16 {
+                        return true;
+                    }
+                    if let Ok(sub) = fs::read_dir(entry.path()) {
+                        for child in sub.filter_map(Result::ok) {
+                            if child.file_type().is_ok_and(|ft| ft.is_dir())
+                                && !SKIP.contains(&child.file_name().to_string_lossy().as_ref())
+                            {
+                                dir_count += 1;
+                                if dir_count >= 16 {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            })
+            .unwrap_or(false);
         let mut builder = WalkBuilder::new(&root);
         builder
             .hidden(false)
@@ -225,7 +262,6 @@ impl Project {
             .ignore(false)
             .require_git(in_git_repo)
             .parents(in_git_repo)
-            .sort_by_file_name(|a, b| a.cmp(b))
             .filter_entry(move |entry| {
                 if entry.depth() == 0 {
                     return true;
@@ -252,77 +288,229 @@ impl Project {
                 }
                 true
             });
-        for entry in builder.build() {
-            let entry = entry.map_err(|e| format!("Cannot enumerate source scope: {e}"))?;
-            if entry.depth() == 0 || !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                continue;
+        if use_parallel_walk {
+            let walk_threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+            builder.threads(walk_threads);
+            #[derive(Default)]
+            struct WalkBatch {
+                paths: Vec<String>,
+                excluded: Vec<String>,
+                nx_dirs: Vec<PathBuf>,
+                tsconfig_files: Vec<PathBuf>,
+                bundler_configs: Vec<PathBuf>,
+                config_dirs: Vec<PathBuf>,
+                manifests: Vec<PathBuf>,
+                include_matched: Vec<bool>,
+                exclude_matched: Vec<bool>,
+                err: Option<String>,
             }
-            let file = entry
-                .path()
-                .strip_prefix(&root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            let name = entry.file_name().to_string_lossy();
-            if nx_enabled && name == "project.json" {
-                nx_dirs.insert(Path::new(&file).parent().unwrap().to_owned());
-            }
-            if name.starts_with("tsconfig") && name.ends_with(".json") {
-                tsconfig_files.push(PathBuf::from(&file));
-            }
-            if name.starts_with("tsdown.config.")
-                && entry
-                    .path()
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| EXTENSIONS.contains(&e))
-            {
-                bundler_configs.push(PathBuf::from(&file));
-            }
-            if name == "tsconfig.json" {
-                config_dirs.insert(
-                    entry
-                        .path()
-                        .parent()
-                        .unwrap()
-                        .strip_prefix(&root)
-                        .unwrap()
-                        .to_owned(),
-                    0usize,
-                );
-            }
-            if name == "package.json" {
-                manifests.push(entry.path().to_owned());
-            }
-            if !EXTENSIONS.contains(
-                &entry
-                    .path()
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or(""),
-            ) {
-                continue;
-            }
-            let mut inc_ok = include.is_none();
-            if let Some(inc) = include.as_ref() {
-                for (idx, p) in inc.iter().enumerate() {
-                    if p.is_match(&file) {
-                        include_matched[idx] = true;
-                        inc_ok = true;
+            let merged = Mutex::new(Vec::<WalkBatch>::new());
+            let include_ref = &include;
+            let exclude_ref = &exclude;
+            let root_ref = &root;
+            let inc_len = include_matched.len();
+            let exc_len = exclude_matched.len();
+            builder.build_parallel().run(|| {
+                let local = WalkBatch {
+                    include_matched: vec![false; inc_len],
+                    exclude_matched: vec![false; exc_len],
+                    ..Default::default()
+                };
+                struct Flush<'a> {
+                    local: WalkBatch,
+                    merged: &'a Mutex<Vec<WalkBatch>>,
+                }
+                impl Drop for Flush<'_> {
+                    fn drop(&mut self) {
+                        self.merged
+                            .lock()
+                            .unwrap()
+                            .push(std::mem::take(&mut self.local));
                     }
                 }
-            }
-            let mut exc_hit = false;
-            for (idx, p) in exclude.iter().enumerate() {
-                if p.is_match(&file) {
-                    exclude_matched[idx] = true;
-                    exc_hit = true;
+                let mut guard = Flush {
+                    local,
+                    merged: &merged,
+                };
+                Box::new(move |res| {
+                    let entry = match res {
+                        Ok(e) => e,
+                        Err(e) => {
+                            guard.local.err = Some(format!("Cannot enumerate source scope: {e}"));
+                            return WalkState::Quit;
+                        }
+                    };
+                    if entry.depth() == 0 || !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                        return WalkState::Continue;
+                    }
+                    let file = entry
+                        .path()
+                        .strip_prefix(root_ref)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let name = entry.file_name().to_string_lossy();
+                    if nx_enabled && name == "project.json" {
+                        guard
+                            .local
+                            .nx_dirs
+                            .push(Path::new(&file).parent().unwrap().to_owned());
+                    }
+                    if name.starts_with("tsconfig") && name.ends_with(".json") {
+                        guard.local.tsconfig_files.push(PathBuf::from(&file));
+                    }
+                    if name.starts_with("tsdown.config.")
+                        && entry
+                            .path()
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| EXTENSIONS.contains(&e))
+                    {
+                        guard.local.bundler_configs.push(PathBuf::from(&file));
+                    }
+                    if name == "tsconfig.json" {
+                        guard.local.config_dirs.push(
+                            entry
+                                .path()
+                                .parent()
+                                .unwrap()
+                                .strip_prefix(root_ref)
+                                .unwrap()
+                                .to_owned(),
+                        );
+                    }
+                    if name == "package.json" {
+                        guard.local.manifests.push(entry.path().to_owned());
+                    }
+                    if !EXTENSIONS.contains(
+                        &entry
+                            .path()
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or(""),
+                    ) {
+                        return WalkState::Continue;
+                    }
+                    let mut inc_ok = include_ref.is_none();
+                    if let Some(inc) = include_ref.as_ref() {
+                        for (idx, p) in inc.iter().enumerate() {
+                            if p.is_match(&file) {
+                                guard.local.include_matched[idx] = true;
+                                inc_ok = true;
+                            }
+                        }
+                    }
+                    let mut exc_hit = false;
+                    for (idx, p) in exclude_ref.iter().enumerate() {
+                        if p.is_match(&file) {
+                            guard.local.exclude_matched[idx] = true;
+                            exc_hit = true;
+                        }
+                    }
+                    if inc_ok && !exc_hit {
+                        guard.local.paths.push(file);
+                    } else {
+                        guard.local.excluded.push(file);
+                    }
+                    WalkState::Continue
+                })
+            });
+            for batch in merged.into_inner().unwrap() {
+                if let Some(err) = batch.err {
+                    return Err(err);
+                }
+                paths.extend(batch.paths);
+                excluded.extend(batch.excluded);
+                nx_dirs.extend(batch.nx_dirs);
+                tsconfig_files.extend(batch.tsconfig_files);
+                bundler_configs.extend(batch.bundler_configs);
+                for d in batch.config_dirs {
+                    config_dirs.insert(d, 0usize);
+                }
+                manifests.extend(batch.manifests);
+                for (i, h) in batch.include_matched.into_iter().enumerate() {
+                    include_matched[i] |= h;
+                }
+                for (i, h) in batch.exclude_matched.into_iter().enumerate() {
+                    exclude_matched[i] |= h;
                 }
             }
-            if inc_ok && !exc_hit {
-                paths.push(file);
-            } else {
-                excluded.push(file);
+            tsconfig_files.sort();
+            bundler_configs.sort();
+        } else {
+            builder.sort_by_file_name(|a, b| a.cmp(b));
+            for entry in builder.build() {
+                let entry = entry.map_err(|e| format!("Cannot enumerate source scope: {e}"))?;
+                if entry.depth() == 0 || !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    continue;
+                }
+                let file = entry
+                    .path()
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let name = entry.file_name().to_string_lossy();
+                if nx_enabled && name == "project.json" {
+                    nx_dirs.insert(Path::new(&file).parent().unwrap().to_owned());
+                }
+                if name.starts_with("tsconfig") && name.ends_with(".json") {
+                    tsconfig_files.push(PathBuf::from(&file));
+                }
+                if name.starts_with("tsdown.config.")
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| EXTENSIONS.contains(&e))
+                {
+                    bundler_configs.push(PathBuf::from(&file));
+                }
+                if name == "tsconfig.json" {
+                    config_dirs.insert(
+                        entry
+                            .path()
+                            .parent()
+                            .unwrap()
+                            .strip_prefix(&root)
+                            .unwrap()
+                            .to_owned(),
+                        0usize,
+                    );
+                }
+                if name == "package.json" {
+                    manifests.push(entry.path().to_owned());
+                }
+                if !EXTENSIONS.contains(
+                    &entry
+                        .path()
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or(""),
+                ) {
+                    continue;
+                }
+                let mut inc_ok = include.is_none();
+                if let Some(inc) = include.as_ref() {
+                    for (idx, p) in inc.iter().enumerate() {
+                        if p.is_match(&file) {
+                            include_matched[idx] = true;
+                            inc_ok = true;
+                        }
+                    }
+                }
+                let mut exc_hit = false;
+                for (idx, p) in exclude.iter().enumerate() {
+                    if p.is_match(&file) {
+                        exclude_matched[idx] = true;
+                        exc_hit = true;
+                    }
+                }
+                if inc_ok && !exc_hit {
+                    paths.push(file);
+                } else {
+                    excluded.push(file);
+                }
             }
         }
         for (idx, hit) in exclude_hits.iter().enumerate() {
@@ -332,9 +520,24 @@ impl Project {
         }
         excluded.extend(std::mem::take(&mut *excluded_dirs.lock().unwrap()));
         excluded.sort();
+        let t_walk = std::time::Instant::now();
+        // Read and parse every package.json once in parallel.
+        manifests.sort_by_key(|p| (p.components().count(), p.clone()));
+        let raw_manifests = crate::io::read_bytes_batch(&manifests);
+        let mut parsed_manifests: FxHashMap<PathBuf, Result<Value, String>> =
+            FxHashMap::with_capacity_and_hasher(manifests.len(), Default::default());
+        for (path, bytes) in manifests.iter().zip(raw_manifests) {
+            let parsed = bytes
+                .map_err(|e| format!("{}: {e}", path.display()))
+                .and_then(|b| {
+                    serde_json::from_slice::<Value>(&b)
+                        .map_err(|e| format!("{}: {e}", path.display()))
+                });
+            parsed_manifests.insert(path.clone(), parsed);
+        }
         let mut non_js_bins = BTreeSet::new();
         for manifest_path in &manifests {
-            let Ok(pkg) = json(manifest_path) else {
+            let Some(Ok(pkg)) = parsed_manifests.get(manifest_path) else {
                 continue;
             };
             let Some(dir) = manifest_path
@@ -450,10 +653,10 @@ impl Project {
         let file_profile = closest_directories(&paths, &config_dirs);
 
         let root_manifest = root.join("package.json");
-        let manifest = if manifests.contains(&root_manifest) {
-            json(&root_manifest)?
-        } else {
-            Value::Null
+        let manifest = match parsed_manifests.remove(&root_manifest) {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => return Err(e),
+            None => Value::Null,
         };
         // A workspace member can in turn declare workspaces relative to itself.
         // Register parents first and let the closest member own a source file.
@@ -476,7 +679,6 @@ impl Project {
         let mut packages = vec![(PathBuf::new(), manifest)];
         let mut directories = BTreeMap::from([(PathBuf::new(), 0)]);
         let mut workspaces = BTreeMap::new();
-        manifests.sort_by_key(|p| (p.components().count(), p.clone()));
         for path in manifests.into_iter().filter(|p| p != &root_manifest) {
             let dir = path.parent().unwrap();
             let rel = dir.strip_prefix(&root).unwrap();
@@ -486,7 +688,10 @@ impl Project {
                     .is_some_and(|globs| globs.matches(rel.strip_prefix(a).unwrap()))
             });
             if member || nx_dirs.contains(rel) {
-                let package = json(&path)?;
+                let package = match parsed_manifests.remove(&path) {
+                    Some(res) => res?,
+                    None => json(&path)?,
+                };
                 if let Some(name) = package["name"].as_str() {
                     let non_empty = |k: &str| {
                         package[k]
@@ -620,9 +825,19 @@ impl Project {
                 });
             }
         }
+        let t_pre_sources = std::time::Instant::now();
+        // On Linux, bulk-read all source files up front via batched io_uring rings.
+        // On other platforms, workers stream each file into a thread-local reusable buffer
+        // right before lexing to keep file bytes L1-cache-resident and overlap I/O with parsing.
+        #[cfg(target_os = "linux")]
+        let sources = crate::io::read_files(&root, &paths);
+        #[cfg(not(target_os = "linux"))]
+        let sources = Vec::new();
+        let t_sources = std::time::Instant::now();
         let mut project = Self {
             root,
             graph: Graph::new(paths),
+            sources,
             excluded,
             workspaces,
             roots: vec![],
@@ -855,6 +1070,20 @@ impl Project {
         project
             .roots
             .dedup_by(|a, b| a.file == b.file && a.role == b.role && a.input == b.input);
+        if profile {
+            let t_end = std::time::Instant::now();
+            let ms = |a: std::time::Instant, b: std::time::Instant| {
+                b.duration_since(a).as_secs_f64() * 1000.0
+            };
+            eprintln!(
+                "[profile:open] total={:.2}ms | walk={:.2}ms meta+nx={:.2}ms read_files={:.2}ms discover={:.2}ms",
+                ms(t0, t_end),
+                ms(t0, t_walk),
+                ms(t_walk, t_pre_sources),
+                ms(t_pre_sources, t_sources),
+                ms(t_sources, t_end),
+            );
+        }
         if project.roots.is_empty() {
             let detail = project
                 .graph
@@ -910,17 +1139,8 @@ impl Project {
             None
         };
         let active_pattern = effective.as_deref().unwrap_or(pattern);
-        let glob = matcher(active_pattern)?;
         let before = self.roots.len();
-        for file in self.graph.paths.iter().filter(|f| glob.is_match(f)) {
-            self.roots.push(Root {
-                file: file.clone(),
-                role,
-                origin,
-                input: input.into(),
-                mode,
-            });
-        }
+        self.push_matching_roots(active_pattern, role, origin, input, mode)?;
         if before == self.roots.len()
             && origin == "discovered"
             && effective.is_none()
@@ -928,16 +1148,7 @@ impl Project {
                 self.source_mapper
                     .map_pattern(&self.root, &self.graph.paths, pattern)
         {
-            let mapped_glob = matcher(&mapped)?;
-            for file in self.graph.paths.iter().filter(|f| mapped_glob.is_match(f)) {
-                self.roots.push(Root {
-                    file: file.clone(),
-                    role,
-                    origin,
-                    input: input.into(),
-                    mode,
-                });
-            }
+            self.push_matching_roots(&mapped, role, origin, input, mode)?;
         }
         if required && before == self.roots.len() {
             let message = format!(
@@ -951,7 +1162,7 @@ impl Project {
                     .unwrap_or_else(|| Path::new(""));
                 self.scope_for_discovered_dir(manifest_dir)
             } else {
-                None
+                GapScope::Global
             };
             if origin == "explicit" {
                 self.stale_config.push(StaleConfigItem {
@@ -1104,52 +1315,93 @@ impl Project {
             .unwrap_or_else(|| Path::new(""))
     }
 
+    fn push_matching_roots(
+        &mut self,
+        pattern: &str,
+        role: Role,
+        origin: &'static str,
+        input: &str,
+        mode: RootEntryMode,
+    ) -> Result<(), String> {
+        let clean = pattern.trim_start_matches("./");
+        if !clean.contains(['*', '?', '[', '{']) {
+            if let Ok(idx) = self.graph.paths.binary_search_by(|p| p.as_str().cmp(clean)) {
+                self.roots.push(Root {
+                    file: self.graph.paths[idx].clone(),
+                    role,
+                    origin,
+                    input: input.into(),
+                    mode,
+                });
+            }
+            return Ok(());
+        }
+        let glob = matcher(pattern)?;
+        for file in self.graph.paths.iter().filter(|f| glob.is_match(f)) {
+            self.roots.push(Root {
+                file: file.clone(),
+                role,
+                origin,
+                input: input.into(),
+                mode,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn source_text(&self, file: Id) -> Option<Result<&str, &str>> {
+        self.sources
+            .get(file)
+            .map(|r| r.as_deref().map_err(String::as_str))
+    }
+
     pub fn is_multi_workspace(&self) -> bool {
         self.workspace_dirs.len() > 1
     }
 
-    pub fn files_in_dir(&self, dir: &Path) -> Vec<String> {
+    pub fn files_in_dir_range(&self, dir: &Path) -> (u32, u32) {
         let prefix = to_slash(dir);
         if prefix.is_empty() {
-            return self.graph.paths.clone();
+            return (0, self.graph.paths.len() as u32);
         }
         let slash = format!("{prefix}/");
         let start = self
             .graph
             .paths
             .partition_point(|p| p.as_str() < slash.as_str());
-        self.graph.paths[start..]
+        let len = self.graph.paths[start..]
             .iter()
             .take_while(|p| p.starts_with(&slash))
-            .cloned()
-            .collect()
+            .count();
+        (start as u32, (start + len) as u32)
     }
 
-    pub fn scope_for_discovered_dir(&self, dir: &Path) -> Option<Vec<String>> {
+    pub fn scope_for_discovered_dir(&self, dir: &Path) -> GapScope {
         if dir.as_os_str().is_empty() || !self.is_multi_workspace() {
-            None
+            GapScope::Global
         } else {
-            Some(self.files_in_dir(dir))
+            let (s, e) = self.files_in_dir_range(dir);
+            GapScope::Range(s, e)
         }
     }
 
-    pub fn scope_unresolved_import(&self, file: Id, spec: &str) -> Option<Vec<String>> {
-        let importer = self.graph.paths[file].clone();
+    pub fn scope_unresolved_import(&self, file: Id, spec: &str) -> GapScope {
+        let importer = &self.graph.paths[file];
         let clean_spec = spec.split('?').next().unwrap_or(spec);
         if is_non_code_export(clean_spec) {
-            return Some(vec![importer]);
+            return GapScope::Files(vec![file as u32]);
         }
         if spec.contains('?')
             && let Ok(resolved) = self.resolve_with_mode(file, clean_spec, false, false)
         {
-            let mut affected = vec![importer];
+            let mut affected = vec![file as u32];
             if let Some(id) = resolved
-                && self.graph.paths[id] != affected[0]
+                && id != file
             {
-                affected.push(self.graph.paths[id].clone());
-                affected.sort();
+                affected.push(id as u32);
+                affected.sort_unstable();
             }
-            return Some(affected);
+            return GapScope::Files(affected);
         }
         if !self.is_multi_workspace() {
             if !clean_spec.starts_with('.')
@@ -1158,16 +1410,15 @@ impl Project {
                     .is_none_or(|(pkg, _)| !self.workspaces.contains_key(&pkg))
                 && self
                     .source_mapper
-                    .matches_tsconfig_path(Path::new(&importer), clean_spec)
+                    .matches_tsconfig_path(Path::new(importer), clean_spec)
                     .is_empty()
             {
-                return Some(vec![importer]);
+                return GapScope::Files(vec![file as u32]);
             }
-            return None;
+            return GapScope::Global;
         }
-        let mut affected = BTreeSet::from([importer.clone()]);
         if clean_spec.starts_with('.') || clean_spec.starts_with('/') {
-            let file_dir = Path::new(&importer)
+            let file_dir = Path::new(importer)
                 .parent()
                 .unwrap_or_else(|| Path::new(""));
             if let Some(rel) = normalize_rel(&file_dir.join(clean_spec)) {
@@ -1180,36 +1431,53 @@ impl Project {
                     || target_ws_dir.is_some_and(|d| d != self.workspace_dir_for(file))
                 {
                     if let Some(ws_dir) = target_ws_dir {
-                        affected.extend(self.files_in_dir(ws_dir));
+                        return GapScope::from_range_and_file(
+                            self.files_in_dir_range(ws_dir),
+                            file,
+                        );
                     }
                 } else if let Some(parent) = rel.parent()
                     && !parent.as_os_str().is_empty()
                 {
-                    affected.extend(self.files_in_dir(parent));
+                    return GapScope::from_range_and_file(self.files_in_dir_range(parent), file);
                 }
             }
-            return Some(affected.into_iter().collect());
+            return GapScope::Files(vec![file as u32]);
         }
         if let Some((pkg_name, _)) = Self::split_package_spec(clean_spec)
             && let Some(WorkspacePackage::Unique(pkg)) = self.workspaces.get(&pkg_name)
         {
-            affected.extend(self.files_in_dir(&pkg.rel_dir));
-            return Some(affected.into_iter().collect());
+            return GapScope::from_range_and_file(self.files_in_dir_range(&pkg.rel_dir), file);
         }
         let ts_targets = self
             .source_mapper
-            .matches_tsconfig_path(Path::new(&importer), clean_spec);
+            .matches_tsconfig_path(Path::new(importer), clean_spec);
         if !ts_targets.is_empty() {
+            let mut ranges: Vec<(u32, u32)> = Vec::new();
             for t in &ts_targets {
                 if let Some(parent) = t.parent()
                     && !parent.as_os_str().is_empty()
                 {
-                    affected.extend(self.files_in_dir(parent));
+                    let r = self.files_in_dir_range(parent);
+                    if r.0 < r.1 {
+                        ranges.push(r);
+                    }
                 }
             }
-            return Some(affected.into_iter().collect());
+            if ranges.len() == 1 {
+                return GapScope::from_range_and_file(ranges[0], file);
+            }
+            if !ranges.is_empty() {
+                let mut ids = vec![file as u32];
+                for (s, e) in ranges {
+                    ids.extend(s..e);
+                }
+                ids.sort_unstable();
+                ids.dedup();
+                return GapScope::Files(ids);
+            }
         }
-        Some(affected.into_iter().collect())
+        GapScope::Files(vec![file as u32])
     }
 
     /// None means a resolved external package, Node builtin or plain stylesheet.

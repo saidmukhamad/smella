@@ -29,7 +29,8 @@
   "scripts": {
     "build:native": "bun scripts/build.mjs --release",
     "build:ts": "tsdown",
-    "build": "bun scripts/build.mjs --release && tsdown",
+    "build:bin": "bun build lib/cli.ts --compile --bytecode --format=esm --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig --no-compile-autoload-tsconfig --no-compile-autoload-package-json --external smella-linux-x64-gnu --outfile bin/smella",
+    "build": "bun scripts/build.mjs --release && tsdown && bun run build:bin",
     "typecheck": "tsc --noEmit",
     "fmt": "cargo fmt",
     "fmt:check": "cargo fmt --check",

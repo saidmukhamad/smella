@@ -275,7 +275,7 @@ impl Workspace {
                 || !self.config["extends"].is_null())
         {
             let scope = if project.is_multi_workspace() && !self.projects.is_empty() {
-                let mut affected = BTreeSet::new();
+                let mut affected = Vec::<u32>::new();
                 for def in &self.projects {
                     if def.field("projectType") != Some("application") {
                         continue;
@@ -286,7 +286,8 @@ impl Workspace {
                             && (prefix.is_empty() || r.file.starts_with(&format!("{prefix}/")))
                     });
                     if !has_runtime && !def.dir.as_os_str().is_empty() {
-                        affected.extend(project.files_in_dir(&def.dir));
+                        let (s, e) = project.files_in_dir_range(&def.dir);
+                        affected.extend(s..e);
                     }
                 }
                 if affected.is_empty()
@@ -299,18 +300,24 @@ impl Workspace {
                         if let Some(spec) = raw.filter(|s| s.starts_with('.'))
                             && let Some(norm) = workspace_path(spec)
                             && let Some(file) = norm.to_str()
+                            && let Ok(idx) = project
+                                .graph
+                                .paths
+                                .binary_search_by(|p| p.as_str().cmp(file))
                         {
-                            affected.insert(file.to_owned());
+                            affected.push(idx as u32);
                         }
                     }
                 }
                 if affected.is_empty() {
-                    None
+                    crate::graph::GapScope::Global
                 } else {
-                    Some(affected.into_iter().collect())
+                    affected.sort_unstable();
+                    affected.dedup();
+                    crate::graph::GapScope::Files(affected)
                 }
             } else {
-                None
+                crate::graph::GapScope::Global
             };
             project.graph.gap_scoped(
                 "ambiguous-entry",

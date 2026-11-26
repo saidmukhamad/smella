@@ -673,19 +673,35 @@ fn is_build_script_candidate(path: &str) -> bool {
         && (name.contains("build") || name.contains("bundle") || name.contains("esbuild"))
 }
 
+fn read_project_source<'a>(
+    project: &'a Project,
+    id: usize,
+    rel: &str,
+    scratch: &'a mut String,
+) -> Option<&'a str> {
+    if let Some(res) = project.source_text(id) {
+        return res.ok();
+    }
+    scratch.clear();
+    let abs = project.root.join(rel);
+    *scratch = fs::read_to_string(&abs).ok()?;
+    Some(scratch.as_str())
+}
+
 /// Inspect Vite, webpack, esbuild, tsdown, rollup configs and build scripts statically to
 /// discover runtime entries (`input`, `entry`, `entryPoints`, `.html` `<script src>`,
 /// Module Federation `exposes`, `resolve.alias`, and Vite `resolveId` targets).
 pub fn discover_bundler_entries(project: &mut Project) {
-    let config_files: Vec<(String, bool)> = project
+    let config_files: Vec<(usize, String, bool)> = project
         .graph
         .paths
         .iter()
-        .filter_map(|p| {
+        .enumerate()
+        .filter_map(|(id, p)| {
             if is_bundler_config_file(p) {
-                Some((p.clone(), true))
+                Some((id, p.clone(), true))
             } else if is_build_script_candidate(p) {
-                Some((p.clone(), false))
+                Some((id, p.clone(), false))
             } else {
                 None
             }
@@ -693,10 +709,10 @@ pub fn discover_bundler_entries(project: &mut Project) {
         .collect();
 
     let mut arena = Allocator::default();
+    let mut scratch = String::new();
     let mut new_roots = Vec::new();
-    for (cfg, is_config) in config_files {
-        let abs = project.root.join(&cfg);
-        let Ok(source) = fs::read_to_string(&abs) else {
+    for (id, cfg, is_config) in config_files {
+        let Some(source) = read_project_source(project, id, &cfg, &mut scratch) else {
             continue;
         };
         if !is_config
@@ -707,10 +723,11 @@ pub fn discover_bundler_entries(project: &mut Project) {
         {
             continue;
         }
+        let abs = project.root.join(&cfg);
         arena.reset();
         let parsed = Parser::new(
             &arena,
-            &source,
+            source,
             SourceType::from_path(&abs).unwrap_or_default(),
         )
         .parse();
@@ -835,11 +852,12 @@ pub fn discover_bundler_entries(project: &mut Project) {
 /// Inspect Jest configs (`jest.config.*`, `jest.*.config.*`) to discover test setup files,
 /// custom environments/transformers, and `moduleNameMapper` mock targets as test roots.
 pub fn discover_jest_config_entries(project: &mut Project) {
-    let configs: Vec<String> = project
+    let configs: Vec<(usize, String)> = project
         .graph
         .paths
         .iter()
-        .filter(|p| {
+        .enumerate()
+        .filter(|(_, p)| {
             let name = Path::new(p)
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -850,22 +868,23 @@ pub fn discover_jest_config_entries(project: &mut Project) {
                 .is_some_and(|e| EXTENSIONS.contains(&e));
             ext_ok && name.starts_with("jest.") && name.contains(".config.")
         })
-        .cloned()
+        .map(|(id, p)| (id, p.clone()))
         .collect();
     if configs.is_empty() {
         return;
     }
     let mut arena = Allocator::default();
+    let mut scratch = String::new();
     let mut new_roots = Vec::new();
-    for cfg in configs {
-        let abs = project.root.join(&cfg);
-        let Ok(source) = fs::read_to_string(&abs) else {
+    for (id, cfg) in configs {
+        let Some(source) = read_project_source(project, id, &cfg, &mut scratch) else {
             continue;
         };
+        let abs = project.root.join(&cfg);
         arena.reset();
         let parsed = Parser::new(
             &arena,
-            &source,
+            source,
             SourceType::from_path(&abs).unwrap_or_default(),
         )
         .parse();
@@ -958,30 +977,32 @@ pub fn discover_public_static_files(project: &mut Project) {
 /// Discover ambient declaration files (`.d.ts`/`.d.mts`/`.d.cts` containing `declare global`
 /// or `declare module` augmentations) that TypeScript automatically includes in compilation.
 pub fn discover_ambient_declarations(project: &mut Project) {
-    let candidates: Vec<String> = project
+    let candidates: Vec<(usize, String)> = project
         .graph
         .paths
         .iter()
-        .filter(|p| p.ends_with(".d.ts") || p.ends_with(".d.mts") || p.ends_with(".d.cts"))
-        .cloned()
+        .enumerate()
+        .filter(|(_, p)| p.ends_with(".d.ts") || p.ends_with(".d.mts") || p.ends_with(".d.cts"))
+        .map(|(id, p)| (id, p.clone()))
         .collect();
     if candidates.is_empty() {
         return;
     }
     let mut arena = Allocator::default();
+    let mut scratch = String::new();
     let mut ambient = Vec::new();
-    for file in candidates {
-        let abs = project.root.join(&file);
-        let Ok(source) = fs::read_to_string(&abs) else {
+    for (id, file) in candidates {
+        let Some(source) = read_project_source(project, id, &file, &mut scratch) else {
             continue;
         };
         if !source.contains("declare ") {
             continue;
         }
+        let abs = project.root.join(&file);
         arena.reset();
         let parsed = Parser::new(
             &arena,
-            &source,
+            source,
             SourceType::from_path(&abs).unwrap_or_default(),
         )
         .parse();
@@ -1042,11 +1063,12 @@ pub fn discover_extra_tooling_configs(project: &mut Project) {
 
 /// Discover Storybook stories declared in `.storybook/main.*` as tooling entries whose CSF exports count as used.
 pub fn discover_storybook_stories(project: &mut Project) -> Result<(), String> {
-    let mains: Vec<String> = project
+    let mains: Vec<(usize, String)> = project
         .graph
         .paths
         .iter()
-        .filter(|p| {
+        .enumerate()
+        .filter(|(_, p)| {
             let path = Path::new(p);
             path.parent()
                 .and_then(|d| d.file_name())
@@ -1054,14 +1076,15 @@ pub fn discover_storybook_stories(project: &mut Project) -> Result<(), String> {
                 == Some(".storybook")
                 && path.file_stem().and_then(|s| s.to_str()) == Some("main")
         })
-        .cloned()
+        .map(|(id, p)| (id, p.clone()))
         .collect();
 
     let mut arena = Allocator::default();
+    let mut scratch = String::new();
     let mut story_globs = Vec::new();
     let mut configs = Vec::new();
 
-    for main_file in mains {
+    for (id, main_file) in mains {
         configs.push(main_file.clone());
         let sb_dir = Path::new(&main_file)
             .parent()
@@ -1072,14 +1095,14 @@ pub fn discover_storybook_stories(project: &mut Project) -> Result<(), String> {
                 configs.push(preview);
             }
         }
-        let abs = project.root.join(&main_file);
-        let Ok(source) = fs::read_to_string(&abs) else {
+        let Some(source) = read_project_source(project, id, &main_file, &mut scratch) else {
             continue;
         };
+        let abs = project.root.join(&main_file);
         arena.reset();
         let parsed = Parser::new(
             &arena,
-            &source,
+            source,
             SourceType::from_path(&abs).unwrap_or_default(),
         )
         .parse();
