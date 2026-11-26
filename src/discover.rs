@@ -664,7 +664,7 @@ pub fn discover_extra_tooling_configs(project: &mut Project) {
             role: Role::Tooling,
             origin: "discovered",
             input: "bundler-config".into(),
-            mode: RootEntryMode::ModuleOnly,
+            mode: RootEntryMode::AllExports,
         });
     }
 }

@@ -717,7 +717,7 @@ test('a workspace manifest subpath protects its public binding through a barrel 
   assert.equal(subject(after, barrel).kind, 'unreferenced-module');
 });
 
-const cliPath = fileURLToPath(new URL('../bin/smella.mjs', import.meta.url));
+const cliPath = fileURLToPath(new URL('../dist/cli.mjs', import.meta.url));
 
 test('workspace build outputs map back to source through tsconfig, declaration maps and source fields', async t => {
   const root = await fixture(t, {

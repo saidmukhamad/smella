@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { analyze } from '../index.js';
+import { analyze } from '../dist/index.mjs';
 
 const base = resolve(process.env.SMELLA_CORPUS_DIR || '.');
 const projects = {

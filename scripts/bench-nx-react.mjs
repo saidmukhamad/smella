@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { analyze } from '../index.js';
+import { analyze } from '../dist/index.mjs';
 import { prepareNxReact } from '../test/support/nx-react.mjs';
 import { stats } from './bench-stats.mjs';
 

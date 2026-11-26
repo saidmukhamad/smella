@@ -6,7 +6,7 @@ import { tmpdir, cpus, release } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
-import { analyze } from '../index.js';
+import { analyze } from '../dist/index.mjs';
 import { stats } from './bench-stats.mjs';
 
 const count = 512;
@@ -54,7 +54,7 @@ async function bench() {
     const script = fileURLToPath(import.meta.url);
     for (let i = 0; i < samples; i++) {
       if (knip && i % 2 === 0) compareKnip();
-      startup.push(run(process.execPath,['--input-type=module','-e',`await import(${JSON.stringify(new URL('../index.js',import.meta.url).href)})`],root).ms);
+      startup.push(run(process.execPath,['--input-type=module','-e',`await import(${JSON.stringify(new URL('../dist/index.mjs',import.meta.url).href)})`],root).ms);
       const { ms, output } = run(process.execPath,[script,'--once',root],root);
       cold.push(ms);
       const snapshot = JSON.parse(output);

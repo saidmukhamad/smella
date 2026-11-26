@@ -1173,7 +1173,7 @@ impl Project {
         type_only: bool,
         cjs: bool,
     ) -> Result<Option<Id>, String> {
-        if spec.starts_with("bun:") {
+        if spec.starts_with("bun:") || spec.ends_with(".node") {
             return Ok(None);
         }
         let origin = self.root.join(&self.graph.paths[file]);

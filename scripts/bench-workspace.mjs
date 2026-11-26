@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { analyze } from '../index.js';
+import { analyze } from '../dist/index.mjs';
 import { stats } from './bench-stats.mjs';
 
 const packages = 32;
